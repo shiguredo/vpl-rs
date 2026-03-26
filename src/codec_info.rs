@@ -204,8 +204,8 @@ unsafe fn build_codec_info_list(desc: &sys::mfxImplDescription) -> Vec<CodecInfo
         .iter()
         .map(|&codec| CodecInfo {
             codec,
-            decoding: probe_decoding(&desc.Dec, codec),
-            encoding: probe_encoding(&desc.Enc, codec),
+            decoding: unsafe { probe_decoding(&desc.Dec, codec) },
+            encoding: unsafe { probe_encoding(&desc.Enc, codec) },
         })
         .collect()
 }
