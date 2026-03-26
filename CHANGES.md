@@ -11,6 +11,8 @@
 
 ## develop
 
+- [ADD] supported_codecs() を追加する
+  - @voluntas
 - [CHANGE] 入力フレームフォーマットを NV12 / YUY2 / BGRA に変更する
   - I420, YV12, P010 を削除し、YUY2 を追加する
   - @voluntas
