@@ -520,6 +520,25 @@ unsafe impl Send for Encoder {}
 impl Encoder {
     /// エンコーダを作成する
     pub fn new(config: EncoderConfig) -> Result<Self, Error> {
+        // 寸法を u16 へ変換する前に範囲を検証する
+        if config.width == 0 || config.height == 0 {
+            return Err(Error::new_custom(
+                "Encoder::new",
+                "width and height must be non-zero",
+            ));
+        }
+        if config.width > u16::MAX as u32 || config.height > u16::MAX as u32 {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "width ({}) and height ({}) must not exceed {}",
+                    config.width,
+                    config.height,
+                    u16::MAX
+                ),
+            ));
+        }
+
         let lib = VplLibrary::load()?;
 
         // API 2.x フローでセッションを作成する（ハードウェア実装を使用）
@@ -554,9 +573,12 @@ impl Encoder {
         let gop_pic_size = config.gop_pic_size.unwrap_or(0);
 
         // ビットストリームバッファサイズ（指定がなければ 4 バイト/ピクセルで自動計算する）
+        let pixel_count = aligned_width as u64 * aligned_height as u64;
+        let auto_buffer_bytes = pixel_count.saturating_mul(4);
+        let auto_buffer_kb = align_up(auto_buffer_bytes.min(u32::MAX as u64) as u32, 1024) / 1024;
         let buffer_size_in_kb: u16 = config
             .buffer_size_in_kb
-            .unwrap_or((align_up(aligned_width * aligned_height * 4, 1024) / 1024) as u16);
+            .unwrap_or(u16::try_from(auto_buffer_kb).unwrap_or(u16::MAX));
 
         // mfxVideoParam を設定する
         let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
@@ -953,7 +975,26 @@ impl Encoder {
             return Ok(());
         }
 
-        let data = self.bitstream_buffer[offset..offset + length].to_vec();
+        // VPL が返したオフセットと長さがバッファ範囲内か検証する
+        let end = offset.checked_add(length).ok_or_else(|| {
+            Error::new_custom_owned(
+                "Encoder::encode",
+                format!("bitstream offset ({offset}) + length ({length}) overflows usize",),
+            )
+        })?;
+        if end > self.bitstream_buffer.len() {
+            return Err(Error::new_custom_owned(
+                "Encoder::encode",
+                format!(
+                    "bitstream range {}..{} exceeds buffer size {}",
+                    offset,
+                    end,
+                    self.bitstream_buffer.len()
+                ),
+            ));
+        }
+
+        let data = self.bitstream_buffer[offset..end].to_vec();
         let frame_type = bitstream.FrameType;
         let picture_type = if frame_type & (sys::MFX_FRAMETYPE_IDR as u16) != 0 {
             PictureType::Idr
