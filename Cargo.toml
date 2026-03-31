@@ -1,6 +1,6 @@
 [package]
 name = "shiguredo_vpl"
-version = "2026.1.0-canary.2"
+version = "2026.1.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Shiguredo Inc."]
@@ -24,6 +24,5 @@ shiguredo_toml = "2026.1"
 #
 # なお、bindgen はマクロ（#define）による定数や一部の static 変数の自動変換には対応していないため、
 # それらは build.rs の中で直接定義しているので、必要に応じて build.rs も更新すること。
-[package.metadata.external-dependencies.vpl]
-version = "2.16.0"
-url = "https://github.com/intel/libvpl"
+[package.metadata.external-dependencies]
+vpl = { url = "https://github.com/intel/libvpl", version = "2.16.0" }
