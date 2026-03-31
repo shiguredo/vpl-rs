@@ -101,7 +101,8 @@ pub struct Decoder {
 }
 
 // Safety: Decoder の全公開メソッドは &mut self を要求するため、同時に複数スレッドから
-// アクセスされることはない。mfxSession 自体はスレッド間で移動しても問題ない。
+// アクセスされることはない。VPL 仕様上、セッション操作の同一スレッド制約は明記されて
+// いないため、スレッド間の移動は許容する。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl Send for Decoder {}
 

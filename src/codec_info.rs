@@ -185,6 +185,13 @@ pub fn supported_codecs() -> Result<Vec<CodecInfo>, Error> {
     }
 
     let desc = hdl as *const sys::mfxImplDescription;
+    if desc.is_null() {
+        unsafe { sys::MFXUnload(loader) };
+        return Err(Error::new_custom(
+            "MFXEnumImplementations",
+            "returned null handle",
+        ));
+    }
     let result = unsafe { build_codec_info_list(&*desc) };
 
     // リソースを解放する
@@ -219,6 +226,13 @@ unsafe fn probe_decoding(dec: &sys::mfxDecoderDescription, codec: VideoCodecType
     let target_id = codec.to_codec_id();
     let num_codecs = dec.NumCodecs as usize;
 
+    if num_codecs > 0 && dec.Codecs.is_null() {
+        return DecodingInfo {
+            supported: false,
+            hardware_accelerated: false,
+        };
+    }
+
     for i in 0..num_codecs {
         let entry = unsafe { &*dec.Codecs.add(i) };
         if entry.CodecID == target_id {
@@ -240,6 +254,16 @@ unsafe fn probe_decoding(dec: &sys::mfxDecoderDescription, codec: VideoCodecType
 unsafe fn probe_encoding(enc: &sys::mfxEncoderDescription, codec: VideoCodecType) -> EncodingInfo {
     let target_id = codec.to_codec_id();
     let num_codecs = enc.NumCodecs as usize;
+
+    if num_codecs > 0 && enc.Codecs.is_null() {
+        return EncodingInfo {
+            supported: false,
+            hardware_accelerated: false,
+            supports_frame_reordering: false,
+            supports_multi_pass: false,
+            profiles: EncodingProfiles::None,
+        };
+    }
 
     for i in 0..num_codecs {
         let entry = unsafe { &*enc.Codecs.add(i) };
@@ -278,9 +302,11 @@ unsafe fn query_encoding_profiles(
     let num_profiles = entry.NumProfiles as usize;
     let mut profile_ids = Vec::with_capacity(num_profiles);
 
-    for i in 0..num_profiles {
-        let profile = unsafe { &*entry.Profiles.add(i) };
-        profile_ids.push(profile.Profile);
+    if num_profiles > 0 && !entry.Profiles.is_null() {
+        for i in 0..num_profiles {
+            let profile = unsafe { &*entry.Profiles.add(i) };
+            profile_ids.push(profile.Profile);
+        }
     }
 
     match codec {
