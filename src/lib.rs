@@ -52,6 +52,7 @@
 //! }
 //! ```
 
+mod codec_info;
 mod decode;
 mod encode;
 mod error;
@@ -63,6 +64,7 @@ pub mod ffi {
     pub use crate::sys::*;
 }
 
+pub use codec_info::*;
 pub use decode::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig};
 pub use encode::{
     Av1EncoderConfig, Av1Profile, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
