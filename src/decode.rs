@@ -261,6 +261,11 @@ impl Decoder {
     /// デコーダの内部バッファに残っているフレームをすべて処理する。
     /// 完了後は [`Decoder::next_frame`] で残りのフレームを取り出せる。
     pub fn finish(&mut self) -> Result<(), Error> {
+        // 初期化前（decode 未呼び出し）なら排出するフレームがないので即座に返す
+        if self.surfaces.is_empty() {
+            return Ok(());
+        }
+
         self.flushing = true;
 
         loop {

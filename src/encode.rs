@@ -538,6 +538,22 @@ impl Encoder {
                 ),
             ));
         }
+        // pitch（行あたりのバイト数）が u16 に収まるか検証する
+        // NV12: width, YUY2: width * 2, BGRA: width * 4
+        let pitch_bytes: u64 = match config.frame_format {
+            FrameFormat::Nv12 => config.width as u64,
+            FrameFormat::Yuy2 => config.width as u64 * 2,
+            FrameFormat::Bgra => config.width as u64 * 4,
+        };
+        if pitch_bytes > u16::MAX as u64 {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "pitch ({pitch_bytes} bytes) for {:?} with width {} exceeds u16::MAX",
+                    config.frame_format, config.width
+                ),
+            ));
+        }
 
         let lib = VplLibrary::load()?;
 
