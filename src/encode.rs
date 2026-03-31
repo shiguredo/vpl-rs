@@ -130,15 +130,17 @@ impl FrameFormat {
     }
 
     /// フレームデータのバイトサイズを返す
-    pub fn frame_size(self, width: usize, height: usize) -> usize {
-        let pixels = width * height;
+    ///
+    /// オーバーフロー時は `None` を返す。
+    pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
+        let pixels = width.checked_mul(height)?;
         match self {
             // YUV 4:2:0 8bit: Y + UV/2 = pixels * 3 / 2
-            FrameFormat::Nv12 => pixels * 3 / 2,
+            FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
             // YUY2: 2 bytes/pixel (packed YUYV)
-            FrameFormat::Yuy2 => pixels * 2,
+            FrameFormat::Yuy2 => pixels.checked_mul(2),
             // BGRA: 4 bytes/pixel
-            FrameFormat::Bgra => pixels * 4,
+            FrameFormat::Bgra => pixels.checked_mul(4),
         }
     }
 
@@ -513,7 +515,9 @@ pub struct Encoder {
 }
 
 // Safety: Encoder の全公開メソッドは &mut self を要求するため、同時に複数スレッドから
-// アクセスされることはない。mfxSession 自体はスレッド間で移動しても問題ない。
+// アクセスされることはない。VPL 仕様上、セッション操作の同一スレッド制約は明記されて
+// いないため、スレッド間の移動は許容する。Intel の公式サンプル（hello-encode 等）でも
+// セッションハンドルにスレッドアフィニティの制約は課されていない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl Send for Encoder {}
 
@@ -859,7 +863,12 @@ impl Encoder {
     /// フレームをエンコードする
     pub fn encode(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
         // フレームサイズを検証する
-        let expected = self.frame_format.frame_size(self.crop_w, self.crop_h);
+        let expected = self
+            .frame_format
+            .frame_size(self.crop_w, self.crop_h)
+            .ok_or_else(|| {
+                Error::new_custom("Encoder::encode", "frame size calculation overflowed")
+            })?;
         if frame_data.len() < expected {
             return Err(Error::new_custom(
                 "Encoder::encode",
@@ -1137,6 +1146,11 @@ fn codec_profile(codec: &CodecConfig) -> u16 {
 }
 
 /// alignment の倍数に切り上げる
+///
+/// オーバーフロー時は alignment 境界に丸めた最大値を返す。
 fn align_up(value: u32, alignment: u32) -> u32 {
-    (value + alignment - 1) & !(alignment - 1)
+    match value.checked_add(alignment - 1) {
+        Some(v) => v & !(alignment - 1),
+        None => !(alignment - 1),
+    }
 }
