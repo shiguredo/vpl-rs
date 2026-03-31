@@ -384,9 +384,25 @@ impl Decoder {
         }
 
         // NV12: Y プレーン (crop_w * crop_h) + UV プレーン (crop_w * crop_h / 2)
-        let y_size = crop_w * crop_h;
-        let uv_size = crop_w * (crop_h / 2);
-        let mut data = vec![0u8; y_size + uv_size];
+        let y_size = crop_w.checked_mul(crop_h).ok_or_else(|| {
+            Error::new_custom(
+                "Decoder::sync_and_collect",
+                "Y plane size calculation overflowed",
+            )
+        })?;
+        let uv_size = crop_w.checked_mul(crop_h / 2).ok_or_else(|| {
+            Error::new_custom(
+                "Decoder::sync_and_collect",
+                "UV plane size calculation overflowed",
+            )
+        })?;
+        let total_size = y_size.checked_add(uv_size).ok_or_else(|| {
+            Error::new_custom(
+                "Decoder::sync_and_collect",
+                "total frame size calculation overflowed",
+            )
+        })?;
+        let mut data = vec![0u8; total_size];
 
         // ピッチを考慮してコピーする（ピッチ == crop_w なら一括コピー可能）
         if pitch == crop_w {
