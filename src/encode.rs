@@ -130,15 +130,17 @@ impl FrameFormat {
     }
 
     /// フレームデータのバイトサイズを返す
-    pub fn frame_size(self, width: usize, height: usize) -> usize {
-        let pixels = width * height;
+    ///
+    /// オーバーフロー時は `None` を返す。
+    pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
+        let pixels = width.checked_mul(height)?;
         match self {
             // YUV 4:2:0 8bit: Y + UV/2 = pixels * 3 / 2
-            FrameFormat::Nv12 => pixels * 3 / 2,
+            FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
             // YUY2: 2 bytes/pixel (packed YUYV)
-            FrameFormat::Yuy2 => pixels * 2,
+            FrameFormat::Yuy2 => pixels.checked_mul(2),
             // BGRA: 4 bytes/pixel
-            FrameFormat::Bgra => pixels * 4,
+            FrameFormat::Bgra => pixels.checked_mul(4),
         }
     }
 
@@ -861,7 +863,12 @@ impl Encoder {
     /// フレームをエンコードする
     pub fn encode(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
         // フレームサイズを検証する
-        let expected = self.frame_format.frame_size(self.crop_w, self.crop_h);
+        let expected = self
+            .frame_format
+            .frame_size(self.crop_w, self.crop_h)
+            .ok_or_else(|| {
+                Error::new_custom("Encoder::encode", "frame size calculation overflowed")
+            })?;
         if frame_data.len() < expected {
             return Err(Error::new_custom(
                 "Encoder::encode",
