@@ -51,6 +51,16 @@ impl Error {
         }
     }
 
+    /// 動的メッセージを持つ crate 起因のエラーを構築する
+    pub(crate) fn new_custom_owned(function: &'static str, message: String) -> Self {
+        Self {
+            function,
+            status_code: None,
+            status_name: None,
+            status_message: Some(Cow::Owned(message)),
+        }
+    }
+
     /// mfxStatus エラーを構築する
     pub(crate) fn from_mfx(status: i32, function: &'static str) -> Self {
         let entry = find_status(status);

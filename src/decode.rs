@@ -340,6 +340,20 @@ impl Decoder {
             ));
         }
 
+        // VPL が返したサーフェス寸法の整合性を検証する
+        if crop_w == 0 || crop_h == 0 {
+            return Err(Error::new_custom(
+                "Decoder::sync_and_collect",
+                "decoded surface has zero crop dimensions",
+            ));
+        }
+        if pitch < crop_w {
+            return Err(Error::new_custom_owned(
+                "Decoder::sync_and_collect",
+                format!("pitch ({pitch}) is less than crop width ({crop_w})"),
+            ));
+        }
+
         // NV12: Y プレーン (crop_w * crop_h) + UV プレーン (crop_w * crop_h / 2)
         let y_size = crop_w * crop_h;
         let uv_size = crop_w * (crop_h / 2);
