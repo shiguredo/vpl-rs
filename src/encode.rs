@@ -513,7 +513,8 @@ pub struct Encoder {
 }
 
 // Safety: Encoder の全公開メソッドは &mut self を要求するため、同時に複数スレッドから
-// アクセスされることはない。mfxSession 自体はスレッド間で移動しても問題ない。
+// アクセスされることはない。VPL 仕様上、セッション操作の同一スレッド制約は明記されて
+// いないため、スレッド間の移動は許容する。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl Send for Encoder {}
 
@@ -1137,6 +1138,11 @@ fn codec_profile(codec: &CodecConfig) -> u16 {
 }
 
 /// alignment の倍数に切り上げる
+///
+/// オーバーフロー時は alignment 境界に丸めた最大値を返す。
 fn align_up(value: u32, alignment: u32) -> u32 {
-    (value + alignment - 1) & !(alignment - 1)
+    match value.checked_add(alignment - 1) {
+        Some(v) => v & !(alignment - 1),
+        None => !(alignment - 1),
+    }
 }
