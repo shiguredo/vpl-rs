@@ -1,0 +1,28 @@
+[package]
+name = "shiguredo_vpl"
+version = "2026.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Shiguredo Inc."]
+license = "Apache-2.0"
+description = "Rust bindings for Intel oneVPL (Video Processing Library)"
+homepage = "https://github.com/shiguredo/vpl-rs"
+repository = "https://github.com/shiguredo/vpl-rs"
+readme = "README.md"
+build = "build.rs"
+include = ["/src/**", "/build.rs", "LICENSE", "README.md"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"
+shiguredo_cmake = "4.3"
+shiguredo_toml = "2026.1"
+
+# Intel VPL 用の外部ライブラリビルド用メタデータ
+# (この内容は build.rs の中からのみ参照される)
+#
+# なお、bindgen はマクロ（#define）による定数や一部の static 変数の自動変換には対応していないため、
+# それらは build.rs の中で直接定義しているので、必要に応じて build.rs も更新すること。
+[package.metadata.external-dependencies]
+vpl = { url = "https://github.com/intel/libvpl", version = "2.16.0" }
