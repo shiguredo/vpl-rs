@@ -102,7 +102,8 @@ pub struct Decoder {
 
 // Safety: Decoder の全公開メソッドは &mut self を要求するため、同時に複数スレッドから
 // アクセスされることはない。VPL 仕様上、セッション操作の同一スレッド制約は明記されて
-// いないため、スレッド間の移動は許容する。
+// いないため、スレッド間の移動は許容する。Intel の公式サンプル（hello-decode 等）でも
+// セッションハンドルにスレッドアフィニティの制約は課されていない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl Send for Decoder {}
 
@@ -161,7 +162,14 @@ impl Decoder {
             let fi = &mfx.FrameInfo.__bindgen_anon_1.__bindgen_anon_1;
             (fi.Width as usize, fi.Height as usize)
         };
-        let frame_size = surf_width * surf_height * 3 / 2; // NV12
+        // NV12: Y平面 + UV平面 (各ピクセル 1.5 バイト)
+        let frame_size = surf_width
+            .checked_mul(surf_height)
+            .and_then(|v| v.checked_mul(3))
+            .map(|v| v / 2)
+            .ok_or_else(|| {
+                Error::new_custom("Decoder::initialize", "surface size calculation overflowed")
+            })?;
 
         let num_surfaces = DECODE_SURFACE_POOL_SIZE;
         let mut surface_buffers: Vec<Vec<u8>> =
