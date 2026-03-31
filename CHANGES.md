@@ -11,10 +11,6 @@
 
 ## develop
 
-- [CHANGE] `FrameFormat::frame_size()` の戻り値を `usize` から `Option<usize>` に変更してオーバーフロー時に `None` を返すようにする
-  - @voluntas
-- [FIX] デコーダの `sync_and_collect` でサーフェスサイズ計算のオーバーフローを防御する
-  - @voluntas
 
 ### misc
 
