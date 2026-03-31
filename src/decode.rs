@@ -194,9 +194,15 @@ impl Decoder {
     pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
         // VPL API は *mut を要求するが入力データを書き換えないためキャストする
+        let data_len = u32::try_from(data.len()).map_err(|_| {
+            Error::new_custom_owned(
+                "Decoder::decode",
+                format!("bitstream length {} exceeds u32::MAX", data.len()),
+            )
+        })?;
         bs.Data = data.as_ptr() as *mut u8;
-        bs.DataLength = data.len() as u32;
-        bs.MaxLength = data.len() as u32;
+        bs.DataLength = data_len;
+        bs.MaxLength = data_len;
 
         // サーフェスが空の場合は初期化が必要
         if self.surfaces.is_empty() {
@@ -351,6 +357,15 @@ impl Decoder {
             return Err(Error::new_custom_owned(
                 "Decoder::sync_and_collect",
                 format!("pitch ({pitch}) is less than crop width ({crop_w})"),
+            ));
+        }
+        if crop_w > self.surf_width || crop_h > self.surf_height {
+            return Err(Error::new_custom_owned(
+                "Decoder::sync_and_collect",
+                format!(
+                    "crop dimensions ({crop_w}x{crop_h}) exceed surface dimensions ({}x{})",
+                    self.surf_width, self.surf_height
+                ),
             ));
         }
 
