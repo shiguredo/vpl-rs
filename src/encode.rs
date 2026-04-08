@@ -169,14 +169,17 @@ impl FrameFormat {
         unsafe {
             data.__bindgen_anon_2.Pitch = self.pitch(width);
             match self {
+                // mfxFrameData は、NV12 や YUY2 のようなパック済みフォーマットの場合であっても、Y/U/V をそれぞれ先頭サンプルへ向ける必要がある
+                // ref: https://github.com/intel/libvpl/blob/778a66d6c6537f08eabb91955dbbf1bce3812894/api/vpl/mfxstructures.h#L344-L349
                 FrameFormat::Nv12 => {
                     data.__bindgen_anon_3.Y = ptr;
-                    data.__bindgen_anon_4.UV = ptr.add(luma_size);
+                    data.__bindgen_anon_4.U = ptr.add(luma_size);
+                    data.__bindgen_anon_5.V = ptr.add(luma_size + 1);
                 }
                 FrameFormat::Yuy2 => {
-                    // YUY2 はパック済み。Y と UV は同じベースアドレスを指す
                     data.__bindgen_anon_3.Y = ptr;
-                    data.__bindgen_anon_4.UV = ptr;
+                    data.__bindgen_anon_4.U = ptr.add(1);
+                    data.__bindgen_anon_5.V = ptr.add(3);
                 }
                 FrameFormat::Bgra => {
                     // BGRA はパック済み。R/G/B/A はすべて同じベースアドレスを指す
