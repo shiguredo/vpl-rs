@@ -532,9 +532,18 @@ fn roundtrip_format(
     format: FrameFormat,
     num_frames: usize,
 ) {
-    let width: u32 = 320;
-    let height: u32 = 240;
+    roundtrip_format_with_size(codec_config, decoder_codec, format, num_frames, 320, 240);
+}
 
+/// フォーマット指定のラウンドトリップテストを実行するヘルパー（任意サイズ）
+fn roundtrip_format_with_size(
+    codec_config: CodecConfig,
+    decoder_codec: DecoderCodec,
+    format: FrameFormat,
+    num_frames: usize,
+    width: u32,
+    height: u32,
+) {
     let mut config = EncoderConfig::new(
         codec_config,
         width,
@@ -598,5 +607,43 @@ fn test_roundtrip_h264_bgra() {
         DecoderCodec::H264,
         FrameFormat::Bgra,
         10,
+    );
+}
+
+/// NV12 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
+#[test]
+fn test_roundtrip_h264_nv12_alignment_mismatch() {
+    let mut config = EncoderConfig::new(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        318,
+        238,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    let (coded_width, coded_height) = coded_size_for(&config);
+    assert_ne!(coded_width, config.width as usize);
+    assert_ne!(coded_height, config.height as usize);
+
+    roundtrip_colorbar(config, DecoderCodec::H264, 10, 25.0);
+}
+
+/// BGRA 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
+#[test]
+fn test_roundtrip_h264_bgra_alignment_mismatch() {
+    roundtrip_format_with_size(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        DecoderCodec::H264,
+        FrameFormat::Bgra,
+        10,
+        318,
+        238,
     );
 }
