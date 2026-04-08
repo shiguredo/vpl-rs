@@ -161,10 +161,11 @@ src/
 ## エンコードフロー
 
 1. `Encoder::new(config)` — セッション初期化 → パラメータ設定 → `MFXVideoENCODE_Init`
-2. `encoder.encode(frame_data, options)` — サーフェス設定 → `EncodeFrameAsync` → `SyncOperation` → 内部キューに蓄積
-3. `encoder.next_frame()` — 内部キューからエンコード済みフレームを取り出す
-4. `encoder.finish()` — `EncodeFrameAsync(null surface)` でフラッシュして残りフレームを排出する
-5. `Drop` — `MFXVideoENCODE_Close` → `MFXClose`
+2. `encoder.coded_size()` — 実効 `FrameInfo::Width/Height` を取得し、入力 stride/バッファサイズ計算に使う
+3. `encoder.encode(frame_data, options)` — サーフェス設定 → `EncodeFrameAsync` → `SyncOperation` → 内部キューに蓄積
+4. `encoder.next_frame()` — 内部キューからエンコード済みフレームを取り出す
+5. `encoder.finish()` — `EncodeFrameAsync(null surface)` でフラッシュして残りフレームを排出する
+6. `Drop` — `MFXVideoENCODE_Close` → `MFXClose`
 
 ## 設計上の特徴
 
