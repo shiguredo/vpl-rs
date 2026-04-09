@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::{sys, Error, VplLibrary};
+use crate::{Error, VplLibrary, sys};
 
 /// H.264 プロファイル
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,15 +145,12 @@ impl FrameFormat {
     }
 
     /// ピッチ（行あたりのバイト数）を返す
-    ///
-    /// `u16` に収まらない場合は `None` を返す。
-    fn pitch(self, width: usize) -> Option<u16> {
-        let pitch = match self {
-            FrameFormat::Nv12 => width,
-            FrameFormat::Yuy2 => width.checked_mul(2)?,
-            FrameFormat::Bgra => width.checked_mul(4)?,
-        };
-        u16::try_from(pitch).ok()
+    fn pitch(self, width: usize) -> u16 {
+        match self {
+            FrameFormat::Nv12 => width as u16,
+            FrameFormat::Yuy2 => (width * 2) as u16,
+            FrameFormat::Bgra => (width * 4) as u16,
+        }
     }
 
     /// mfxFrameData の各プレーンポインタを設定する
@@ -165,18 +162,19 @@ impl FrameFormat {
         self,
         data: &mut sys::mfxFrameData,
         ptr: *mut u8,
-        pitch: u16,
-        y_plane_size: usize,
+        coded_width: usize,
+        coded_height: usize,
     ) {
+        let luma_size = coded_width * coded_height;
         unsafe {
-            data.__bindgen_anon_2.Pitch = pitch;
+            data.__bindgen_anon_2.Pitch = self.pitch(coded_width);
             match self {
                 // mfxFrameData は、NV12 や YUY2 のようなパック済みフォーマットの場合であっても、Y/U/V をそれぞれ先頭サンプルへ向ける必要がある
                 // ref: https://github.com/intel/libvpl/blob/778a66d6c6537f08eabb91955dbbf1bce3812894/api/vpl/mfxstructures.h#L344-L349
                 FrameFormat::Nv12 => {
                     data.__bindgen_anon_3.Y = ptr;
-                    data.__bindgen_anon_4.U = ptr.add(y_plane_size);
-                    data.__bindgen_anon_5.V = ptr.add(y_plane_size + 1);
+                    data.__bindgen_anon_4.U = ptr.add(luma_size);
+                    data.__bindgen_anon_5.V = ptr.add(luma_size + 1);
                 }
                 FrameFormat::Yuy2 => {
                     data.__bindgen_anon_3.Y = ptr;
@@ -534,17 +532,6 @@ impl Encoder {
                 "width and height must be non-zero",
             ));
         }
-        if config.width > u16::MAX as u32 || config.height > u16::MAX as u32 {
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "width ({}) and height ({}) must not exceed {}",
-                    config.width,
-                    config.height,
-                    u16::MAX
-                ),
-            ));
-        }
         let aligned_width = align_up(config.width, 16);
         let aligned_height = align_up(config.height, 16);
         if aligned_width > u16::MAX as u32 || aligned_height > u16::MAX as u32 {
@@ -553,15 +540,6 @@ impl Encoder {
                 format!(
                     "aligned width ({aligned_width}) and height ({aligned_height}) must not exceed {}",
                     u16::MAX
-                ),
-            ));
-        }
-        if config.frame_format.pitch(aligned_width as usize).is_none() {
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "pitch for {:?} with aligned width {} exceeds u16::MAX",
-                    config.frame_format, aligned_width
                 ),
             ));
         }
@@ -894,20 +872,6 @@ impl Encoder {
                 ),
             ));
         }
-        let pitch = self.frame_format.pitch(coded_width).ok_or_else(|| {
-            Error::new_custom_owned(
-                "Encoder::encode",
-                format!(
-                    "pitch for {:?} with coded width {} exceeds u16::MAX",
-                    self.frame_format, coded_width
-                ),
-            )
-        })?;
-        let y_plane_size = usize::from(pitch)
-            .checked_mul(coded_height)
-            .ok_or_else(|| {
-                Error::new_custom("Encoder::encode", "Y plane size calculation overflowed")
-            })?;
 
         // mfxFrameSurface1 を設定する
         let mut surface: sys::mfxFrameSurface1 = unsafe { std::mem::zeroed() };
@@ -918,8 +882,8 @@ impl Encoder {
             self.frame_format.set_planes(
                 &mut surface.Data,
                 frame_data.as_ptr() as *mut u8,
-                pitch,
-                y_plane_size,
+                coded_width,
+                coded_height,
             );
         }
 
