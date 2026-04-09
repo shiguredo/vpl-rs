@@ -42,7 +42,11 @@
 //! let mut encoder = Encoder::new(config).unwrap();
 //!
 //! // フレームデータをエンコードする
-//! let frame_data = vec![0u8; FrameFormat::Nv12.frame_size(1920, 1080).unwrap()];
+//! let (coded_width, coded_height) = encoder.coded_size();
+//! let frame_size = FrameFormat::Nv12
+//!     .frame_size(coded_width, coded_height)
+//!     .unwrap();
+//! let frame_data = vec![0u8; frame_size];
 //! let options = EncodeOptions { frame_type: 0 };
 //! encoder.encode(&frame_data, &options).unwrap();
 //!

@@ -7,18 +7,33 @@ use shiguredo_vpl::{
 /// ダミー NV12 フレームを生成する
 ///
 /// Y プレーンはフレーム番号に応じたグラデーション、UV プレーンは 128 固定。
-fn generate_dummy_nv12(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
-    let y_size = width * height;
-    let uv_size = y_size / 2;
+fn generate_dummy_nv12(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    frame_index: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "source size {}x{} exceeds coded size {}x{}",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
+    let y_size = coded_width * coded_height;
+    let uv_height = coded_height.div_ceil(2);
+    let uv_size = coded_width * uv_height;
     let mut data = vec![0u8; y_size + uv_size];
+    for i in 0..uv_size {
+        data[y_size + i] = 128;
+    }
 
     for y in 0..height {
         for x in 0..width {
-            data[y * width + x] = ((x + y + frame_index * 7) % 256) as u8;
+            data[y * coded_width + x] = ((x + y + frame_index * 7) % 256) as u8;
         }
-    }
-    for i in 0..uv_size {
-        data[y_size + i] = 128;
     }
 
     data
@@ -28,7 +43,20 @@ fn generate_dummy_nv12(width: usize, height: usize, frame_index: usize) -> Vec<u
 ///
 /// 7 色の縦ストライプ（白/黄/シアン/緑/マゼンタ/赤/青）を
 /// BT.601 で YUV に変換し NV12 形式で返す。
-fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
+fn generate_colorbar_nv12(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "source size {}x{} exceeds coded size {}x{}",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
     // SMPTE カラーバーの RGB 値（白/黄/シアン/緑/マゼンタ/赤/青）
     let bars: [(u8, u8, u8); 7] = [
         (235, 235, 235), // 白
@@ -40,10 +68,14 @@ fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
         (16, 16, 235),   // 青
     ];
 
-    let y_size = width * height;
-    let uv_size = y_size / 2;
+    let y_size = coded_width * coded_height;
+    let uv_height = coded_height.div_ceil(2);
+    let uv_size = coded_width * uv_height;
     let mut data = vec![0u8; y_size + uv_size];
     let uv_offset = y_size;
+    for i in 0..uv_size {
+        data[uv_offset + i] = 128;
+    }
 
     for y in 0..height {
         for x in 0..width {
@@ -55,7 +87,7 @@ fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
             let gf = g as f64;
             let bf = b as f64;
             let yv = (0.257 * rf + 0.504 * gf + 0.098 * bf + 16.0).clamp(16.0, 235.0) as u8;
-            data[y * width + x] = yv;
+            data[y * coded_width + x] = yv;
 
             // UV は 2x2 ブロック単位（左上ピクセルで代表する）
             if y % 2 == 0 && x % 2 == 0 {
@@ -63,8 +95,8 @@ fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
                 let v = (0.439 * rf - 0.368 * gf - 0.071 * bf + 128.0).clamp(16.0, 240.0) as u8;
                 let uv_row = y / 2;
                 let uv_col = x; // NV12 はインターリーブなので x そのまま
-                data[uv_offset + uv_row * width + uv_col] = u;
-                data[uv_offset + uv_row * width + uv_col + 1] = v;
+                data[uv_offset + uv_row * coded_width + uv_col] = u;
+                data[uv_offset + uv_row * coded_width + uv_col + 1] = v;
             }
         }
     }
@@ -171,6 +203,12 @@ fn roundtrip(
     (encoded_frames, decoded_frames)
 }
 
+/// 指定エンコーダ設定の coded サイズを取得する
+fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
+    let encoder = Encoder::new(config.clone()).expect("failed to create encoder");
+    encoder.coded_size()
+}
+
 /// カラーバーを使ったラウンドトリップで PSNR を検証するヘルパー
 ///
 /// 同一のカラーバーフレームを num_frames 回エンコードし、デコード後に
@@ -183,14 +221,16 @@ fn roundtrip_colorbar(
 ) {
     let width = encoder_config.width as usize;
     let height = encoder_config.height as usize;
+    let (coded_width, coded_height) = coded_size_for(&encoder_config);
 
-    let colorbar = generate_colorbar_nv12(width, height);
+    let colorbar = generate_colorbar_nv12(width, height, coded_width, coded_height);
+    let colorbar_for_psnr = generate_colorbar_nv12(width, height, width, height);
     let input_frames: Vec<Vec<u8>> = (0..num_frames).map(|_| colorbar.clone()).collect();
 
     let (_, decoded_frames) = roundtrip(encoder_config, decoder_codec, &input_frames);
 
     for (i, decoded) in decoded_frames.iter().enumerate() {
-        let psnr = psnr_y(&colorbar, decoded.data(), width, height);
+        let psnr = psnr_y(&colorbar_for_psnr, decoded.data(), width, height);
         assert!(
             psnr >= min_psnr_db,
             "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
@@ -262,11 +302,12 @@ fn test_roundtrip_h264_force_idr() {
     let width = config.width as usize;
     let height = config.height as usize;
     let mut encoder = Encoder::new(config).expect("failed to create encoder");
+    let (coded_width, coded_height) = encoder.coded_size();
     let mut encoded_frames = Vec::new();
     let mut bitstream = Vec::new();
 
     for i in 0..15 {
-        let frame = generate_dummy_nv12(width, height, i);
+        let frame_data = generate_dummy_nv12(width, height, coded_width, coded_height, i);
         let options = if i == 10 {
             EncodeOptions {
                 frame_type: frame_type::IDR | frame_type::I | frame_type::REF,
@@ -276,7 +317,9 @@ fn test_roundtrip_h264_force_idr() {
                 frame_type: frame_type::UNKNOWN,
             }
         };
-        encoder.encode(&frame, &options).expect("failed to encode");
+        encoder
+            .encode(&frame_data, &options)
+            .expect("failed to encode");
         while let Some(encoded) = encoder.next_frame() {
             bitstream.extend_from_slice(encoded.data());
             encoded_frames.push(encoded);
@@ -397,11 +440,25 @@ fn test_roundtrip_av1_cqp() {
 /// ダミー YUY2 フレームを生成する
 ///
 /// Packed YUV 4:2:2: YUYV の繰り返し（2 ピクセルで 4 バイト）
-fn generate_dummy_yuy2(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
-    let mut data = vec![0u8; width * height * 2];
+fn generate_dummy_yuy2(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    frame_index: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "source size {}x{} exceeds coded size {}x{}",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
+    let mut data = vec![0u8; coded_width * coded_height * 2];
     for y in 0..height {
         for x in (0..width).step_by(2) {
-            let offset = (y * width + x) * 2;
+            let offset = (y * coded_width + x) * 2;
             let y0 = ((x + y + frame_index * 7) % 256) as u8;
             let y1 = ((x + 1 + y + frame_index * 7) % 256) as u8;
             data[offset] = y0; // Y0
@@ -414,11 +471,25 @@ fn generate_dummy_yuy2(width: usize, height: usize, frame_index: usize) -> Vec<u
 }
 
 /// ダミー BGRA フレームを生成する
-fn generate_dummy_bgra(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
-    let mut data = vec![0u8; width * height * 4];
+fn generate_dummy_bgra(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    frame_index: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "source size {}x{} exceeds coded size {}x{}",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
+    let mut data = vec![0u8; coded_width * coded_height * 4];
     for y in 0..height {
         for x in 0..width {
-            let offset = (y * width + x) * 4;
+            let offset = (y * coded_width + x) * 4;
             let v = ((x + y + frame_index * 7) % 256) as u8;
             data[offset] = v; // B
             data[offset + 1] = v; // G
@@ -434,12 +505,20 @@ fn generate_dummy_frame(
     format: FrameFormat,
     width: usize,
     height: usize,
+    coded_width: usize,
+    coded_height: usize,
     frame_index: usize,
 ) -> Vec<u8> {
     match format {
-        FrameFormat::Nv12 => generate_dummy_nv12(width, height, frame_index),
-        FrameFormat::Yuy2 => generate_dummy_yuy2(width, height, frame_index),
-        FrameFormat::Bgra => generate_dummy_bgra(width, height, frame_index),
+        FrameFormat::Nv12 => {
+            generate_dummy_nv12(width, height, coded_width, coded_height, frame_index)
+        }
+        FrameFormat::Yuy2 => {
+            generate_dummy_yuy2(width, height, coded_width, coded_height, frame_index)
+        }
+        FrameFormat::Bgra => {
+            generate_dummy_bgra(width, height, coded_width, coded_height, frame_index)
+        }
     }
 }
 
@@ -453,9 +532,18 @@ fn roundtrip_format(
     format: FrameFormat,
     num_frames: usize,
 ) {
-    let width: u32 = 320;
-    let height: u32 = 240;
+    roundtrip_format_with_size(codec_config, decoder_codec, format, num_frames, 320, 240);
+}
 
+/// フォーマット指定のラウンドトリップテストを実行するヘルパー（任意サイズ）
+fn roundtrip_format_with_size(
+    codec_config: CodecConfig,
+    decoder_codec: DecoderCodec,
+    format: FrameFormat,
+    num_frames: usize,
+    width: u32,
+    height: u32,
+) {
     let mut config = EncoderConfig::new(
         codec_config,
         width,
@@ -467,14 +555,24 @@ fn roundtrip_format(
     );
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
+    let (coded_width, coded_height) = coded_size_for(&config);
 
     let input_frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_frame(format, width as usize, height as usize, i))
+        .map(|i| {
+            generate_dummy_frame(
+                format,
+                width as usize,
+                height as usize,
+                coded_width,
+                coded_height,
+                i,
+            )
+        })
         .collect();
 
     // フレームサイズが FrameFormat::frame_size() と一致することを確認する
     let expected_size = format
-        .frame_size(width as usize, height as usize)
+        .frame_size(coded_width, coded_height)
         .expect("frame size calculation overflowed");
     for (i, frame) in input_frames.iter().enumerate() {
         assert_eq!(
@@ -509,5 +607,43 @@ fn test_roundtrip_h264_bgra() {
         DecoderCodec::H264,
         FrameFormat::Bgra,
         10,
+    );
+}
+
+/// NV12 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
+#[test]
+fn test_roundtrip_h264_nv12_alignment_mismatch() {
+    let mut config = EncoderConfig::new(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        318,
+        238,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    let (coded_width, coded_height) = coded_size_for(&config);
+    assert_ne!(coded_width, config.width as usize);
+    assert_ne!(coded_height, config.height as usize);
+
+    roundtrip_colorbar(config, DecoderCodec::H264, 10, 25.0);
+}
+
+/// BGRA 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
+#[test]
+fn test_roundtrip_h264_bgra_alignment_mismatch() {
+    roundtrip_format_with_size(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        DecoderCodec::H264,
+        FrameFormat::Bgra,
+        10,
+        318,
+        238,
     );
 }

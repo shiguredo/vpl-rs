@@ -83,6 +83,11 @@ config.target_kbps = Some(5_000);
 let mut encoder = Encoder::new(config)?;
 
 // フレームデータをエンコード
+let (coded_width, coded_height) = encoder.coded_size();
+let frame_size = FrameFormat::Nv12
+    .frame_size(coded_width, coded_height)
+    .ok_or("frame size overflowed")?;
+let frame_data = vec![0u8; frame_size];
 let options = EncodeOptions { frame_type: frame_type::UNKNOWN };
 encoder.encode(&frame_data, &options)?;
 

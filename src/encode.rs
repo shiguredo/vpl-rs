@@ -157,17 +157,17 @@ impl FrameFormat {
     ///
     /// # Safety
     ///
-    /// `ptr` は `frame_size(width, height)` バイト以上の有効なメモリを指す必要がある
+    /// `ptr` は `frame_size(coded_width, coded_height)` バイト以上の有効なメモリを指す必要がある
     unsafe fn set_planes(
         self,
         data: &mut sys::mfxFrameData,
         ptr: *mut u8,
-        width: usize,
-        height: usize,
+        coded_width: usize,
+        coded_height: usize,
     ) {
-        let luma_size = width * height;
+        let luma_size = coded_width * coded_height;
         unsafe {
-            data.__bindgen_anon_2.Pitch = self.pitch(width);
+            data.__bindgen_anon_2.Pitch = self.pitch(coded_width);
             match self {
                 // mfxFrameData は、NV12 や YUY2 のようなパック済みフォーマットの場合であっても、Y/U/V をそれぞれ先頭サンプルへ向ける必要がある
                 // ref: https://github.com/intel/libvpl/blob/778a66d6c6537f08eabb91955dbbf1bce3812894/api/vpl/mfxstructures.h#L344-L349
@@ -509,8 +509,6 @@ pub struct Encoder {
     video_param: sys::mfxVideoParam,
     frame_info: sys::mfxFrameInfo,
     frame_format: FrameFormat,
-    crop_w: usize,
-    crop_h: usize,
     bitstream_buffer: Vec<u8>,
     encoded_frames: VecDeque<EncodedFrame>,
     frame_count: u64,
@@ -534,13 +532,13 @@ impl Encoder {
                 "width and height must be non-zero",
             ));
         }
-        if config.width > u16::MAX as u32 || config.height > u16::MAX as u32 {
+        let aligned_width = align_up(config.width, 16);
+        let aligned_height = align_up(config.height, 16);
+        if aligned_width > u16::MAX as u32 || aligned_height > u16::MAX as u32 {
             return Err(Error::new_custom_owned(
                 "Encoder::new",
                 format!(
-                    "width ({}) and height ({}) must not exceed {}",
-                    config.width,
-                    config.height,
+                    "aligned width ({aligned_width}) and height ({aligned_height}) must not exceed {}",
                     u16::MAX
                 ),
             ));
@@ -548,16 +546,16 @@ impl Encoder {
         // pitch（行あたりのバイト数）が u16 に収まるか検証する
         // NV12: width, YUY2: width * 2, BGRA: width * 4
         let pitch_bytes: u64 = match config.frame_format {
-            FrameFormat::Nv12 => config.width as u64,
-            FrameFormat::Yuy2 => config.width as u64 * 2,
-            FrameFormat::Bgra => config.width as u64 * 4,
+            FrameFormat::Nv12 => aligned_width as u64,
+            FrameFormat::Yuy2 => aligned_width as u64 * 2,
+            FrameFormat::Bgra => aligned_width as u64 * 4,
         };
         if pitch_bytes > u16::MAX as u64 {
             return Err(Error::new_custom_owned(
                 "Encoder::new",
                 format!(
                     "pitch ({pitch_bytes} bytes) for {:?} with width {} exceeds u16::MAX",
-                    config.frame_format, config.width
+                    config.frame_format, aligned_width
                 ),
             ));
         }
@@ -569,9 +567,6 @@ impl Encoder {
 
         // 初期化失敗時に MFXClose を呼ぶガード
         let session_guard = CloseGuard::session(lib, loader, session);
-
-        let aligned_width = align_up(config.width, 16);
-        let aligned_height = align_up(config.height, 16);
 
         // mfxFrameInfo を設定する
         let mut frame_info: sys::mfxFrameInfo = unsafe { std::mem::zeroed() };
@@ -757,6 +752,10 @@ impl Encoder {
         video_param.ExtParam = std::ptr::null_mut();
         video_param.NumExtParam = 0;
 
+        // 初期化後の実効パラメータを反映する
+        lib.mfx_video_encode_get_video_param(session, &mut video_param)?;
+        frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
+
         // エンコーダ初期化後のガード（エラー時に MFXVideoENCODE_Close を呼ぶ）
         let encoder_guard = CloseGuard::encoder(lib, loader, session);
 
@@ -773,8 +772,6 @@ impl Encoder {
             video_param,
             frame_info,
             frame_format: config.frame_format,
-            crop_w: config.width as usize,
-            crop_h: config.height as usize,
             bitstream_buffer,
             encoded_frames: VecDeque::new(),
             frame_count: 0,
@@ -851,6 +848,12 @@ impl Encoder {
         Ok(param)
     }
 
+    /// エンコーダが要求する coded フレームサイズ（`FrameInfo::Width/Height`）を取得する
+    pub fn coded_size(&self) -> (usize, usize) {
+        let fi = unsafe { self.frame_info.__bindgen_anon_1.__bindgen_anon_1 };
+        (usize::from(fi.Width), usize::from(fi.Height))
+    }
+
     /// エンコード統計情報を取得する
     pub fn get_encode_stat(&self) -> Result<EncoderStats, Error> {
         let mut stat: sys::mfxEncodeStat = unsafe { std::mem::zeroed() };
@@ -866,16 +869,23 @@ impl Encoder {
     /// フレームをエンコードする
     pub fn encode(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
         // フレームサイズを検証する
+        let (coded_width, coded_height) = self.coded_size();
         let expected = self
             .frame_format
-            .frame_size(self.crop_w, self.crop_h)
+            .frame_size(coded_width, coded_height)
             .ok_or_else(|| {
                 Error::new_custom("Encoder::encode", "frame size calculation overflowed")
             })?;
         if frame_data.len() < expected {
-            return Err(Error::new_custom(
+            return Err(Error::new_custom_owned(
                 "Encoder::encode",
-                "frame data is too small for the specified frame format",
+                format!(
+                    "frame data is too small for coded size {}x{} (got {}, need at least {})",
+                    coded_width,
+                    coded_height,
+                    frame_data.len(),
+                    expected
+                ),
             ));
         }
 
@@ -888,8 +898,8 @@ impl Encoder {
             self.frame_format.set_planes(
                 &mut surface.Data,
                 frame_data.as_ptr() as *mut u8,
-                self.crop_w,
-                self.crop_h,
+                coded_width,
+                coded_height,
             );
         }
 
