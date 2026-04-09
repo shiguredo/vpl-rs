@@ -157,7 +157,7 @@ impl FrameFormat {
     ///
     /// # Safety
     ///
-    /// `ptr` は `coded_width * coded_height` に応じた有効なメモリを指す必要がある
+    /// `ptr` は `frame_size(coded_width, coded_height)` バイト以上の有効なメモリを指す必要がある
     unsafe fn set_planes(
         self,
         data: &mut sys::mfxFrameData,
