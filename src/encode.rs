@@ -157,7 +157,7 @@ impl FrameFormat {
     ///
     /// # Safety
     ///
-    /// `ptr` は `pitch * surface_height` に応じた有効なメモリを指す必要がある
+    /// `ptr` は `coded_width * coded_height` に応じた有効なメモリを指す必要がある
     unsafe fn set_planes(
         self,
         data: &mut sys::mfxFrameData,
@@ -540,6 +540,22 @@ impl Encoder {
                 format!(
                     "aligned width ({aligned_width}) and height ({aligned_height}) must not exceed {}",
                     u16::MAX
+                ),
+            ));
+        }
+        // pitch（行あたりのバイト数）が u16 に収まるか検証する
+        // NV12: width, YUY2: width * 2, BGRA: width * 4
+        let pitch_bytes: u64 = match config.frame_format {
+            FrameFormat::Nv12 => aligned_width as u64,
+            FrameFormat::Yuy2 => aligned_width as u64 * 2,
+            FrameFormat::Bgra => aligned_width as u64 * 4,
+        };
+        if pitch_bytes > u16::MAX as u64 {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "pitch ({pitch_bytes} bytes) for {:?} with width {} exceeds u16::MAX",
+                    config.frame_format, aligned_width
                 ),
             ));
         }
