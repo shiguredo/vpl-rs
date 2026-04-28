@@ -1,6 +1,9 @@
+use std::sync::mpsc;
+use std::time::Duration;
+
 use shiguredo_vpl::{
     Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodeOptions,
-    EncodedFrame, Encoder, EncoderConfig, FrameFormat, H264EncoderConfig, H264Profile,
+    EncodedFrame, Encoder, EncoderConfig, Error, FrameFormat, H264EncoderConfig, H264Profile,
     HevcEncoderConfig, HevcProfile, PictureType, RateControlMode, frame_type,
 };
 
@@ -123,26 +126,49 @@ fn psnr_y(original: &[u8], decoded: &[u8], width: usize, height: usize) -> f64 {
 }
 
 /// エンコードしてフレーム一覧とビットストリームを返すヘルパー
-fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame>, Vec<u8>) {
-    let mut encoder = Encoder::new(config).expect("failed to create encoder");
+fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<u8>) {
+    let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
+    let mut encoder = Encoder::new(config, move |result| {
+        tx.send(result)
+            .expect("failed to send encoded frame callback result");
+    })
+    .expect("failed to create encoder");
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
     };
+
+    for (index, frame) in frames.iter().enumerate() {
+        encoder
+            .encode(frame, index, &options)
+            .expect("failed to encode");
+    }
+    encoder.finish().expect("failed to finish");
+
     let mut encoded_frames = Vec::new();
     let mut bitstream = Vec::new();
-
-    for frame in frames {
-        encoder.encode(frame, &options).expect("failed to encode");
-        while let Some(encoded) = encoder.next_frame() {
-            bitstream.extend_from_slice(encoded.data());
-            encoded_frames.push(encoded);
-        }
-    }
-
-    encoder.finish().expect("failed to finish");
-    while let Some(encoded) = encoder.next_frame() {
+    for _ in 0..frames.len() {
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for encoded frame callback");
+        let encoded = result.expect("failed to encode");
         bitstream.extend_from_slice(encoded.data());
         encoded_frames.push(encoded);
+    }
+
+    let mut seen = vec![0u32; frames.len()];
+    for frame in &encoded_frames {
+        let value = *frame.value();
+        assert!(
+            value < frames.len(),
+            "encoded value {value} is out of range"
+        );
+        seen[value] += 1;
+    }
+    for (index, count) in seen.iter().enumerate() {
+        assert_eq!(
+            *count, 1,
+            "callback value {index} was expected once but appeared {count} times"
+        );
     }
 
     (encoded_frames, bitstream)
@@ -171,7 +197,7 @@ fn roundtrip(
     encoder_config: EncoderConfig,
     decoder_codec: DecoderCodec,
     input_frames: &[Vec<u8>],
-) -> (Vec<EncodedFrame>, Vec<shiguredo_vpl::DecodedFrame>) {
+) -> (Vec<EncodedFrame<usize>>, Vec<shiguredo_vpl::DecodedFrame>) {
     let width = encoder_config.width as usize;
     let height = encoder_config.height as usize;
     let num_frames = input_frames.len();
@@ -205,7 +231,8 @@ fn roundtrip(
 
 /// 指定エンコーダ設定の coded サイズを取得する
 fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
-    let encoder = Encoder::new(config.clone()).expect("failed to create encoder");
+    let encoder: Encoder<()> =
+        Encoder::new(config.clone(), |_| {}).expect("failed to create encoder");
     encoder.coded_size()
 }
 
@@ -301,7 +328,12 @@ fn test_roundtrip_h264_force_idr() {
 
     let width = config.width as usize;
     let height = config.height as usize;
-    let mut encoder = Encoder::new(config).expect("failed to create encoder");
+    let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
+    let mut encoder = Encoder::new(config, move |result| {
+        tx.send(result)
+            .expect("failed to send encoded frame callback result");
+    })
+    .expect("failed to create encoder");
     let (coded_width, coded_height) = encoder.coded_size();
     let mut encoded_frames = Vec::new();
     let mut bitstream = Vec::new();
@@ -318,15 +350,15 @@ fn test_roundtrip_h264_force_idr() {
             }
         };
         encoder
-            .encode(&frame_data, &options)
+            .encode(&frame_data, i, &options)
             .expect("failed to encode");
-        while let Some(encoded) = encoder.next_frame() {
-            bitstream.extend_from_slice(encoded.data());
-            encoded_frames.push(encoded);
-        }
     }
     encoder.finish().expect("failed to finish");
-    while let Some(encoded) = encoder.next_frame() {
+    for _ in 0..15 {
+        let encoded = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for encoded frame callback")
+            .expect("failed to encode");
         bitstream.extend_from_slice(encoded.data());
         encoded_frames.push(encoded);
     }
@@ -343,6 +375,114 @@ fn test_roundtrip_h264_force_idr() {
     // デコードで復号できることを確認する
     let decoded_frames = decode(DecoderCodec::H264, &bitstream);
     assert_eq!(decoded_frames.len(), 15);
+}
+
+/// encode に渡した value が callback で回収できることを確認する
+#[test]
+fn test_encode_value_callback() {
+    let mut config = EncoderConfig::new(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
+    let mut encoder = Encoder::new(config, move |result| {
+        tx.send(result)
+            .expect("failed to send encoded frame callback result");
+    })
+    .expect("failed to create encoder");
+    let (coded_width, coded_height) = encoder.coded_size();
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+
+    for i in 0..8 {
+        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        encoder
+            .encode(&frame_data, i, &options)
+            .expect("failed to encode");
+    }
+    encoder.finish().expect("failed to finish");
+
+    let mut seen = [false; 8];
+    for _ in 0..8 {
+        let encoded = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for encoded frame callback")
+            .expect("failed to encode");
+        let value = *encoded.value();
+        assert!(value < 8, "value {value} is out of range");
+        seen[value] = true;
+    }
+
+    for (index, appeared) in seen.iter().enumerate() {
+        assert!(*appeared, "value {index} did not appear in callback");
+    }
+}
+
+/// drop 時に未完了フレームへキャンセル callback が送信されることを確認する
+#[test]
+fn test_drop_cancels_pending_callbacks() {
+    let mut config = EncoderConfig::new(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    // 最初の入力で MFX_ERR_MORE_DATA になりやすい設定にして、
+    // finish 前に drop したとき未完了分が残る状況を作る。
+    config.gop_ref_dist = Some(3);
+
+    let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
+    {
+        let mut encoder = Encoder::new(config, move |result| {
+            tx.send(result)
+                .expect("failed to send encoded frame callback result");
+        })
+        .expect("failed to create encoder");
+        let (coded_width, coded_height) = encoder.coded_size();
+        let options = EncodeOptions {
+            frame_type: frame_type::UNKNOWN,
+        };
+
+        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, 0);
+        encoder
+            .encode(&frame_data, 0, &options)
+            .expect("failed to encode");
+    }
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("timed out waiting for callback result");
+    let error = match result {
+        Ok(_) => panic!("drop callback must be an error"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.status_code(),
+        Some(shiguredo_vpl::ffi::mfxStatus_MFX_ERR_ABORTED),
+        "canceled callback must return MFX_ERR_ABORTED"
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "unexpected extra callback after canceled result"
+    );
 }
 
 // --- H.265 ---

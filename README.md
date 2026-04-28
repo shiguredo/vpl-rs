@@ -66,6 +66,7 @@ use shiguredo_vpl::{
     CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
     H264EncoderConfig, H264Profile, RateControlMode, frame_type,
 };
+use std::sync::mpsc;
 
 let mut config = EncoderConfig::new(
     CodecConfig::H264(H264EncoderConfig {
@@ -80,7 +81,10 @@ let mut config = EncoderConfig::new(
 );
 config.target_kbps = Some(5_000);
 
-let mut encoder = Encoder::new(config)?;
+let (tx, rx) = mpsc::channel();
+let mut encoder = Encoder::new(config, move |result| {
+    tx.send(result).expect("failed to send callback result");
+})?;
 
 // フレームデータをエンコード
 let (coded_width, coded_height) = encoder.coded_size();
@@ -89,24 +93,21 @@ let frame_size = FrameFormat::Nv12
     .ok_or("frame size overflowed")?;
 let frame_data = vec![0u8; frame_size];
 let options = EncodeOptions { frame_type: frame_type::UNKNOWN };
-encoder.encode(&frame_data, &options)?;
+encoder.encode(&frame_data, "normal", &options)?;
 
 // IDR フレームを強制してエンコード
-encoder.encode(&frame_data, &EncodeOptions {
+encoder.encode(&frame_data, "force-idr", &EncodeOptions {
     frame_type: frame_type::IDR | frame_type::I | frame_type::REF,
 })?;
 
-// エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame() {
+// 残りのフレームをすべて取得する
+encoder.finish()?;
+for _ in 0..2 {
+    let encoded = rx.recv().expect("failed to receive callback result")?;
     println!("encoded bytes: {}", encoded.data().len());
     println!("timestamp: {}", encoded.timestamp());
     println!("picture type: {:?}", encoded.picture_type());
-}
-
-// 残りのフレームをすべて取得する
-encoder.finish()?;
-while let Some(encoded) = encoder.next_frame() {
-    println!("flushed: {} bytes", encoded.data().len());
+    println!("value: {}", encoded.value());
 }
 ```
 

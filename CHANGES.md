@@ -11,8 +11,10 @@
 
 ## develop
 
-### misc
+- [CHANGE] Encoder のエンコード完了通知を非同期 callback 型 API に変更する
+  - @melpon
 
+### misc
 
 ## 2026.1.2
 

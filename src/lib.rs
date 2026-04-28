@@ -29,6 +29,7 @@
 //!     Encoder, EncoderConfig, EncodeOptions, CodecConfig,
 //!     H264EncoderConfig, FrameFormat, RateControlMode,
 //! };
+//! use std::sync::mpsc;
 //!
 //! let config = EncoderConfig::new(
 //!     CodecConfig::H264(H264EncoderConfig { profile: None }),
@@ -39,7 +40,10 @@
 //!     1,
 //!     RateControlMode::Cqp,
 //! );
-//! let mut encoder = Encoder::new(config).unwrap();
+//! let (tx, rx) = mpsc::channel();
+//! let mut encoder = Encoder::new(config, move |result| {
+//!     tx.send(result).unwrap();
+//! }).unwrap();
 //!
 //! // フレームデータをエンコードする
 //! let (coded_width, coded_height) = encoder.coded_size();
@@ -48,12 +52,11 @@
 //!     .unwrap();
 //! let frame_data = vec![0u8; frame_size];
 //! let options = EncodeOptions { frame_type: 0 };
-//! encoder.encode(&frame_data, &options).unwrap();
+//! encoder.encode(&frame_data, (), &options).unwrap();
 //!
-//! // エンコード済みフレームを取り出す
-//! while let Some(encoded) = encoder.next_frame() {
-//!     let _bitstream = encoded.data();
-//! }
+//! encoder.finish().unwrap();
+//! let encoded = rx.recv().unwrap().unwrap();
+//! let _bitstream = encoded.data();
 //! ```
 
 mod codec_info;

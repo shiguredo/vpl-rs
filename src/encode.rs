@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
+use std::sync::mpsc;
+use std::thread;
 
 use crate::{Error, VplLibrary, sys};
 
@@ -169,9 +171,10 @@ impl FrameFormat {
         unsafe {
             data.__bindgen_anon_2.Pitch = self.pitch(coded_width);
             match self {
-                // mfxFrameData は、NV12 や YUY2 のようなパック済みフォーマットの場合であっても、Y/U/V をそれぞれ先頭サンプルへ向ける必要がある
-                // ref: https://github.com/intel/libvpl/blob/778a66d6c6537f08eabb91955dbbf1bce3812894/api/vpl/mfxstructures.h#L344-L349
                 FrameFormat::Nv12 => {
+                    // mfxFrameData は、NV12 や YUY2 のようなパック済みフォーマットの場合であっても、
+                    // Y/U/V をそれぞれ先頭サンプルへ向ける必要がある。
+                    // ref: https://github.com/intel/libvpl/blob/778a66d6c6537f08eabb91955dbbf1bce3812894/api/vpl/mfxstructures.h#L344-L349
                     data.__bindgen_anon_3.Y = ptr;
                     data.__bindgen_anon_4.U = ptr.add(luma_size);
                     data.__bindgen_anon_5.V = ptr.add(luma_size + 1);
@@ -182,7 +185,7 @@ impl FrameFormat {
                     data.__bindgen_anon_5.V = ptr.add(3);
                 }
                 FrameFormat::Bgra => {
-                    // BGRA はパック済み。R/G/B/A はすべて同じベースアドレスを指す
+                    // BGRA はパック済み。R/G/B/A はすべて同じベースアドレスを指す。
                     data.__bindgen_anon_3.R = ptr;
                     data.__bindgen_anon_4.G = ptr;
                     data.__bindgen_anon_5.B = ptr;
@@ -470,13 +473,14 @@ pub struct EncoderStats {
 }
 
 /// エンコード済みフレーム
-pub struct EncodedFrame {
+pub struct EncodedFrame<T> {
     data: Vec<u8>,
     timestamp: u64,
     picture_type: PictureType,
+    value: T,
 }
 
-impl EncodedFrame {
+impl<T> EncodedFrame<T> {
     /// エンコード済みデータを取得する
     pub fn data(&self) -> &[u8] {
         &self.data
@@ -496,40 +500,134 @@ impl EncodedFrame {
     pub fn picture_type(&self) -> PictureType {
         self.picture_type
     }
+
+    /// エンコード時に渡した値を取得する
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// エンコード時に渡した値を取得する（所有権を移動）
+    pub fn into_value(self) -> T {
+        self.value
+    }
 }
 
 /// デバイスビジー時の最大リトライ回数
 const DEVICE_BUSY_MAX_RETRIES: u32 = 10;
 
+struct PendingFrame<T> {
+    presentation_timestamp: u64,
+    value: T,
+    _frame_buffer: Vec<u8>,
+    _surface: Box<sys::mfxFrameSurface1>,
+}
+
+// Safety: PendingFrame はスレッド間で所有権を移動するだけで、同時アクセスはしない。
+unsafe impl<T: Send> Send for PendingFrame<T> {}
+
+struct SyncData {
+    syncp: sys::mfxSyncPoint,
+    bitstream: Box<sys::mfxBitstream>,
+    bitstream_buffer: Vec<u8>,
+}
+
+// Safety: SyncData はスレッド間で所有権を移動するだけで、同時アクセスはしない。
+unsafe impl Send for SyncData {}
+
+struct SyncedBitstream {
+    data: Vec<u8>,
+    frame_seq: u64,
+    picture_type: PictureType,
+}
+
+/// frame_seq と pending frame の対応情報を管理する構造体
+struct PendingFrameStore<T> {
+    by_frame_seq: HashMap<u64, PendingFrame<T>>,
+}
+
+impl<T> PendingFrameStore<T> {
+    fn new() -> Self {
+        Self {
+            by_frame_seq: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, frame_seq: u64, pending: PendingFrame<T>) -> Option<PendingFrame<T>> {
+        self.by_frame_seq.insert(frame_seq, pending)
+    }
+
+    fn take_by_frame_seq(&mut self, frame_seq: u64) -> Option<PendingFrame<T>> {
+        self.by_frame_seq.remove(&frame_seq)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_frame_seq.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.by_frame_seq.len()
+    }
+
+    fn drain_all(&mut self) -> Vec<(u64, PendingFrame<T>)> {
+        let mut drained = Vec::with_capacity(self.len());
+        for (frame_seq, pending) in self.by_frame_seq.drain() {
+            drained.push((frame_seq, pending));
+        }
+        drained
+    }
+}
+
+enum WorkerCommand<T> {
+    QueueFrame {
+        frame_seq: u64,
+        pending_frame: PendingFrame<T>,
+    },
+    Sync(SyncData),
+    WaitIdle(mpsc::Sender<Result<(), Error>>),
+    Stop,
+}
+
+// Safety: WorkerCommand はスレッド間で所有権を移動するだけで、同時アクセスはしない。
+unsafe impl<T: Send> Send for WorkerCommand<T> {}
+
 /// エンコーダ
-pub struct Encoder {
+pub struct Encoder<T> {
     lib: VplLibrary,
     loader: sys::mfxLoader,
     session: sys::mfxSession,
     video_param: sys::mfxVideoParam,
     frame_info: sys::mfxFrameInfo,
     frame_format: FrameFormat,
-    bitstream_buffer: Vec<u8>,
-    encoded_frames: VecDeque<EncodedFrame>,
+    bitstream_buffer_size: usize,
+    worker_tx: mpsc::Sender<WorkerCommand<T>>,
+    worker_handle: Option<thread::JoinHandle<()>>,
     frame_count: u64,
     framerate_den: u64,
 }
 
-// Safety: Encoder の全公開メソッドは &mut self を要求するため、同時に複数スレッドから
-// アクセスされることはない。VPL 仕様上、セッション操作の同一スレッド制約は明記されて
-// いないため、スレッド間の移動は許容する。Intel の公式サンプル（hello-encode 等）でも
+// Safety: エンコード完了通知は専用スレッドで行い、メインスレッドは EncodeFrameAsync のみ実行する。
+// VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
-unsafe impl Send for Encoder {}
+unsafe impl<T: Send> Send for Encoder<T> {}
 
-impl Encoder {
+impl<T: Send + 'static> Encoder<T> {
     /// エンコーダを作成する
-    pub fn new(config: EncoderConfig) -> Result<Self, Error> {
+    pub fn new<F>(config: EncoderConfig, callback: F) -> Result<Self, Error>
+    where
+        F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
+    {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
             return Err(Error::new_custom(
                 "Encoder::new",
                 "width and height must be non-zero",
+            ));
+        }
+        if config.framerate_den == 0 {
+            return Err(Error::new_custom(
+                "Encoder::new",
+                "framerate_den must be non-zero",
             ));
         }
         let aligned_width = align_up(config.width, 16);
@@ -601,7 +699,12 @@ impl Encoder {
         // mfxVideoParam を設定する
         let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
         video_param.IOPattern = sys::MFX_IOPATTERN_IN_SYSTEM_MEMORY as u16;
-        video_param.AsyncDepth = 1;
+        // AsyncDepth は 4 を既定値にする。
+        // libvpl のガイドでは、1 は最小メモリだが性能が低く、4 は高スループット寄りの推奨値とされる。
+        // ref:
+        // - doc/spec/source/programming_guide/VPL_prg_decoding.rst (AsyncDepth Specific Details)
+        // - doc/spec/source/programming_guide/VPL_prg_transcoding.rst (Operation sequence)
+        video_param.AsyncDepth = 4;
         unsafe {
             let mfx = &mut video_param.__bindgen_anon_1.mfx;
             mfx.FrameInfo = frame_info;
@@ -759,7 +862,20 @@ impl Encoder {
         // エンコーダ初期化後のガード（エラー時に MFXVideoENCODE_Close を呼ぶ）
         let encoder_guard = CloseGuard::encoder(lib, loader, session);
 
-        let bitstream_buffer = vec![0u8; (buffer_size_in_kb as usize) * 1024];
+        let bitstream_buffer_size = (buffer_size_in_kb as usize) * 1024;
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let session_handle = session as usize;
+        let worker_handle = thread::Builder::new()
+            .name("vpl-encoder-sync".to_owned())
+            .spawn(move || {
+                run_sync_worker(lib, session_handle, worker_rx, callback);
+            })
+            .map_err(|error| {
+                Error::new_custom_owned(
+                    "Encoder::new",
+                    format!("failed to spawn sync worker thread: {error}"),
+                )
+            })?;
 
         // ガードをキャンセルして所有権を Encoder に移す
         encoder_guard.cancel();
@@ -772,8 +888,9 @@ impl Encoder {
             video_param,
             frame_info,
             frame_format: config.frame_format,
-            bitstream_buffer,
-            encoded_frames: VecDeque::new(),
+            bitstream_buffer_size,
+            worker_tx,
+            worker_handle: Some(worker_handle),
             frame_count: 0,
             framerate_den: config.framerate_den as u64,
         })
@@ -803,6 +920,13 @@ impl Encoder {
     ///
     /// MFXVideoENCODE_Reset を呼び出す。ビットレートやフレームレートの変更に使用する。
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+        if let Some(0) = params.framerate_den {
+            return Err(Error::new_custom(
+                "Encoder::reconfigure",
+                "framerate_den must be non-zero",
+            ));
+        }
+
         // 現在の video_param をベースに変更を適用する
         unsafe {
             let enc = &mut self
@@ -867,7 +991,12 @@ impl Encoder {
     }
 
     /// フレームをエンコードする
-    pub fn encode(&mut self, frame_data: &[u8], options: &EncodeOptions) -> Result<(), Error> {
+    pub fn encode(
+        &mut self,
+        frame_data: &[u8],
+        value: T,
+        options: &EncodeOptions,
+    ) -> Result<(), Error> {
         // フレームサイズを検証する
         let (coded_width, coded_height) = self.coded_size();
         let expected = self
@@ -889,15 +1018,21 @@ impl Encoder {
             ));
         }
 
-        // mfxFrameSurface1 を設定する
-        let mut surface: sys::mfxFrameSurface1 = unsafe { std::mem::zeroed() };
+        let mut frame_buffer = frame_data[..expected].to_vec();
+        let frame_seq = self.frame_count;
+        // 公開 API 向けのタイムスタンプは従来どおり frame_rate 由来で計算する。
+        let presentation_timestamp = frame_seq
+            .checked_mul(self.framerate_den)
+            .ok_or_else(|| Error::new_custom("Encoder::encode", "timestamp overflowed"))?;
+
+        let mut surface: Box<sys::mfxFrameSurface1> = Box::new(unsafe { std::mem::zeroed() });
         surface.Info = self.frame_info;
-        surface.Data.TimeStamp = self.frame_count * self.framerate_den;
-        // VPL API は *mut を要求するが入力データを書き換えないためキャストする
+        surface.Data.TimeStamp = frame_seq;
+        // VPL API は *mut を要求するが入力データを書き換えないためキャストする。
         unsafe {
             self.frame_format.set_planes(
                 &mut surface.Data,
-                frame_data.as_ptr() as *mut u8,
+                frame_buffer.as_mut_ptr(),
                 coded_width,
                 coded_height,
             );
@@ -912,45 +1047,38 @@ impl Encoder {
             std::ptr::null_mut()
         };
 
-        let mut bitstream: sys::mfxBitstream = unsafe { std::mem::zeroed() };
-        bitstream.Data = self.bitstream_buffer.as_mut_ptr();
-        bitstream.MaxLength = self.bitstream_buffer.len() as u32;
+        let (mut bitstream, bitstream_buffer) = self.create_bitstream();
+        let syncp = self.encode_frame_async(ctrl_ptr, surface.as_mut(), bitstream.as_mut())?;
 
-        let Some(syncp) = self.encode_frame_async(ctrl_ptr, &mut surface, &mut bitstream)? else {
-            // 出力なし（通常の動作）
-            self.frame_count += 1;
-            return Ok(());
-        };
+        // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
+        self.send_worker_command(
+            "Encoder::encode",
+            WorkerCommand::QueueFrame {
+                frame_seq,
+                pending_frame: PendingFrame {
+                    presentation_timestamp,
+                    value,
+                    _frame_buffer: frame_buffer,
+                    _surface: surface,
+                },
+            },
+        )?;
 
-        self.sync_and_collect(&bitstream, syncp, surface.Data.TimeStamp)?;
-        self.frame_count += 1;
-        Ok(())
-    }
-
-    /// バッファに蓄積されたエンコード済みフレームを取り出す
-    pub fn next_frame(&mut self) -> Option<EncodedFrame> {
-        self.encoded_frames.pop_front()
-    }
-
-    /// エンコーダをフラッシュして残りのフレームを取得する
-    pub fn finish(&mut self) -> Result<(), Error> {
-        loop {
-            let mut bitstream: sys::mfxBitstream = unsafe { std::mem::zeroed() };
-            bitstream.Data = self.bitstream_buffer.as_mut_ptr();
-            bitstream.MaxLength = self.bitstream_buffer.len() as u32;
-
-            let Some(syncp) = self.encode_frame_async(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut bitstream,
-            )?
-            else {
-                // すべて排出済み
-                break;
-            };
-
-            self.sync_and_collect(&bitstream, syncp, 0)?;
+        if let Some(syncp) = syncp {
+            self.send_worker_command(
+                "Encoder::encode",
+                WorkerCommand::Sync(SyncData {
+                    syncp,
+                    bitstream,
+                    bitstream_buffer,
+                }),
+            )?;
         }
+
+        self.frame_count = self
+            .frame_count
+            .checked_add(1)
+            .ok_or_else(|| Error::new_custom("Encoder::encode", "frame sequence overflowed"))?;
         Ok(())
     }
 
@@ -990,76 +1118,271 @@ impl Encoder {
         ))
     }
 
-    /// SyncOperation を実行してエンコード済みフレームを収集する
-    fn sync_and_collect(
+    /// エンコーダをフラッシュして残りのフレームを取得する
+    ///
+    /// この関数は全てのエンコードの完了を待ち、内部で保持している
+    /// フレームをすべて排出してコールバックを呼び出し終わるまでブロックする。
+    pub fn finish(&mut self) -> Result<(), Error> {
+        loop {
+            // null surface でエンコードを呼び出して、残りのフレームをすべて排出する
+            let (mut bitstream, bitstream_buffer) = self.create_bitstream();
+
+            let Some(syncp) = self.encode_frame_async(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                bitstream.as_mut(),
+            )?
+            else {
+                // すべて排出済み
+                break;
+            };
+
+            self.send_worker_command(
+                "Encoder::finish",
+                WorkerCommand::Sync(SyncData {
+                    syncp,
+                    bitstream,
+                    bitstream_buffer,
+                }),
+            )?;
+        }
+
+        // ここまでに送った Sync が worker 側で全て処理されるまで待つ。
+        let (tx, rx) = mpsc::channel();
+        self.send_worker_command("Encoder::finish", WorkerCommand::WaitIdle(tx))?;
+        rx.recv().map_err(|_| {
+            Error::new_custom("Encoder::finish", "sync worker thread stopped unexpectedly")
+        })?
+    }
+
+    fn create_bitstream(&self) -> (Box<sys::mfxBitstream>, Vec<u8>) {
+        let mut bitstream_buffer = vec![0u8; self.bitstream_buffer_size];
+        let mut bitstream: Box<sys::mfxBitstream> = Box::new(unsafe { std::mem::zeroed() });
+        bitstream.Data = bitstream_buffer.as_mut_ptr();
+        bitstream.MaxLength = bitstream_buffer.len() as u32;
+        (bitstream, bitstream_buffer)
+    }
+
+    fn send_worker_command(
         &mut self,
-        bitstream: &sys::mfxBitstream,
-        syncp: sys::mfxSyncPoint,
-        timestamp: u64,
+        function: &'static str,
+        command: WorkerCommand<T>,
     ) -> Result<(), Error> {
-        if syncp.is_null() {
-            return Ok(());
-        }
-
-        Error::check_mfx(
-            self.lib
-                .mfx_video_core_sync_operation(self.session, syncp, sys::MFX_INFINITE),
-            "MFXVideoCORE_SyncOperation",
-        )?;
-
-        let offset = bitstream.DataOffset as usize;
-        let length = bitstream.DataLength as usize;
-        if length == 0 {
-            return Ok(());
-        }
-
-        // VPL が返したオフセットと長さがバッファ範囲内か検証する
-        let end = offset.checked_add(length).ok_or_else(|| {
-            Error::new_custom_owned(
-                "Encoder::encode",
-                format!("bitstream offset ({offset}) + length ({length}) overflows usize",),
-            )
-        })?;
-        if end > self.bitstream_buffer.len() {
-            return Err(Error::new_custom_owned(
-                "Encoder::encode",
-                format!(
-                    "bitstream range {}..{} exceeds buffer size {}",
-                    offset,
-                    end,
-                    self.bitstream_buffer.len()
-                ),
-            ));
-        }
-
-        let data = self.bitstream_buffer[offset..end].to_vec();
-        let frame_type = bitstream.FrameType;
-        let picture_type = if frame_type & (sys::MFX_FRAMETYPE_IDR as u16) != 0 {
-            PictureType::Idr
-        } else if frame_type & (sys::MFX_FRAMETYPE_I as u16) != 0 {
-            PictureType::I
-        } else if frame_type & (sys::MFX_FRAMETYPE_P as u16) != 0 {
-            PictureType::P
-        } else if frame_type & (sys::MFX_FRAMETYPE_B as u16) != 0 {
-            PictureType::B
-        } else {
-            PictureType::Unknown
-        };
-
-        self.encoded_frames.push_back(EncodedFrame {
-            data,
-            timestamp,
-            picture_type,
-        });
-        Ok(())
+        self.worker_tx
+            .send(command)
+            .map_err(|_| Error::new_custom(function, "sync worker thread is not running"))
     }
 }
 
-impl Drop for Encoder {
+// Drop<T> 実装は `T: Send + 'static` 制約を付けられないため、
+// worker 停止処理だけを impl<T> 側へ分離して呼び出せるようにしている。
+impl<T> Encoder<T> {
+    fn stop_worker(&mut self) {
+        if let Some(handle) = self.worker_handle.take() {
+            // Stop を送って join した時点で worker は確実に終了するため、
+            // 以降に worker へデータが届くケースは考慮しない。
+            let _ = self.worker_tx.send(WorkerCommand::Stop);
+            let _ = handle.join();
+        }
+    }
+}
+
+impl<T> Drop for Encoder<T> {
     fn drop(&mut self) {
+        self.stop_worker();
         let _ = self.lib.mfx_video_encode_close(self.session);
         let _ = self.lib.mfx_close(self.session);
         self.lib.mfx_unload(self.loader);
+    }
+}
+
+fn run_sync_worker<T, F>(
+    lib: VplLibrary,
+    session_handle: usize,
+    worker_rx: mpsc::Receiver<WorkerCommand<T>>,
+    mut callback: F,
+) where
+    T: Send + 'static,
+    F: FnMut(Result<EncodedFrame<T>, Error>),
+{
+    let mut pending_store = PendingFrameStore::new();
+    while let Ok(command) = worker_rx.recv() {
+        match command {
+            WorkerCommand::QueueFrame {
+                frame_seq,
+                pending_frame,
+            } => {
+                // encode 呼び出し単位の pending frame を frame_seq で登録する。
+                // syncp == None の入力も必ずここで保持し、後続出力との一致で回収する。
+                if pending_store.insert(frame_seq, pending_frame).is_some() {
+                    callback(Err(Error::new_custom_owned(
+                        "Encoder::sync_worker",
+                        format!("duplicate frame sequence in pending frames: {frame_seq}"),
+                    )));
+                }
+            }
+            WorkerCommand::Sync(sync) => {
+                // 通常入力の sync 完了を待ち、bitstream.TimeStamp と frame_seq を完全一致で対応付ける。
+                callback(sync_and_build_frame(
+                    lib,
+                    session_handle,
+                    sync,
+                    &mut pending_store,
+                ));
+            }
+            WorkerCommand::WaitIdle(reply_tx) => {
+                // finish 側のバリア。ここに到達した時点で、それ以前に送信された
+                // QueueFrame / Sync はすべて処理済みである。
+                if pending_store.is_empty() {
+                    let _ = reply_tx.send(Ok(()));
+                    continue;
+                }
+
+                let pending = pending_store.drain_all();
+                let remaining_count = pending.len();
+                for (frame_seq, _meta) in pending {
+                    callback(Err(finish_pending_error(frame_seq, remaining_count)));
+                }
+                let _ = reply_tx.send(Err(Error::new_custom_owned(
+                    "Encoder::finish",
+                    format!("finish completed but {remaining_count} pending frames remained"),
+                )));
+            }
+            WorkerCommand::Stop => {
+                // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
+                for (_frame_seq, _pending) in pending_store.drain_all() {
+                    callback(Err(canceled_error()));
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// `SyncOperation` 完了後の bitstream を取り出し、
+/// `bitstream.TimeStamp == frame_seq` の完全一致で pending frame を引き当てて `EncodedFrame<T>` を構築する。
+///
+/// この関数は以下をまとめて行う。
+/// 1. `SyncOperation` 完了待ちと bitstream データ抽出
+/// 2. `frame_seq` 完全一致での pending frame 取り出し
+/// 3. callback へ渡す `EncodedFrame<T>` の生成
+fn sync_and_build_frame<T>(
+    lib: VplLibrary,
+    session_handle: usize,
+    sync_data: SyncData,
+    pending_store: &mut PendingFrameStore<T>,
+) -> Result<EncodedFrame<T>, Error> {
+    let synced = sync_and_collect(lib, session_handle, sync_data)?;
+    let pending = pending_store
+        .take_by_frame_seq(synced.frame_seq)
+        .ok_or_else(|| mismatched_timestamp_error(synced.frame_seq, pending_store.len()))?;
+    Ok(EncodedFrame {
+        data: synced.data,
+        timestamp: pending.presentation_timestamp,
+        picture_type: synced.picture_type,
+        value: pending.value,
+    })
+}
+
+/// `SyncOperation` を実行し、VPL が返した `mfxBitstream` から
+/// callback に必要な情報を取り出して `SyncedBitstream` に整形する。
+///
+/// 取り出し時は `DataOffset` / `DataLength` の範囲検証を行い、
+/// 不正なオフセットでメモリアクセスしないように防御する。
+fn sync_and_collect(
+    lib: VplLibrary,
+    session_handle: usize,
+    sync_data: SyncData,
+) -> Result<SyncedBitstream, Error> {
+    let SyncData {
+        syncp,
+        bitstream,
+        bitstream_buffer,
+    } = sync_data;
+    if syncp.is_null() {
+        return Err(Error::new_custom(
+            "Encoder::sync_worker",
+            "sync point is null",
+        ));
+    }
+
+    let status = lib.mfx_video_core_sync_operation(
+        session_handle as sys::mfxSession,
+        syncp,
+        sys::MFX_INFINITE,
+    );
+    Error::check_mfx(status, "MFXVideoCORE_SyncOperation")?;
+
+    let offset = bitstream.DataOffset as usize;
+    let length = bitstream.DataLength as usize;
+    if length == 0 {
+        return Err(Error::new_custom(
+            "Encoder::sync_worker",
+            "encoded bitstream is empty",
+        ));
+    }
+
+    // VPL が返したオフセットと長さがバッファ範囲内か検証する
+    let end = offset.checked_add(length).ok_or_else(|| {
+        Error::new_custom_owned(
+            "Encoder::sync_worker",
+            format!("bitstream offset ({offset}) + length ({length}) overflows usize"),
+        )
+    })?;
+    if end > bitstream_buffer.len() {
+        return Err(Error::new_custom_owned(
+            "Encoder::sync_worker",
+            format!(
+                "bitstream range {}..{} exceeds buffer size {}",
+                offset,
+                end,
+                bitstream_buffer.len()
+            ),
+        ));
+    }
+
+    let data = bitstream_buffer[offset..end].to_vec();
+    let picture_type = picture_type_from_frame_type(bitstream.FrameType);
+    Ok(SyncedBitstream {
+        data,
+        frame_seq: bitstream.TimeStamp,
+        picture_type,
+    })
+}
+
+fn mismatched_timestamp_error(frame_seq: u64, pending_len: usize) -> Error {
+    Error::new_custom_owned(
+        "Encoder::sync_worker",
+        format!(
+            "no pending frame for bitstream timestamp {frame_seq} (pending count: {pending_len})"
+        ),
+    )
+}
+
+fn finish_pending_error(frame_seq: u64, pending_count: usize) -> Error {
+    Error::new_custom_owned(
+        "Encoder::finish",
+        format!(
+            "pending frames remained after flush for frame sequence {frame_seq} (pending count: {pending_count})"
+        ),
+    )
+}
+
+fn canceled_error() -> Error {
+    Error::from_mfx(sys::mfxStatus_MFX_ERR_ABORTED, "Encoder::drop")
+}
+
+fn picture_type_from_frame_type(frame_type: u16) -> PictureType {
+    if frame_type & (sys::MFX_FRAMETYPE_IDR as u16) != 0 {
+        PictureType::Idr
+    } else if frame_type & (sys::MFX_FRAMETYPE_I as u16) != 0 {
+        PictureType::I
+    } else if frame_type & (sys::MFX_FRAMETYPE_P as u16) != 0 {
+        PictureType::P
+    } else if frame_type & (sys::MFX_FRAMETYPE_B as u16) != 0 {
+        PictureType::B
+    } else {
+        PictureType::Unknown
     }
 }
 
@@ -1165,5 +1488,140 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     match value.checked_add(alignment - 1) {
         Some(v) => v & !(alignment - 1),
         None => !(alignment - 1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_pending(presentation_timestamp: u64, value: u32) -> PendingFrame<u32> {
+        PendingFrame {
+            presentation_timestamp,
+            value,
+            _frame_buffer: Vec::new(),
+            _surface: Box::new(unsafe { std::mem::zeroed() }),
+        }
+    }
+
+    #[test]
+    fn pending_frame_store_takes_by_frame_seq() {
+        let mut store = PendingFrameStore::new();
+        store.insert(10, make_pending(1000, 1));
+        store.insert(20, make_pending(2000, 2));
+
+        let second = store
+            .take_by_frame_seq(20)
+            .expect("pending frame for frame sequence 20 should exist");
+        assert_eq!(second.presentation_timestamp, 2000);
+        assert_eq!(second.value, 2);
+        let first = store
+            .take_by_frame_seq(10)
+            .expect("pending frame for frame sequence 10 should exist");
+        assert_eq!(first.presentation_timestamp, 1000);
+        assert_eq!(first.value, 1);
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn worker_wait_idle_returns_error_when_pending_remains() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let worker = thread::spawn(move || {
+            run_sync_worker(
+                VplLibrary,
+                0,
+                command_rx,
+                move |result: Result<EncodedFrame<u32>, Error>| {
+                    callback_tx
+                        .send(result.map(|_| ()))
+                        .expect("failed to forward callback result");
+                },
+            );
+        });
+
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 77,
+                pending_frame: make_pending(7700, 7),
+            })
+            .expect("failed to send QueueFrame");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        command_tx
+            .send(WorkerCommand::WaitIdle(reply_tx))
+            .expect("failed to send WaitIdle");
+        let wait_result = reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed to receive WaitIdle response");
+        assert!(
+            wait_result.is_err(),
+            "WaitIdle should fail when pending frames remain"
+        );
+
+        let callback_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed to receive callback result");
+        assert!(
+            callback_result.is_err(),
+            "pending frames on WaitIdle must be reported as callback error"
+        );
+
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("failed to send Stop");
+        worker.join().expect("worker thread panicked");
+    }
+
+    #[test]
+    fn worker_stop_returns_aborted_for_all_pending() {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let worker = thread::spawn(move || {
+            run_sync_worker(
+                VplLibrary,
+                0,
+                command_rx,
+                move |result: Result<EncodedFrame<u32>, Error>| {
+                    callback_tx
+                        .send(result.map(|_| ()))
+                        .expect("failed to forward callback result");
+                },
+            );
+        });
+
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 1,
+                pending_frame: make_pending(100, 10),
+            })
+            .expect("failed to send QueueFrame");
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 2,
+                pending_frame: make_pending(200, 20),
+            })
+            .expect("failed to send QueueFrame");
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("failed to send Stop");
+        worker.join().expect("worker thread panicked");
+
+        let mut callback_count = 0;
+        while let Ok(result) = callback_rx.recv_timeout(Duration::from_millis(200)) {
+            callback_count += 1;
+            let error = result.expect_err("stop callback must be an error");
+            assert_eq!(
+                error.status_code(),
+                Some(sys::mfxStatus_MFX_ERR_ABORTED),
+                "stop callback must return MFX_ERR_ABORTED",
+            );
+        }
+        assert_eq!(
+            callback_count, 2,
+            "expected callbacks for all pending frames"
+        );
     }
 }
