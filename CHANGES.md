@@ -22,6 +22,16 @@
   - `surface_work=NULL` の VPL 内部割り当て方式に移行し、自前のサーフェスプール管理を廃止
   - @melpon
 - [CHANGE] Encoder のエンコード完了通知を非同期 callback 型 API に変更する
+  - Encoder がジェネリクス `Encoder<T>` になり、コンストラクタでコールバックを受け取るように変更
+  - `Encoder::encode` のシグネチャが `encode(&mut self, data: &[u8], value: T)` に変更
+  - エンコード結果はコールバック経由で `EncodedFrame<T>` として受け取る
+  - `EncodedFrame` に `value()` / `into_value()` メソッドを追加
+  - `MFXMemory_GetSurfaceForEncode` による VPL 内部サーフェス利用に移行し、自前のサーフェスプール管理を廃止
+  - `SurfaceGuard` を導入し、エラーパスでの内部サーフェス解放漏れを防止
+  - `surface_work=NULL` の VPL 内部割り当て方式に移行し、Row-by-Row コピーでフレームデータを書き込む
+  - `EncoderConfig` に `async_depth` フィールドを追加（None の場合は 4）
+  - DEVICE_BUSY 最大リトライ回数を 10 → 30 に変更
+  - ドレイン時の空ビットストリームをエラーではなく空データとして正常処理するよう修正
   - @melpon
 
 ### misc
