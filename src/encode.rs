@@ -284,6 +284,13 @@ pub struct EncoderConfig {
     /// None の場合は 0（デフォルト）。
     pub aspect_ratio_h: Option<u16>,
 
+    // --- 非同期深度 (mfxVideoParam) ---
+    /// 非同期深度（mfxVideoParam.AsyncDepth）
+    ///
+    /// 1 = 最小メモリだが性能が低い。4 = 高スループット寄りの推奨値。
+    /// None の場合は 4（推奨値）を使用する。
+    pub async_depth: Option<u16>,
+
     // --- エンコード制御 (mfxInfoMFX) ---
     /// LowPower モード（mfxInfoMFX.LowPower）
     ///
@@ -410,6 +417,7 @@ impl EncoderConfig {
             framerate_den,
             aspect_ratio_w: None,
             aspect_ratio_h: None,
+            async_depth: None,
             low_power: None,
             brc_param_multiplier: None,
             target_usage: None,
@@ -713,12 +721,12 @@ impl<T: Send + 'static> Encoder<T> {
         // mfxVideoParam を設定する
         let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
         video_param.IOPattern = sys::MFX_IOPATTERN_IN_SYSTEM_MEMORY as u16;
-        // AsyncDepth は 4 を既定値にする。
+        // AsyncDepth は設定値またはデフォルト 4 を使用する。
         // libvpl のガイドでは、1 は最小メモリだが性能が低く、4 は高スループット寄りの推奨値とされる。
         // ref:
         // - doc/spec/source/programming_guide/VPL_prg_decoding.rst (AsyncDepth Specific Details)
         // - doc/spec/source/programming_guide/VPL_prg_transcoding.rst (Operation sequence)
-        video_param.AsyncDepth = 4;
+        video_param.AsyncDepth = config.async_depth.unwrap_or(4);
         unsafe {
             let mfx = &mut video_param.__bindgen_anon_1.mfx;
             mfx.FrameInfo = frame_info;
