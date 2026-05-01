@@ -1054,31 +1054,30 @@ impl<T: Send + 'static> Encoder<T> {
         if status != sys::mfxStatus_MFX_ERR_NONE {
             return Err(Error::from_mfx(status, "MFXMemory_GetSurfaceForEncode"));
         }
+        let surface_guard = SurfaceGuard::new(self.lib, surface);
 
         // Map して CPU から書き込めるようにする
         let status = self
             .lib
-            .mfx_frame_surface_map(surface, sys::mfxMemoryFlags_MFX_MAP_WRITE);
+            .mfx_frame_surface_map(surface_guard.surface(), sys::mfxMemoryFlags_MFX_MAP_WRITE);
         if status != sys::mfxStatus_MFX_ERR_NONE {
-            let _ = self.lib.mfx_frame_surface_release(surface);
             return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Map"));
         }
 
         // フレームデータを内部サーフェスにコピーする
         unsafe {
-            (*surface).Data.TimeStamp = frame_seq;
+            (*surface_guard.surface()).Data.TimeStamp = frame_seq;
             self.frame_format.copy_to_surface_planes(
                 &frame_data[..expected],
-                &(*surface).Data,
+                &(*surface_guard.surface()).Data,
                 coded_width,
                 coded_height,
             );
         }
 
         // Unmap して書き込み完了を通知する
-        let status = self.lib.mfx_frame_surface_unmap(surface);
+        let status = self.lib.mfx_frame_surface_unmap(surface_guard.surface());
         if status != sys::mfxStatus_MFX_ERR_NONE {
-            let _ = self.lib.mfx_frame_surface_release(surface);
             return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Unmap"));
         }
 
@@ -1092,14 +1091,11 @@ impl<T: Send + 'static> Encoder<T> {
         };
 
         let (mut bitstream, bitstream_buffer) = self.create_bitstream();
-        let syncp = self.encode_frame_async(ctrl_ptr, surface, bitstream.as_mut())?;
+        let syncp = self.encode_frame_async(ctrl_ptr, surface_guard.surface(), bitstream.as_mut())?;
 
         // エンコードを投げたら内部サーフェスの参照を解除する
         // （エンコーダ内部でまだ使用中でも安全に保持される）
-        let status = self.lib.mfx_frame_surface_release(surface);
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Release"));
-        }
+        surface_guard.release()?;
 
         // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
         self.send_worker_command(
@@ -1245,12 +1241,50 @@ impl<T> Drop for Encoder<T> {
     }
 }
 
+/// エンコード用内部サーフェスの解放を保証するガード
+///
+/// `encode_frame_async` などのエラーパスで `mfxFrameSurfaceInterface::Release`
+/// が呼ばれないことを防ぐため、ガード構造体でラップして安全に管理する。
+struct SurfaceGuard {
+    lib: VplLibrary,
+    surface: *mut sys::mfxFrameSurface1,
+}
+
+impl SurfaceGuard {
+    fn new(lib: VplLibrary, surface: *mut sys::mfxFrameSurface1) -> Self {
+        Self { lib, surface }
+    }
+
+    fn surface(&self) -> *mut sys::mfxFrameSurface1 {
+        self.surface
+    }
+
+    /// サーフェスの参照を明示的に解除する
+    fn release(mut self) -> Result<(), Error> {
+        let status = self.lib.mfx_frame_surface_release(self.surface);
+        self.surface = std::ptr::null_mut();
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Release"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SurfaceGuard {
+    fn drop(&mut self) {
+        if !self.surface.is_null() {
+            let _ = self.lib.mfx_frame_surface_release(self.surface);
+        }
+    }
+}
+
 fn run_sync_worker<T, F>(
     lib: VplLibrary,
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<T>>,
     mut callback: F,
-) where
+)
+where
     T: Send + 'static,
     F: FnMut(Result<EncodedFrame<T>, Error>),
 {
@@ -1364,11 +1398,15 @@ fn sync_and_collect(
 
     let offset = bitstream.DataOffset as usize;
     let length = bitstream.DataLength as usize;
+
+    // VPL のドレイン処理では syncp は返るが DataLength == 0 となるケースがあるため、
+    // 空ビットストリームをエラーではなく空データとして正常に処理する。
     if length == 0 {
-        return Err(Error::new_custom(
-            "Encoder::sync_worker",
-            "encoded bitstream is empty",
-        ));
+        return Ok(SyncedBitstream {
+            data: vec![],
+            frame_seq: bitstream.TimeStamp,
+            picture_type: picture_type_from_frame_type(bitstream.FrameType),
+        });
     }
 
     // VPL が返したオフセットと長さがバッファ範囲内か検証する
