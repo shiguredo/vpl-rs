@@ -1091,7 +1091,8 @@ impl<T: Send + 'static> Encoder<T> {
         };
 
         let (mut bitstream, bitstream_buffer) = self.create_bitstream();
-        let syncp = self.encode_frame_async(ctrl_ptr, surface_guard.surface(), bitstream.as_mut())?;
+        let syncp =
+            self.encode_frame_async(ctrl_ptr, surface_guard.surface(), bitstream.as_mut())?;
 
         // エンコードを投げたら内部サーフェスの参照を解除する
         // （エンコーダ内部でまだ使用中でも安全に保持される）
@@ -1283,8 +1284,7 @@ fn run_sync_worker<T, F>(
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<T>>,
     mut callback: F,
-)
-where
+) where
     T: Send + 'static,
     F: FnMut(Result<EncodedFrame<T>, Error>),
 {
