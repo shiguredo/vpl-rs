@@ -43,6 +43,18 @@ pub struct DecoderConfig {
     pub async_depth: Option<u16>,
 }
 
+impl DecoderConfig {
+    /// 必須パラメータのみ指定して DecoderConfig を作成する
+    ///
+    /// オプションパラメータはすべて None (デコーダのデフォルト) に設定される。
+    pub fn new(codec: DecoderCodec) -> DecoderConfig {
+        DecoderConfig {
+            codec,
+            async_depth: None,
+        }
+    }
+}
+
 /// デコードされたフレーム
 ///
 /// NV12 フォーマット (Y プレーン + インターリーブ UV プレーン) のフレームデータを

@@ -191,10 +191,7 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
 /// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
 fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
     let num_frames = bitstreams.len();
-    let config = DecoderConfig {
-        codec: decoder_codec,
-        async_depth: None,
-    };
+    let config = DecoderConfig::new(decoder_codec);
     let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
     let mut decoder = Decoder::new(config, move |result| {
         let info = result.map(|frame| {
@@ -501,10 +498,7 @@ fn test_decode_value_callback() {
         .collect();
     let (_, bitstreams) = encode(config, &input_frames);
 
-    let decoder_config = DecoderConfig {
-        codec: DecoderCodec::H264,
-        async_depth: None,
-    };
+    let decoder_config = DecoderConfig::new(DecoderCodec::H264);
     let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
     let mut decoder = Decoder::new(decoder_config, move |result| {
         let value = result.map(|frame| *frame.value());

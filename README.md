@@ -115,24 +115,28 @@ for _ in 0..2 {
 
 ```rust
 use shiguredo_vpl::{Decoder, DecoderCodec, DecoderConfig};
+use std::sync::mpsc;
 
-let config = DecoderConfig {
-    codec: DecoderCodec::H264,
-};
-let mut decoder = Decoder::new(config)?;
+let config = DecoderConfig::new(DecoderCodec::H264);
 
-// ビットストリームデータをデコード
-decoder.decode(&bitstream_data)?;
+let (tx, rx) = mpsc::channel();
+let mut decoder = Decoder::new(config, move |result| {
+    tx.send(result).expect("failed to send callback result");
+})?;
 
-// デコード済みフレームを取得 (NV12 フォーマット)
-while let Some(frame) = decoder.next_frame() {
-    println!("decoded: {}x{}, {} bytes", frame.width(), frame.height(), frame.data().len());
-}
+// ビットストリームデータをデコード (value で任意のユーザーデータを紐付け可能)
+let bitstream_data = vec![0u8; 1024];
+decoder.decode(&bitstream_data, "frame-0")?;
+decoder.decode(&bitstream_data, "frame-1")?;
 
 // 残りのフレームをすべて取得する
 decoder.finish()?;
-while let Some(frame) = decoder.next_frame() {
-    println!("flushed: {}x{}", frame.width(), frame.height());
+
+// コールバック経由でデコード結果を受け取る
+while let Ok(result) = rx.try_recv() {
+    let frame = result?;
+    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, value: {}",
+        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.value());
 }
 ```
 
