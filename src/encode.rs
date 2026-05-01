@@ -146,50 +146,66 @@ impl FrameFormat {
         }
     }
 
-    /// ピッチ（行あたりのバイト数）を返す
-    fn pitch(self, width: usize) -> u16 {
-        match self {
-            FrameFormat::Nv12 => width as u16,
-            FrameFormat::Yuy2 => (width * 2) as u16,
-            FrameFormat::Bgra => (width * 4) as u16,
-        }
-    }
-
-    /// mfxFrameData の各プレーンポインタを設定する
+    /// フレームデータを内部サーフェスの mfxFrameData にコピーする
     ///
     /// # Safety
     ///
-    /// `ptr` は `frame_size(coded_width, coded_height)` バイト以上の有効なメモリを指す必要がある
-    unsafe fn set_planes(
+    /// `data` の各プレーンポインタは有効なメモリを指し、Pitch 幅分の書き込みが可能である必要がある。
+    /// `src` は `frame_size(coded_width, coded_height)` バイト以上である必要がある。
+    unsafe fn copy_to_surface_planes(
         self,
-        data: &mut sys::mfxFrameData,
-        ptr: *mut u8,
+        src: &[u8],
+        data: &sys::mfxFrameData,
         coded_width: usize,
         coded_height: usize,
     ) {
-        let luma_size = coded_width * coded_height;
         unsafe {
-            data.__bindgen_anon_2.Pitch = self.pitch(coded_width);
+            let pitch = data.__bindgen_anon_2.Pitch as usize;
             match self {
                 FrameFormat::Nv12 => {
-                    // mfxFrameData は、NV12 や YUY2 のようなパック済みフォーマットの場合であっても、
-                    // Y/U/V をそれぞれ先頭サンプルへ向ける必要がある。
-                    // ref: https://github.com/intel/libvpl/blob/778a66d6c6537f08eabb91955dbbf1bce3812894/api/vpl/mfxstructures.h#L344-L349
-                    data.__bindgen_anon_3.Y = ptr;
-                    data.__bindgen_anon_4.U = ptr.add(luma_size);
-                    data.__bindgen_anon_5.V = ptr.add(luma_size + 1);
+                    let y_ptr = data.__bindgen_anon_3.Y;
+                    let uv_ptr = data.__bindgen_anon_4.UV;
+                    let luma_size = coded_width * coded_height;
+                    // Y プレーンをコピーする
+                    for row in 0..coded_height {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr().add(row * coded_width),
+                            y_ptr.add(row * pitch),
+                            coded_width,
+                        );
+                    }
+                    // UV プレーンをコピーする
+                    let uv_src = src.as_ptr().add(luma_size);
+                    let uv_height = coded_height / 2;
+                    for row in 0..uv_height {
+                        std::ptr::copy_nonoverlapping(
+                            uv_src.add(row * coded_width),
+                            uv_ptr.add(row * pitch),
+                            coded_width,
+                        );
+                    }
                 }
                 FrameFormat::Yuy2 => {
-                    data.__bindgen_anon_3.Y = ptr;
-                    data.__bindgen_anon_4.U = ptr.add(1);
-                    data.__bindgen_anon_5.V = ptr.add(3);
+                    let y_ptr = data.__bindgen_anon_3.Y;
+                    let row_bytes = coded_width * 2;
+                    for row in 0..coded_height {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr().add(row * row_bytes),
+                            y_ptr.add(row * pitch),
+                            row_bytes,
+                        );
+                    }
                 }
                 FrameFormat::Bgra => {
-                    // BGRA はパック済み。R/G/B/A はすべて同じベースアドレスを指す。
-                    data.__bindgen_anon_3.R = ptr;
-                    data.__bindgen_anon_4.G = ptr;
-                    data.__bindgen_anon_5.B = ptr;
-                    data.A = ptr;
+                    let b_ptr = data.__bindgen_anon_5.B;
+                    let row_bytes = coded_width * 4;
+                    for row in 0..coded_height {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr().add(row * row_bytes),
+                            b_ptr.add(row * pitch),
+                            row_bytes,
+                        );
+                    }
                 }
             }
         }
@@ -518,8 +534,6 @@ const DEVICE_BUSY_MAX_RETRIES: u32 = 10;
 struct PendingFrame<T> {
     presentation_timestamp: u64,
     value: T,
-    _frame_buffer: Vec<u8>,
-    _surface: Box<sys::mfxFrameSurface1>,
 }
 
 // Safety: PendingFrame はスレッド間で所有権を移動するだけで、同時アクセスはしない。
@@ -1018,24 +1032,46 @@ impl<T: Send + 'static> Encoder<T> {
             ));
         }
 
-        let mut frame_buffer = frame_data[..expected].to_vec();
         let frame_seq = self.frame_count;
         // 公開 API 向けのタイムスタンプは従来どおり frame_rate 由来で計算する。
         let presentation_timestamp = frame_seq
             .checked_mul(self.framerate_den)
             .ok_or_else(|| Error::new_custom("Encoder::encode", "timestamp overflowed"))?;
 
-        let mut surface: Box<sys::mfxFrameSurface1> = Box::new(unsafe { std::mem::zeroed() });
-        surface.Info = self.frame_info;
-        surface.Data.TimeStamp = frame_seq;
-        // VPL API は *mut を要求するが入力データを書き換えないためキャストする。
+        // エンコード用内部サーフェスを取得する
+        let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
+        let status = self
+            .lib
+            .mfx_memory_get_surface_for_encode(self.session, &mut surface);
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            return Err(Error::from_mfx(status, "MFXMemory_GetSurfaceForEncode"));
+        }
+
+        // Map して CPU から書き込めるようにする
+        let status = self
+            .lib
+            .mfx_frame_surface_map(surface, sys::mfxMemoryFlags_MFX_MAP_WRITE);
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            let _ = self.lib.mfx_frame_surface_release(surface);
+            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Map"));
+        }
+
+        // フレームデータを内部サーフェスにコピーする
         unsafe {
-            self.frame_format.set_planes(
-                &mut surface.Data,
-                frame_buffer.as_mut_ptr(),
+            (*surface).Data.TimeStamp = frame_seq;
+            self.frame_format.copy_to_surface_planes(
+                &frame_data[..expected],
+                &(*surface).Data,
                 coded_width,
                 coded_height,
             );
+        }
+
+        // Unmap して書き込み完了を通知する
+        let status = self.lib.mfx_frame_surface_unmap(surface);
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            let _ = self.lib.mfx_frame_surface_release(surface);
+            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Unmap"));
         }
 
         // エンコード制御を設定する
@@ -1048,7 +1084,14 @@ impl<T: Send + 'static> Encoder<T> {
         };
 
         let (mut bitstream, bitstream_buffer) = self.create_bitstream();
-        let syncp = self.encode_frame_async(ctrl_ptr, surface.as_mut(), bitstream.as_mut())?;
+        let syncp = self.encode_frame_async(ctrl_ptr, surface, bitstream.as_mut())?;
+
+        // エンコードを投げたら内部サーフェスの参照を解除する
+        // （エンコーダ内部でまだ使用中でも安全に保持される）
+        let status = self.lib.mfx_frame_surface_release(surface);
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Release"));
+        }
 
         // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
         self.send_worker_command(
@@ -1058,8 +1101,6 @@ impl<T: Send + 'static> Encoder<T> {
                 pending_frame: PendingFrame {
                     presentation_timestamp,
                     value,
-                    _frame_buffer: frame_buffer,
-                    _surface: surface,
                 },
             },
         )?;
@@ -1502,8 +1543,6 @@ mod tests {
         PendingFrame {
             presentation_timestamp,
             value,
-            _frame_buffer: Vec::new(),
-            _surface: Box::new(unsafe { std::mem::zeroed() }),
         }
     }
 

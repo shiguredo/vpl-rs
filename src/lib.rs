@@ -312,4 +312,62 @@ impl VplLibrary {
             sys::MFXVideoDECODE_DecodeFrameAsync(session, bs, work_surface, out_surface, syncp)
         }
     }
+
+    /// MFXMemory_GetSurfaceForEncode を呼び出してエンコード用内部サーフェスを取得する
+    pub(crate) fn mfx_memory_get_surface_for_encode(
+        &self,
+        session: sys::mfxSession,
+        surface: *mut *mut sys::mfxFrameSurface1,
+    ) -> i32 {
+        unsafe { sys::MFXMemory_GetSurfaceForEncode(session, surface) }
+    }
+
+    /// mfxFrameSurfaceInterface::Map を呼び出してサーフェスをマップする
+    pub(crate) fn mfx_frame_surface_map(
+        &self,
+        surface: *mut sys::mfxFrameSurface1,
+        flags: u32,
+    ) -> i32 {
+        unsafe {
+            let iface = (*surface).__bindgen_anon_1.FrameInterface;
+            if iface.is_null() {
+                return sys::mfxStatus_MFX_ERR_NULL_PTR;
+            }
+            let map_fn = (*iface).Map;
+            if map_fn.is_none() {
+                return sys::mfxStatus_MFX_ERR_NULL_PTR;
+            }
+            map_fn.unwrap()(surface, flags)
+        }
+    }
+
+    /// mfxFrameSurfaceInterface::Unmap を呼び出してサーフェスをアンマップする
+    pub(crate) fn mfx_frame_surface_unmap(&self, surface: *mut sys::mfxFrameSurface1) -> i32 {
+        unsafe {
+            let iface = (*surface).__bindgen_anon_1.FrameInterface;
+            if iface.is_null() {
+                return sys::mfxStatus_MFX_ERR_NULL_PTR;
+            }
+            let unmap_fn = (*iface).Unmap;
+            if unmap_fn.is_none() {
+                return sys::mfxStatus_MFX_ERR_NULL_PTR;
+            }
+            unmap_fn.unwrap()(surface)
+        }
+    }
+
+    /// mfxFrameSurfaceInterface::Release を呼び出してサーフェスの参照を解除する
+    pub(crate) fn mfx_frame_surface_release(&self, surface: *mut sys::mfxFrameSurface1) -> i32 {
+        unsafe {
+            let iface = (*surface).__bindgen_anon_1.FrameInterface;
+            if iface.is_null() {
+                return sys::mfxStatus_MFX_ERR_NULL_PTR;
+            }
+            let release_fn = (*iface).Release;
+            if release_fn.is_none() {
+                return sys::mfxStatus_MFX_ERR_NULL_PTR;
+            }
+            release_fn.unwrap()(surface)
+        }
+    }
 }
