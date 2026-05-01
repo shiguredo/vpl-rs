@@ -208,7 +208,7 @@ impl<T: Send + 'static> Decoder<T> {
     /// `DecodedFrame` のライフタイムはコールバック呼び出し中のみ有効。
     pub fn new<F>(config: DecoderConfig, callback: F) -> Result<Self, Error>
     where
-        F: FnMut(Result<DecodedFrame<'_, T>, Error>) + Send + 'static,
+        F: for<'a> FnMut(Result<DecodedFrame<'a, T>, Error>) + Send + 'static,
     {
         let lib = VplLibrary::load()?;
 
@@ -510,13 +510,17 @@ fn run_sync_worker<T, F>(
     mut callback: F,
 ) where
     T: Send + 'static,
-    F: FnMut(Result<DecodedFrame<'_, T>, Error>),
+    F: for<'a> FnMut(Result<DecodedFrame<'a, T>, Error>),
 {
     while let Ok(command) = worker_rx.recv() {
         match command {
             WorkerCommand::DecodeFrame { sync_data, pending } => {
                 // SyncOperation + Map + 読み取り + callback + Unmap + Release
-                callback(sync_and_callback(lib, session_handle, sync_data, pending));
+                if let Err(error) =
+                    sync_and_callback(lib, session_handle, sync_data, pending, &mut callback)
+                {
+                    callback(Err(error));
+                }
             }
             WorkerCommand::DrainFrame { sync_data } => {
                 // SyncOperation + Map + Unmap + Release のみ。コールバックなし
@@ -535,18 +539,72 @@ fn run_sync_worker<T, F>(
     }
 }
 
-/// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
-/// `DecodedFrame<T>` を構築して返す。
+/// デコード済みサーフェスの `Map` / `Unmap` / `Release` を保証するガード
 ///
-/// `out_surface` は `Unmap` + `Release` で解放されるため、
-/// `DecodedFrame` 内の y/uv スライスはコールバック呼び出し中のみ有効。
-fn sync_and_callback<T>(
+/// `Drop` で `Unmap` と `Release` を自動実行する。
+struct DecodedSurfaceGuard {
+    lib: VplLibrary,
+    surface: *mut sys::mfxFrameSurface1,
+    mapped: bool,
+}
+
+impl DecodedSurfaceGuard {
+    fn new(lib: VplLibrary, surface: *mut sys::mfxFrameSurface1) -> Self {
+        Self {
+            lib,
+            surface,
+            mapped: false,
+        }
+    }
+
+    fn surface(&self) -> *mut sys::mfxFrameSurface1 {
+        self.surface
+    }
+
+    fn map_read(&mut self) -> Result<(), Error> {
+        let status = self
+            .lib
+            .mfx_frame_surface_map(self.surface, sys::mfxMemoryFlags_MFX_MAP_READ);
+        Error::check_mfx(status, "mfxFrameSurfaceInterface::Map")?;
+        self.mapped = true;
+        Ok(())
+    }
+}
+
+impl Drop for DecodedSurfaceGuard {
+    fn drop(&mut self) {
+        if self.surface.is_null() {
+            return;
+        }
+        if self.mapped {
+            let _ = Error::check_mfx(
+                self.lib.mfx_frame_surface_unmap(self.surface),
+                "mfxFrameSurfaceInterface::Unmap",
+            );
+        }
+        let _ = Error::check_mfx(
+            self.lib.mfx_frame_surface_release(self.surface),
+            "mfxFrameSurfaceInterface::Release",
+        );
+    }
+}
+
+/// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
+/// callback を呼び出す。
+///
+/// `DecodedFrame` 内の y/uv スライスは callback 呼び出し中のみ有効。
+fn sync_and_callback<T, F>(
     lib: VplLibrary,
     session_handle: usize,
     sync_data: DecodeSyncData,
     pending: PendingDecode<T>,
-) -> Result<DecodedFrame<'static, T>, Error> {
+    callback: &mut F,
+) -> Result<(), Error>
+where
+    F: for<'a> FnMut(Result<DecodedFrame<'a, T>, Error>),
+{
     let DecodeSyncData { syncp, out_surface } = sync_data;
+    let mut surface_guard = DecodedSurfaceGuard::new(lib, out_surface);
 
     if syncp.is_null() {
         return Err(Error::new_custom(
@@ -568,41 +626,14 @@ fn sync_and_callback<T>(
         syncp,
         sys::MFX_INFINITE,
     );
-    if let Err(err) = Error::check_mfx(status, "MFXVideoCORE_SyncOperation") {
-        // エラー時も out_surface は解放する
-        lib.mfx_frame_surface_release(out_surface);
-        return Err(err);
-    }
+    Error::check_mfx(status, "MFXVideoCORE_SyncOperation")?;
 
-    // Map して CPU から読み取り可能にする
-    let status = lib.mfx_frame_surface_map(out_surface, sys::mfxMemoryFlags_MFX_MAP_READ);
-    if let Err(err) = Error::check_mfx(status, "mfxFrameSurfaceInterface::Map") {
-        lib.mfx_frame_surface_release(out_surface);
-        return Err(err);
-    }
+    surface_guard.map_read()?;
 
     // デコードされたフレームデータを読み取る
-    let result = read_decoded_surface(out_surface, pending);
-
-    // Unmap して読み取り完了を通知する
-    let unmap_status = lib.mfx_frame_surface_unmap(out_surface);
-    // Release でサーフェスの参照カウントを減らす
-    let release_status = lib.mfx_frame_surface_release(out_surface);
-
-    match result {
-        Ok(frame) => {
-            // Unmap と Release のエラーはデコード成功時は無視する
-            let _ = Error::check_mfx(unmap_status, "mfxFrameSurfaceInterface::Unmap");
-            let _ = Error::check_mfx(release_status, "mfxFrameSurfaceInterface::Release");
-            Ok(frame)
-        }
-        Err(err) => {
-            // 読み取り失敗時も Unmap/Release は試行する
-            let _ = Error::check_mfx(unmap_status, "mfxFrameSurfaceInterface::Unmap");
-            let _ = Error::check_mfx(release_status, "mfxFrameSurfaceInterface::Release");
-            Err(err)
-        }
-    }
+    let frame = read_decoded_surface(&surface_guard, pending)?;
+    callback(Ok(frame));
+    Ok(())
 }
 
 /// ドレインフレームの Sync + Map/Unmap + Release を行う
@@ -611,11 +642,9 @@ fn sync_and_callback<T>(
 /// エラーはすべて無視する（データ破棄が目的のため）。
 fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncData) {
     let DecodeSyncData { syncp, out_surface } = sync_data;
+    let mut surface_guard = DecodedSurfaceGuard::new(lib, out_surface);
 
     if syncp.is_null() || out_surface.is_null() {
-        if !out_surface.is_null() {
-            lib.mfx_frame_surface_release(out_surface);
-        }
         return;
     }
 
@@ -625,10 +654,8 @@ fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncD
         sys::MFX_INFINITE,
     );
 
-    // Sync が成功していれば Map/Unmap/Release でクリーンアップする
-    let _ = lib.mfx_frame_surface_map(out_surface, sys::mfxMemoryFlags_MFX_MAP_READ);
-    let _ = lib.mfx_frame_surface_unmap(out_surface);
-    lib.mfx_frame_surface_release(out_surface);
+    // Drop での自動解放を使ってクリーンアップする
+    let _ = surface_guard.map_read();
 }
 
 /// デコード済みサーフェスから Y/UV スライスを読み取り `DecodedFrame` を構築する
@@ -695,14 +722,13 @@ unsafe fn read_decoded_surface_inner<'a, T>(
 
 /// デコード済みサーフェスを読み取る安全性ラッパー
 ///
-/// `DecodedFrame` のライフタイムを `'static` にしているが、
-/// 実際のデータ寿命は呼び出し元の `sync_and_callback` が Unmap/Release するまで。
-/// Unmap/Release の前にコールバックが完了するため、実質的に安全。
-fn read_decoded_surface<T>(
-    out_surface: *mut sys::mfxFrameSurface1,
+/// `DecodedFrame` のライフタイムを `DecodedSurfaceGuard` に束縛し、
+/// callback 呼び出し中のみデータ参照が有効になるようにする。
+fn read_decoded_surface<'a, T>(
+    surface_guard: &'a DecodedSurfaceGuard,
     pending: PendingDecode<T>,
-) -> Result<DecodedFrame<'static, T>, Error> {
-    unsafe { read_decoded_surface_inner(out_surface, pending) }
+) -> Result<DecodedFrame<'a, T>, Error> {
+    unsafe { read_decoded_surface_inner(surface_guard.surface(), pending) }
 }
 
 /// セッションの解放ガード
