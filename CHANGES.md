@@ -11,6 +11,16 @@
 
 ## develop
 
+- [CHANGE] Decoder のデコード完了通知を非同期 callback 型 API に変更する
+  - Decoder がジェネリクス `Decoder<T>` になり、コンストラクタでコールバックを受け取るように変更
+  - `Decoder::decode` のシグネチャが `decode(&mut self, data: &[u8], value: T)` に変更
+  - デコード結果はコールバック経由で `DecodedFrame<'a, T>` として受け取る
+  - `DecodedFrame` は y()/uv() スライスと pitch() を提供し、コールバック呼び出し中のみ有効
+  - データコピー不要で、VPL 内部サーフェスから直接読み取ったデータを借用として渡す
+  - `Decoder::next_frame` を削除
+  - `DecoderConfig` に `async_depth` フィールドを追加（None の場合は 4）
+  - `surface_work=NULL` の VPL 内部割り当て方式に移行し、自前のサーフェスプール管理を廃止
+  - @melpon
 - [CHANGE] Encoder のエンコード完了通知を非同期 callback 型 API に変更する
   - @melpon
 

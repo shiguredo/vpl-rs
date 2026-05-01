@@ -7,6 +7,16 @@ use shiguredo_vpl::{
     HevcEncoderConfig, HevcProfile, PictureType, RateControlMode, frame_type,
 };
 
+/// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
+#[allow(dead_code)]
+struct DecodedFrameInfo {
+    y_data: Vec<u8>,
+    pitch: usize,
+    width: usize,
+    height: usize,
+    value: usize,
+}
+
 /// ダミー NV12 フレームを生成する
 ///
 /// Y プレーンはフレーム番号に応じたグラデーション、UV プレーンは 128 固定。
@@ -110,23 +120,27 @@ fn generate_colorbar_nv12(
 /// Y プレーン同士の PSNR を計算する（dB）
 ///
 /// 値が大きいほど入力と出力が近い。一般に 30dB 以上あれば視覚的に良好。
-fn psnr_y(original: &[u8], decoded: &[u8], width: usize, height: usize) -> f64 {
-    assert_eq!(original.len(), decoded.len());
-    let y_size = width * height;
+/// decoded_y はピッチを含む生データ。
+fn psnr_y(original: &[u8], decoded_y: &[u8], pitch: usize, width: usize, height: usize) -> f64 {
     let mut mse_sum: f64 = 0.0;
-    for i in 0..y_size {
-        let diff = original[i] as f64 - decoded[i] as f64;
-        mse_sum += diff * diff;
+    let pixels = width * height;
+    for row in 0..height {
+        for col in 0..width {
+            let orig = original[row * width + col] as f64;
+            let dec = decoded_y[row * pitch + col] as f64;
+            let diff = orig - dec;
+            mse_sum += diff * diff;
+        }
     }
-    let mse = mse_sum / y_size as f64;
+    let mse = mse_sum / pixels as f64;
     if mse == 0.0 {
         return f64::INFINITY;
     }
     10.0 * (255.0_f64 * 255.0 / mse).log10()
 }
 
-/// エンコードしてフレーム一覧とビットストリームを返すヘルパー
-fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<u8>) {
+/// エンコードしてフレーム一覧とフレームごとのビットストリームを返すヘルパー
+fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
     let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
     let mut encoder = Encoder::new(config, move |result| {
         tx.send(result)
@@ -145,13 +159,13 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
     encoder.finish().expect("failed to finish");
 
     let mut encoded_frames = Vec::new();
-    let mut bitstream = Vec::new();
+    let mut bitstreams: Vec<Vec<u8>> = Vec::new();
     for _ in 0..frames.len() {
         let result = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("timed out waiting for encoded frame callback");
         let encoded = result.expect("failed to encode");
-        bitstream.extend_from_slice(encoded.data());
+        bitstreams.push(encoded.data().to_vec());
         encoded_frames.push(encoded);
     }
 
@@ -171,22 +185,45 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
         );
     }
 
-    (encoded_frames, bitstream)
+    (encoded_frames, bitstreams)
 }
 
-/// デコードしてフレーム一覧を返すヘルパー
-fn decode(decoder_codec: DecoderCodec, bitstream: &[u8]) -> Vec<shiguredo_vpl::DecodedFrame> {
+/// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
+fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
+    let num_frames = bitstreams.len();
     let config = DecoderConfig {
         codec: decoder_codec,
+        async_depth: None,
     };
-    let mut decoder = Decoder::new(config).expect("failed to create decoder");
+    let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
+    let mut decoder = Decoder::new(config, move |result| {
+        let info = result.map(|frame| {
+            let y_data = frame.y().to_vec();
+            DecodedFrameInfo {
+                y_data,
+                pitch: frame.pitch(),
+                width: frame.width(),
+                height: frame.height(),
+                value: *frame.value(),
+            }
+        });
+        tx.send(info)
+            .expect("failed to send decoded frame callback result");
+    })
+    .expect("failed to create decoder");
 
-    decoder.decode(bitstream).expect("failed to decode");
+    for (index, bs) in bitstreams.iter().enumerate() {
+        decoder.decode(bs, index).expect("failed to decode");
+    }
     decoder.finish().expect("failed to finish");
 
     let mut decoded_frames = Vec::new();
-    while let Some(frame) = decoder.next_frame() {
-        decoded_frames.push(frame);
+    for _ in 0..num_frames {
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for decoded frame callback");
+        let info = result.expect("failed to decode");
+        decoded_frames.push(info);
     }
 
     decoded_frames
@@ -197,12 +234,12 @@ fn roundtrip(
     encoder_config: EncoderConfig,
     decoder_codec: DecoderCodec,
     input_frames: &[Vec<u8>],
-) -> (Vec<EncodedFrame<usize>>, Vec<shiguredo_vpl::DecodedFrame>) {
+) -> (Vec<EncodedFrame<usize>>, Vec<DecodedFrameInfo>) {
     let width = encoder_config.width as usize;
     let height = encoder_config.height as usize;
     let num_frames = input_frames.len();
 
-    let (encoded_frames, bitstream) = encode(encoder_config, input_frames);
+    let (encoded_frames, bitstreams) = encode(encoder_config, input_frames);
 
     assert!(
         !encoded_frames.is_empty(),
@@ -212,7 +249,7 @@ fn roundtrip(
         assert!(!frame.data().is_empty(), "encoded frame {i} has empty data");
     }
 
-    let decoded_frames = decode(decoder_codec, &bitstream);
+    let decoded_frames = decode(decoder_codec, &bitstreams);
 
     assert_eq!(
         decoded_frames.len(),
@@ -221,9 +258,12 @@ fn roundtrip(
         decoded_frames.len()
     );
     for (i, frame) in decoded_frames.iter().enumerate() {
-        assert_eq!(frame.width(), width, "decoded frame {i} width mismatch");
-        assert_eq!(frame.height(), height, "decoded frame {i} height mismatch");
-        assert!(!frame.data().is_empty(), "decoded frame {i} has empty data");
+        assert_eq!(frame.width, width, "decoded frame {i} width mismatch");
+        assert_eq!(frame.height, height, "decoded frame {i} height mismatch");
+        assert!(
+            !frame.y_data.is_empty(),
+            "decoded frame {i} has empty y plane"
+        );
     }
 
     (encoded_frames, decoded_frames)
@@ -257,7 +297,13 @@ fn roundtrip_colorbar(
     let (_, decoded_frames) = roundtrip(encoder_config, decoder_codec, &input_frames);
 
     for (i, decoded) in decoded_frames.iter().enumerate() {
-        let psnr = psnr_y(&colorbar_for_psnr, decoded.data(), width, height);
+        let psnr = psnr_y(
+            &colorbar_for_psnr,
+            &decoded.y_data,
+            decoded.pitch,
+            width,
+            height,
+        );
         assert!(
             psnr >= min_psnr_db,
             "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
@@ -336,7 +382,7 @@ fn test_roundtrip_h264_force_idr() {
     .expect("failed to create encoder");
     let (coded_width, coded_height) = encoder.coded_size();
     let mut encoded_frames = Vec::new();
-    let mut bitstream = Vec::new();
+    let mut bitstreams: Vec<Vec<u8>> = Vec::new();
 
     for i in 0..15 {
         let frame_data = generate_dummy_nv12(width, height, coded_width, coded_height, i);
@@ -359,7 +405,7 @@ fn test_roundtrip_h264_force_idr() {
             .recv_timeout(Duration::from_secs(10))
             .expect("timed out waiting for encoded frame callback")
             .expect("failed to encode");
-        bitstream.extend_from_slice(encoded.data());
+        bitstreams.push(encoded.data().to_vec());
         encoded_frames.push(encoded);
     }
 
@@ -373,7 +419,7 @@ fn test_roundtrip_h264_force_idr() {
     );
 
     // デコードで復号できることを確認する
-    let decoded_frames = decode(DecoderCodec::H264, &bitstream);
+    let decoded_frames = decode(DecoderCodec::H264, &bitstreams);
     assert_eq!(decoded_frames.len(), 15);
 }
 
@@ -421,6 +467,64 @@ fn test_encode_value_callback() {
             .expect("failed to encode");
         let value = *encoded.value();
         assert!(value < 8, "value {value} is out of range");
+        seen[value] = true;
+    }
+
+    for (index, appeared) in seen.iter().enumerate() {
+        assert!(*appeared, "value {index} did not appear in callback");
+    }
+}
+
+/// decode に渡した value が callback で回収できることを確認する
+#[test]
+fn test_decode_value_callback() {
+    let mut config = EncoderConfig::new(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let (coded_width, coded_height) = coded_size_for(&config);
+    let num_frames = 8;
+    let input_frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
+        .collect();
+    let (_, bitstreams) = encode(config, &input_frames);
+
+    let decoder_config = DecoderConfig {
+        codec: DecoderCodec::H264,
+        async_depth: None,
+    };
+    let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
+    let mut decoder = Decoder::new(decoder_config, move |result| {
+        let value = result.map(|frame| *frame.value());
+        tx.send(value)
+            .expect("failed to send decoded frame callback result");
+    })
+    .expect("failed to create decoder");
+
+    for (i, bs) in bitstreams.iter().enumerate() {
+        decoder.decode(bs, i).expect("failed to decode");
+    }
+    decoder.finish().expect("failed to finish");
+
+    let mut seen = [false; 8];
+    for _ in 0..num_frames {
+        let value = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for decoded frame callback")
+            .expect("failed to decode");
+        assert!(value < num_frames, "value {value} is out of range");
         seen[value] = true;
     }
 

@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::thread;
 
 use crate::{Error, VplLibrary, sys};
 
@@ -34,42 +36,122 @@ impl DecoderCodec {
 pub struct DecoderConfig {
     /// コーデック識別子
     pub codec: DecoderCodec,
+    /// 非同期深度（mfxVideoParam.AsyncDepth）
+    ///
+    /// 1 = 最小メモリだが性能が低い。4 = 高スループット寄りの推奨値。
+    /// None の場合は 4（推奨値）を使用する。
+    pub async_depth: Option<u16>,
 }
 
 /// デコードされたフレーム
 ///
-/// NV12 フォーマット (Y プレーン + インターリーブ UV プレーン) のフレームデータを保持する。
-/// データサイズは `width * height * 3 / 2` バイトとなる。
-pub struct DecodedFrame {
+/// NV12 フォーマット (Y プレーン + インターリーブ UV プレーン) のフレームデータを
+/// コールバック呼び出し中のみ有効な借用として提供する。
+/// データは VPL の内部サーフェスからピッチ幅を考慮した生データとして渡される。
+///
+/// `y()` および `uv()` が返すスライスはピッチ幅を含んだサーフェス生データである。
+/// 各行の先頭 `width()` バイトのみが有効データで、残りはパディングとなる。
+///
+/// # ライフタイム
+///
+/// 内部の `y`, `uv` スライスはコールバック呼び出し中のみ有効。
+/// コールバックの外に持ち出そうとするとコンパイルエラーになる。
+pub struct DecodedFrame<'a, T> {
+    y: &'a [u8],
+    uv: &'a [u8],
+    pitch: usize,
     width: usize,
     height: usize,
-    data: Vec<u8>,
+    value: T,
 }
 
-impl DecodedFrame {
-    /// フレームデータを取得する
-    pub fn data(&self) -> &[u8] {
-        &self.data
+impl<'a, T> DecodedFrame<'a, T> {
+    /// Y プレーンを取得する（ピッチ含む生データ）
+    ///
+    /// 長さは `pitch() * height()` バイト。
+    /// 各行の先頭 `width()` バイトのみが有効データ。
+    pub fn y(&self) -> &[u8] {
+        self.y
     }
 
-    /// フレームデータを取得する（所有権を移動）
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
+    /// UV プレーンを取得する（ピッチ含む生データ、NV12 インターリーブ）
+    ///
+    /// 長さは `pitch() * height() / 2` バイト。
+    /// 各行の先頭 `width()` バイトのみが有効データ。
+    pub fn uv(&self) -> &[u8] {
+        self.uv
     }
 
-    /// フレームの幅を返す
+    /// ピッチ（行あたりのバイト数）を返す
+    pub fn pitch(&self) -> usize {
+        self.pitch
+    }
+
+    /// フレームのクロップ幅を返す
     pub fn width(&self) -> usize {
         self.width
     }
 
-    /// フレームの高さを返す
+    /// フレームのクロップ高さを返す
     pub fn height(&self) -> usize {
         self.height
     }
+
+    /// デコード時に渡した値を取得する
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// デコード時に渡した値を取得する（所有権を移動）
+    pub fn into_value(self) -> T {
+        self.value
+    }
 }
 
-/// デコード用サーフェスプールのサーフェス数
-const DECODE_SURFACE_POOL_SIZE: usize = 8;
+/// デコード用サーフェスの同期情報
+///
+/// Worker スレッドに渡される。
+/// `syncp` で SyncOperation を待機し、`out_surface` から Map でデータを読み取る。
+struct DecodeSyncData {
+    syncp: sys::mfxSyncPoint,
+    out_surface: *mut sys::mfxFrameSurface1,
+}
+
+// Safety: DecodeSyncData はスレッド間で所有権を移動するだけで、同時アクセスはしない。
+unsafe impl Send for DecodeSyncData {}
+
+/// デコード予約情報
+///
+/// `decode()` で渡された value を保持し、Worker がコールバックを呼ぶ際に
+/// `DecodedFrame` に含めて返す。
+struct PendingDecode<T> {
+    value: T,
+}
+
+// Safety: PendingDecode はスレッド間で所有権を移動するだけで、同時アクセスはしない。
+unsafe impl<T: Send> Send for PendingDecode<T> {}
+
+/// Worker スレッドへの命令
+///
+/// - `DecodeFrame`: 通常のデコードフレーム。value を含み、コールバックで通知する。
+/// - `DrainFrame`: ドレインで排出されたフレーム、または value 枯渇時のフレーム。
+///   Sync + Map + Unmap + Release のみ行い、コールバックは呼ばない。
+/// - `WaitIdle`: finish() のバリア。全コマンド処理後に応答を返す。
+/// - `Stop`: Drop 時の中断。Worker を停止する。
+enum WorkerCommand<T> {
+    DecodeFrame {
+        sync_data: DecodeSyncData,
+        pending: PendingDecode<T>,
+    },
+    DrainFrame {
+        sync_data: DecodeSyncData,
+    },
+    WaitIdle(mpsc::Sender<Result<(), Error>>),
+    Stop,
+}
+
+// Safety: WorkerCommand はスレッド間で所有権を移動するだけで、同時アクセスはしない。
+unsafe impl<T: Send> Send for WorkerCommand<T> {}
 
 /// Intel VPL ハードウェアデコーダ
 ///
@@ -77,69 +159,110 @@ const DECODE_SURFACE_POOL_SIZE: usize = 8;
 /// 最初の [`Decoder::decode`] 呼び出し時にビットストリームのヘッダ (SPS/PPS 等) を解析して
 /// 自動的に初期化される。
 ///
+/// VPL の内部割り当て (`surface_work=NULL`) を使用するため、アプリケーション側での
+/// サーフェスプール管理は不要。
+///
 /// # 使い方
 ///
-/// 1. [`Decoder::new`] でデコーダを作成する
-/// 2. [`Decoder::decode`] でビットストリームデータを投入する
-/// 3. [`Decoder::next_frame`] でデコード済みフレームを取り出す
-/// 4. すべてのデータを投入したら [`Decoder::finish`] を呼んで残留フレームを排出する
-pub struct Decoder {
+/// 1. [`Decoder::new`] でデコーダを作成する（コールバックを登録）
+/// 2. [`Decoder::decode`] でビットストリームデータと値を投入する
+/// 3. すべてのデータを投入したら [`Decoder::finish`] を呼んで残留フレームを排出する
+/// 4. デコード完了時にコールバックが呼ばれる
+///
+/// # スレッド安全性
+///
+/// デコード完了通知は専用スレッド (`"vpl-decoder-sync"`) で行い、
+/// メインスレッドは `DecodeFrameAsync` の呼び出しのみを担当する。
+/// `Send` のみ実装し、`Sync` は実装しない（生ポインタにより自動的に `!Sync`）。
+pub struct Decoder<T> {
     lib: VplLibrary,
     loader: sys::mfxLoader,
     session: sys::mfxSession,
     codec: DecoderCodec,
-    surfaces: Vec<sys::mfxFrameSurface1>,
-    /// サーフェスごとのフレームバッファ（surfaces と同じインデックスで対応する）
-    surface_buffers: Vec<Vec<u8>>,
-    /// デコードされたフレームサイズ情報
-    surf_width: usize,
-    surf_height: usize,
-    /// デコード済みフレームのキュー
-    decoded_frames: VecDeque<DecodedFrame>,
-    /// フラッシュ中かどうか
-    flushing: bool,
+    /// mfxVideoParam.AsyncDepth に設定する値
+    async_depth: u16,
+    /// DecodeHeader + Init が完了しているか
+    initialized: bool,
+    /// Worker スレッドへの命令チャネル
+    worker_tx: mpsc::Sender<WorkerCommand<T>>,
+    /// Worker スレッドの join ハンドル
+    worker_handle: Option<thread::JoinHandle<()>>,
+    /// decode() で渡された value の FIFO キュー
+    ///
+    /// VPL は内部バッファにビットストリームを蓄積するため、
+    /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない。
+    /// このキューにより value と出力フレームの対応を管理する。
+    pending_values: VecDeque<T>,
 }
 
-// Safety: Decoder の全公開メソッドは &mut self を要求するため、同時に複数スレッドから
-// アクセスされることはない。VPL 仕様上、セッション操作の同一スレッド制約は明記されて
-// いないため、スレッド間の移動は許容する。Intel の公式サンプル（hello-decode 等）でも
+// Safety: デコード完了通知は専用スレッドで行い、メインスレッドは DecodeFrameAsync のみ実行する。
+// VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
-unsafe impl Send for Decoder {}
+unsafe impl<T: Send> Send for Decoder<T> {}
 
-impl Decoder {
+impl<T: Send + 'static> Decoder<T> {
     /// デコーダを作成する
-    pub fn new(config: DecoderConfig) -> Result<Self, Error> {
+    ///
+    /// `callback` は Worker スレッドから呼ばれる。
+    /// `DecodedFrame` のライフタイムはコールバック呼び出し中のみ有効。
+    pub fn new<F>(config: DecoderConfig, callback: F) -> Result<Self, Error>
+    where
+        F: FnMut(Result<DecodedFrame<'_, T>, Error>) + Send + 'static,
+    {
         let lib = VplLibrary::load()?;
 
         // API 2.x フローでセッションを作成する（ハードウェア実装を使用）
         let (loader, session) = lib.create_session(sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE)?;
+
+        // 初期化失敗時に MFXClose を呼ぶガード
+        let session_guard = CloseGuard::session(lib, loader, session);
+
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let session_handle = session as usize;
+        let worker_handle = thread::Builder::new()
+            .name("vpl-decoder-sync".to_owned())
+            .spawn(move || {
+                run_sync_worker(lib, session_handle, worker_rx, callback);
+            })
+            .map_err(|error| {
+                Error::new_custom_owned(
+                    "Decoder::new",
+                    format!("failed to spawn sync worker thread: {error}"),
+                )
+            })?;
+
+        // ガードをキャンセルして所有権を Decoder に移す
+        session_guard.cancel();
 
         Ok(Decoder {
             lib,
             loader,
             session,
             codec: config.codec,
-            surfaces: Vec::new(),
-            surface_buffers: Vec::new(),
-            surf_width: 0,
-            surf_height: 0,
-            decoded_frames: VecDeque::new(),
-            flushing: false,
+            async_depth: config.async_depth.unwrap_or(4),
+            initialized: false,
+            worker_tx,
+            worker_handle: Some(worker_handle),
+            pending_values: VecDeque::new(),
         })
     }
 
     /// ビットストリームからヘッダを解析してデコーダを初期化する
     ///
-    /// 最初のデコード呼び出しの前に、ビットストリームの先頭（SPS/PPS 等を含む部分）で
-    /// この関数を呼び出す必要がある。
+    /// `MFXVideoDECODE_DecodeHeader` でビットストリームの SPS/PPS 等を解析し、
+    /// `MFXVideoDECODE_Init` でデコーダを初期化する。
+    /// `IOPattern = OUT_SYSTEM_MEMORY` を使用し、Map/Unmap でデータにアクセスする。
+    ///
+    /// AsyncDepth は設定値またはデフォルト 4 を使用する。
+    /// libvpl のガイドでは、1 は最小メモリだが性能が低く、4 は高スループット寄りの推奨値とされる。
     fn initialize(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
         let codec_id = self.codec.codec_id();
 
         // デコーダパラメータを設定する
         let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
         video_param.IOPattern = sys::MFX_IOPATTERN_OUT_SYSTEM_MEMORY as u16;
-        video_param.AsyncDepth = 1;
+        video_param.AsyncDepth = self.async_depth;
         unsafe {
             let mfx = &mut video_param.__bindgen_anon_1.mfx;
             mfx.CodecId = codec_id;
@@ -148,50 +271,15 @@ impl Decoder {
             mfx.FrameInfo.PicStruct = sys::MFX_PICSTRUCT_PROGRESSIVE as u16;
         }
 
-        // DecodeHeader でビットストリームからパラメータを読み取る
+        // DecodeHeader でビットストリームから解像度などのパラメータを読み取る
         self.lib
             .mfx_video_decode_decode_header(self.session, bs, &mut video_param)?;
 
-        // デコーダを初期化する
+        // デコーダを初期化する。警告を返すことがあるが初期化自体は成功している
         self.lib
             .mfx_video_decode_init(self.session, &mut video_param)?;
 
-        // サーフェスプールを確保する
-        let (surf_width, surf_height) = unsafe {
-            let mfx = &video_param.__bindgen_anon_1.mfx;
-            let fi = &mfx.FrameInfo.__bindgen_anon_1.__bindgen_anon_1;
-            (fi.Width as usize, fi.Height as usize)
-        };
-        // NV12: Y平面 + UV平面 (各ピクセル 1.5 バイト)
-        let frame_size = surf_width
-            .checked_mul(surf_height)
-            .and_then(|v| v.checked_mul(3))
-            .map(|v| v / 2)
-            .ok_or_else(|| {
-                Error::new_custom("Decoder::initialize", "surface size calculation overflowed")
-            })?;
-
-        let num_surfaces = DECODE_SURFACE_POOL_SIZE;
-        let mut surface_buffers: Vec<Vec<u8>> =
-            (0..num_surfaces).map(|_| vec![0u8; frame_size]).collect();
-        let mut surfaces: Vec<sys::mfxFrameSurface1> = Vec::with_capacity(num_surfaces);
-
-        let dec_mfx_frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
-        for buf in &mut surface_buffers {
-            let mut surface: sys::mfxFrameSurface1 = unsafe { std::mem::zeroed() };
-            surface.Info = dec_mfx_frame_info;
-            unsafe {
-                surface.Data.__bindgen_anon_2.Pitch = surf_width as u16;
-                surface.Data.__bindgen_anon_3.Y = buf.as_mut_ptr();
-                surface.Data.__bindgen_anon_4.UV = buf.as_mut_ptr().add(surf_width * surf_height);
-            }
-            surfaces.push(surface);
-        }
-
-        self.surfaces = surfaces;
-        self.surface_buffers = surface_buffers;
-        self.surf_width = surf_width;
-        self.surf_height = surf_height;
+        self.initialized = true;
 
         Ok(())
     }
@@ -199,57 +287,74 @@ impl Decoder {
     /// 圧縮されたビットストリームデータをデコードする
     ///
     /// 最初の呼び出し時にヘッダ解析とデコーダ初期化を自動的に行う。
-    /// デコード済みフレームは [`Decoder::next_frame`] で取り出す。
-    pub fn decode(&mut self, data: &[u8]) -> Result<(), Error> {
+    /// デコード完了時にはコンストラクタで登録したコールバックが呼ばれる。
+    ///
+    /// `value` は対応するフレームがデコードされたときに [`DecodedFrame::value`] で取得できる。
+    /// VPL は内部バッファにビットストリームを蓄積するため、
+    /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない場合がある。
+    /// value は `pending_values` キューで管理され、FIFO で出力フレームに割り当てられる。
+    pub fn decode(&mut self, data: &[u8], value: T) -> Result<(), Error> {
         let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
-        // VPL API は *mut を要求するが入力データを書き換えないためキャストする
         let data_len = u32::try_from(data.len()).map_err(|_| {
             Error::new_custom_owned(
                 "Decoder::decode",
                 format!("bitstream length {} exceeds u32::MAX", data.len()),
             )
         })?;
+        // VPL API は *mut を要求するが入力データを書き換えないためキャストする
         bs.Data = data.as_ptr() as *mut u8;
         bs.DataLength = data_len;
         bs.MaxLength = data_len;
 
-        // サーフェスが空の場合は初期化が必要
-        if self.surfaces.is_empty() {
+        // 未初期化の場合は初期化する。value は初期化成功後に push する。
+        // これにより初期化エラー時に value が pending_values に残留するのを防ぐ。
+        if !self.initialized {
             self.initialize(&mut bs)?;
         }
 
-        self.decode_bitstream(&mut bs)?;
-        Ok(())
+        self.pending_values.push_back(value);
+
+        match self.decode_bitstream(&mut bs) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // エラー時は残留 value をすべて破棄して状態をリセットする
+                self.pending_values.clear();
+                Err(e)
+            }
+        }
     }
 
     /// ビットストリームをデコードしてフレームを収集する
+    ///
+    /// `bs.DataLength > 0` の間 `DecodeFrameAsync` を繰り返し呼び出す。
+    /// VPL は `MORE_DATA` 時にビットストリームを内部バッファに蓄積し、
+    /// 十分なデータが溜まった時点でフレームを出力する。
+    ///
+    /// 出力フレームには `pending_values` から値を取り出して割り当てる。
+    /// 値が枯渇した場合は `DrainFrame` として処理する（コールバックなし）。
     fn decode_bitstream(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
         while bs.DataLength > 0 {
-            let work_surface = self
-                .surfaces
-                .iter_mut()
-                .find(|s| s.Data.Locked == 0)
-                .ok_or_else(|| Error::new_custom("Decoder::decode", "no free surface available"))?;
-
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
+            // surface_work=NULL で VPL 内部割り当てを使用する
             let status = self.lib.mfx_video_decode_frame_async(
                 self.session,
                 bs,
-                work_surface,
+                std::ptr::null_mut(),
                 &mut out_surface,
                 &mut syncp,
             );
 
+            // MORE_DATA: データ不足。VPL 内部に蓄積済み。呼び出し元に戻る
             if status == sys::mfxStatus_MFX_ERR_MORE_DATA {
-                // データ不足、呼び出し元に戻る
-                break;
+                return Ok(());
             }
+            // MORE_SURFACE: 内部割り当てでは通常発生しないが、安全のため再試行
             if status == sys::mfxStatus_MFX_ERR_MORE_SURFACE {
-                // サーフェス不足、再試行する
                 continue;
             }
+            // DEVICE_BUSY: デバイスが混雑している。1ms 待って再試行
             if status == sys::mfxStatus_MFX_WRN_DEVICE_BUSY {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
@@ -258,8 +363,28 @@ impl Decoder {
                 return Err(Error::from_mfx(status, "MFXVideoDECODE_DecodeFrameAsync"));
             }
 
+            // MFX_ERR_NONE または MFX_WRN_*（DEVICE_BUSY 以外）。
+            // syncp が非 null ならデコード済みフレームが存在する
             if !syncp.is_null() {
-                self.sync_and_collect(syncp, out_surface)?;
+                if let Some(pending_value) = self.pending_values.pop_front() {
+                    self.send_worker_command(
+                        "Decoder::decode",
+                        WorkerCommand::DecodeFrame {
+                            sync_data: DecodeSyncData { syncp, out_surface },
+                            pending: PendingDecode {
+                                value: pending_value,
+                            },
+                        },
+                    )?;
+                } else {
+                    // pending_values が枯渇しているので drain 扱いで破棄する
+                    self.send_worker_command(
+                        "Decoder::decode",
+                        WorkerCommand::DrainFrame {
+                            sync_data: DecodeSyncData { syncp, out_surface },
+                        },
+                    )?;
+                }
             }
         }
         Ok(())
@@ -267,40 +392,34 @@ impl Decoder {
 
     /// これ以上データが来ないことをデコーダに伝え、残留フレームを排出する
     ///
-    /// デコーダの内部バッファに残っているフレームをすべて処理する。
-    /// 完了後は [`Decoder::next_frame`] で残りのフレームを取り出せる。
+    /// null bitstream で `DecodeFrameAsync` を `MORE_DATA` が返るまで繰り返す。
+    /// ドレイン時に `pending_values` に値が残っていれば `DecodeFrame`（コールバックあり）、
+    /// 枯渇していれば `DrainFrame`（コールバックなし）で処理する。
+    ///
+    /// この関数は全ての Worker コマンドの完了を待ち、
+    /// コールバックが呼び出され終わるまでブロックする。
     pub fn finish(&mut self) -> Result<(), Error> {
         // 初期化前（decode 未呼び出し）なら排出するフレームがないので即座に返す
-        if self.surfaces.is_empty() {
+        if !self.initialized {
             return Ok(());
         }
 
-        self.flushing = true;
-
         loop {
-            let work_surface = self
-                .surfaces
-                .iter_mut()
-                .find(|s| s.Data.Locked == 0)
-                .ok_or_else(|| Error::new_custom("Decoder::finish", "no free surface available"))?;
-
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
+            // null bitstream で残留フレームを排出する
             let status = self.lib.mfx_video_decode_frame_async(
                 self.session,
                 std::ptr::null_mut(),
-                work_surface,
+                std::ptr::null_mut(),
                 &mut out_surface,
                 &mut syncp,
             );
 
+            // MORE_DATA: すべての残留フレームを排出済み
             if status == sys::mfxStatus_MFX_ERR_MORE_DATA {
-                // すべて排出済み
                 break;
-            }
-            if status == sys::mfxStatus_MFX_ERR_MORE_SURFACE {
-                continue;
             }
             if status == sys::mfxStatus_MFX_WRN_DEVICE_BUSY {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -311,141 +430,311 @@ impl Decoder {
             }
 
             if !syncp.is_null() {
-                self.sync_and_collect(syncp, out_surface)?;
+                // 残留 value があればコールバック付きで送信する。
+                // これにより pending_values の全エントリが消費される。
+                if let Some(pending_value) = self.pending_values.pop_front() {
+                    self.send_worker_command(
+                        "Decoder::finish",
+                        WorkerCommand::DecodeFrame {
+                            sync_data: DecodeSyncData { syncp, out_surface },
+                            pending: PendingDecode {
+                                value: pending_value,
+                            },
+                        },
+                    )?;
+                } else {
+                    self.send_worker_command(
+                        "Decoder::finish",
+                        WorkerCommand::DrainFrame {
+                            sync_data: DecodeSyncData { syncp, out_surface },
+                        },
+                    )?;
+                }
             }
         }
 
-        self.flushing = false;
+        // ここまでに送ったコマンドが Worker 側で全て処理されるまで待つ
+        let (tx, rx) = mpsc::channel();
+        self.send_worker_command("Decoder::finish", WorkerCommand::WaitIdle(tx))?;
+        rx.recv().map_err(|_| {
+            Error::new_custom("Decoder::finish", "sync worker thread stopped unexpectedly")
+        })??;
+
         Ok(())
     }
 
-    /// デコード済みのフレームを取り出す
-    ///
-    /// フレームがない場合は `None` を返す。
-    /// [`Decoder::decode`] または [`Decoder::finish`] の後に呼び出す。
-    pub fn next_frame(&mut self) -> Option<DecodedFrame> {
-        self.decoded_frames.pop_front()
-    }
-
-    /// SyncOperation を実行してデコード済みフレームを収集する
-    fn sync_and_collect(
+    fn send_worker_command(
         &mut self,
-        syncp: sys::mfxSyncPoint,
-        out_surface: *mut sys::mfxFrameSurface1,
+        function: &'static str,
+        command: WorkerCommand<T>,
     ) -> Result<(), Error> {
-        Error::check_mfx(
-            self.lib
-                .mfx_video_core_sync_operation(self.session, syncp, sys::MFX_INFINITE),
-            "MFXVideoCORE_SyncOperation",
-        )?;
-
-        if out_surface.is_null() {
-            return Ok(());
-        }
-
-        // デコードされたフレームデータをコピーする
-        let surface = unsafe { &*out_surface };
-        let (crop_w, crop_h) = unsafe {
-            let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
-            (fi.CropW as usize, fi.CropH as usize)
-        };
-        let pitch = unsafe { surface.Data.__bindgen_anon_2.Pitch as usize };
-        let y_ptr = unsafe { surface.Data.__bindgen_anon_3.Y };
-        let uv_ptr = unsafe { surface.Data.__bindgen_anon_4.UV };
-
-        if y_ptr.is_null() || uv_ptr.is_null() {
-            return Err(Error::new_custom(
-                "Decoder::sync_and_collect",
-                "decoded surface has null plane pointers",
-            ));
-        }
-
-        // VPL が返したサーフェス寸法の整合性を検証する
-        if crop_w == 0 || crop_h == 0 {
-            return Err(Error::new_custom(
-                "Decoder::sync_and_collect",
-                "decoded surface has zero crop dimensions",
-            ));
-        }
-        if pitch < crop_w {
-            return Err(Error::new_custom_owned(
-                "Decoder::sync_and_collect",
-                format!("pitch ({pitch}) is less than crop width ({crop_w})"),
-            ));
-        }
-        if crop_w > self.surf_width || crop_h > self.surf_height {
-            return Err(Error::new_custom_owned(
-                "Decoder::sync_and_collect",
-                format!(
-                    "crop dimensions ({crop_w}x{crop_h}) exceed surface dimensions ({}x{})",
-                    self.surf_width, self.surf_height
-                ),
-            ));
-        }
-
-        // NV12: Y プレーン (crop_w * crop_h) + UV プレーン (crop_w * crop_h / 2)
-        let y_size = crop_w.checked_mul(crop_h).ok_or_else(|| {
-            Error::new_custom(
-                "Decoder::sync_and_collect",
-                "Y plane size calculation overflowed",
-            )
-        })?;
-        let uv_size = crop_w.checked_mul(crop_h / 2).ok_or_else(|| {
-            Error::new_custom(
-                "Decoder::sync_and_collect",
-                "UV plane size calculation overflowed",
-            )
-        })?;
-        let total_size = y_size.checked_add(uv_size).ok_or_else(|| {
-            Error::new_custom(
-                "Decoder::sync_and_collect",
-                "total frame size calculation overflowed",
-            )
-        })?;
-        let mut data = vec![0u8; total_size];
-
-        // ピッチを考慮してコピーする（ピッチ == crop_w なら一括コピー可能）
-        if pitch == crop_w {
-            unsafe {
-                std::ptr::copy_nonoverlapping(y_ptr, data.as_mut_ptr(), y_size);
-                std::ptr::copy_nonoverlapping(uv_ptr, data[y_size..].as_mut_ptr(), uv_size);
-            }
-        } else {
-            // 行ごとにコピーする
-            for row in 0..crop_h {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        y_ptr.add(row * pitch),
-                        data[row * crop_w..].as_mut_ptr(),
-                        crop_w,
-                    );
-                }
-            }
-            for row in 0..(crop_h / 2) {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        uv_ptr.add(row * pitch),
-                        data[y_size + row * crop_w..].as_mut_ptr(),
-                        crop_w,
-                    );
-                }
-            }
-        }
-
-        self.decoded_frames.push_back(DecodedFrame {
-            width: crop_w,
-            height: crop_h,
-            data,
-        });
-
-        Ok(())
+        self.worker_tx
+            .send(command)
+            .map_err(|_| Error::new_custom(function, "sync worker thread is not running"))
     }
 }
 
-impl Drop for Decoder {
+// Drop<T> 実装は `T: Send + 'static` 制約を付けられないため、
+// worker 停止処理だけを impl<T> 側へ分離して呼び出せるようにしている。
+impl<T> Decoder<T> {
+    fn stop_worker(&mut self) {
+        if let Some(handle) = self.worker_handle.take() {
+            // Stop を送って join した時点で worker は確実に終了するため、
+            // 以降に worker へデータが届くケースは考慮しない。
+            let _ = self.worker_tx.send(WorkerCommand::Stop);
+            let _ = handle.join();
+        }
+    }
+}
+
+impl<T> Drop for Decoder<T> {
     fn drop(&mut self) {
-        if !self.surfaces.is_empty() {
+        self.stop_worker();
+        if self.initialized {
             let _ = self.lib.mfx_video_decode_close(self.session);
+        }
+        let _ = self.lib.mfx_close(self.session);
+        self.lib.mfx_unload(self.loader);
+    }
+}
+
+/// Worker スレッドのメインループ
+///
+/// mpsc チャネルからコマンドを受信し、VPL API を呼び出す。
+/// セッション操作は全てこのスレッドで行うため、VPL のスレッド安全性に関する
+/// 暗黙の制約に抵触しない。
+fn run_sync_worker<T, F>(
+    lib: VplLibrary,
+    session_handle: usize,
+    worker_rx: mpsc::Receiver<WorkerCommand<T>>,
+    mut callback: F,
+) where
+    T: Send + 'static,
+    F: FnMut(Result<DecodedFrame<'_, T>, Error>),
+{
+    while let Ok(command) = worker_rx.recv() {
+        match command {
+            WorkerCommand::DecodeFrame { sync_data, pending } => {
+                // SyncOperation + Map + 読み取り + callback + Unmap + Release
+                callback(sync_and_callback(lib, session_handle, sync_data, pending));
+            }
+            WorkerCommand::DrainFrame { sync_data } => {
+                // SyncOperation + Map + Unmap + Release のみ。コールバックなし
+                sync_and_drain(lib, session_handle, sync_data);
+            }
+            WorkerCommand::WaitIdle(reply_tx) => {
+                // finish 側のバリア。ここに到達した時点で、それ以前に送信された
+                // コマンドはすべて処理済みである。
+                let _ = reply_tx.send(Ok(()));
+            }
+            WorkerCommand::Stop => {
+                // drop 時の中断。未完了処理は破棄する。
+                break;
+            }
+        }
+    }
+}
+
+/// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
+/// `DecodedFrame<T>` を構築して返す。
+///
+/// `out_surface` は `Unmap` + `Release` で解放されるため、
+/// `DecodedFrame` 内の y/uv スライスはコールバック呼び出し中のみ有効。
+fn sync_and_callback<T>(
+    lib: VplLibrary,
+    session_handle: usize,
+    sync_data: DecodeSyncData,
+    pending: PendingDecode<T>,
+) -> Result<DecodedFrame<'static, T>, Error> {
+    let DecodeSyncData { syncp, out_surface } = sync_data;
+
+    if syncp.is_null() {
+        return Err(Error::new_custom(
+            "Decoder::sync_worker",
+            "sync point is null",
+        ));
+    }
+
+    if out_surface.is_null() {
+        return Err(Error::new_custom(
+            "Decoder::sync_worker",
+            "output surface is null",
+        ));
+    }
+
+    // SyncOperation でデコード完了を待機する
+    let status = lib.mfx_video_core_sync_operation(
+        session_handle as sys::mfxSession,
+        syncp,
+        sys::MFX_INFINITE,
+    );
+    if let Err(err) = Error::check_mfx(status, "MFXVideoCORE_SyncOperation") {
+        // エラー時も out_surface は解放する
+        lib.mfx_frame_surface_release(out_surface);
+        return Err(err);
+    }
+
+    // Map して CPU から読み取り可能にする
+    let status = lib.mfx_frame_surface_map(out_surface, sys::mfxMemoryFlags_MFX_MAP_READ);
+    if let Err(err) = Error::check_mfx(status, "mfxFrameSurfaceInterface::Map") {
+        lib.mfx_frame_surface_release(out_surface);
+        return Err(err);
+    }
+
+    // デコードされたフレームデータを読み取る
+    let result = read_decoded_surface(out_surface, pending);
+
+    // Unmap して読み取り完了を通知する
+    let unmap_status = lib.mfx_frame_surface_unmap(out_surface);
+    // Release でサーフェスの参照カウントを減らす
+    let release_status = lib.mfx_frame_surface_release(out_surface);
+
+    match result {
+        Ok(frame) => {
+            // Unmap と Release のエラーはデコード成功時は無視する
+            let _ = Error::check_mfx(unmap_status, "mfxFrameSurfaceInterface::Unmap");
+            let _ = Error::check_mfx(release_status, "mfxFrameSurfaceInterface::Release");
+            Ok(frame)
+        }
+        Err(err) => {
+            // 読み取り失敗時も Unmap/Release は試行する
+            let _ = Error::check_mfx(unmap_status, "mfxFrameSurfaceInterface::Unmap");
+            let _ = Error::check_mfx(release_status, "mfxFrameSurfaceInterface::Release");
+            Err(err)
+        }
+    }
+}
+
+/// ドレインフレームの Sync + Map/Unmap + Release を行う
+///
+/// ドレインフレームには value がないため、データは読み取らずに解放のみ行う。
+/// エラーはすべて無視する（データ破棄が目的のため）。
+fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncData) {
+    let DecodeSyncData { syncp, out_surface } = sync_data;
+
+    if syncp.is_null() || out_surface.is_null() {
+        if !out_surface.is_null() {
+            lib.mfx_frame_surface_release(out_surface);
+        }
+        return;
+    }
+
+    let _ = lib.mfx_video_core_sync_operation(
+        session_handle as sys::mfxSession,
+        syncp,
+        sys::MFX_INFINITE,
+    );
+
+    // Sync が成功していれば Map/Unmap/Release でクリーンアップする
+    let _ = lib.mfx_frame_surface_map(out_surface, sys::mfxMemoryFlags_MFX_MAP_READ);
+    let _ = lib.mfx_frame_surface_unmap(out_surface);
+    lib.mfx_frame_surface_release(out_surface);
+}
+
+/// デコード済みサーフェスから Y/UV スライスを読み取り `DecodedFrame` を構築する
+///
+/// # Safety
+///
+/// 呼び出し元は `out_surface` が Map 済みで有効なデータを持つことを保証すること。
+/// 戻り値の `DecodedFrame` が生存している間、`out_surface` のデータは有効でなければならない。
+unsafe fn read_decoded_surface_inner<'a, T>(
+    out_surface: *mut sys::mfxFrameSurface1,
+    pending: PendingDecode<T>,
+) -> Result<DecodedFrame<'a, T>, Error> {
+    let surface = unsafe { &*out_surface };
+    let (crop_w, crop_h) = unsafe {
+        let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
+        (fi.CropW as usize, fi.CropH as usize)
+    };
+    let pitch = unsafe { surface.Data.__bindgen_anon_2.Pitch as usize };
+    let y_ptr = unsafe { surface.Data.__bindgen_anon_3.Y };
+    let uv_ptr = unsafe { surface.Data.__bindgen_anon_4.UV };
+
+    // VPL が返したサーフェスデータの整合性を検証する
+    if y_ptr.is_null() || uv_ptr.is_null() {
+        return Err(Error::new_custom(
+            "Decoder::sync_worker",
+            "decoded surface has null plane pointers",
+        ));
+    }
+
+    if crop_w == 0 || crop_h == 0 {
+        return Err(Error::new_custom(
+            "Decoder::sync_worker",
+            "decoded surface has zero crop dimensions",
+        ));
+    }
+    if pitch < crop_w {
+        return Err(Error::new_custom_owned(
+            "Decoder::sync_worker",
+            format!("pitch ({pitch}) is less than crop width ({crop_w})"),
+        ));
+    }
+
+    // ピッチを考慮したプレーンサイズを計算する
+    let y_size = pitch
+        .checked_mul(crop_h)
+        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "Y plane size overflowed"))?;
+    let uv_height = crop_h / 2;
+    let uv_size = pitch
+        .checked_mul(uv_height)
+        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "UV plane size overflowed"))?;
+
+    let y = unsafe { std::slice::from_raw_parts(y_ptr, y_size) };
+    let uv = unsafe { std::slice::from_raw_parts(uv_ptr, uv_size) };
+
+    Ok(DecodedFrame {
+        y,
+        uv,
+        pitch,
+        width: crop_w,
+        height: crop_h,
+        value: pending.value,
+    })
+}
+
+/// デコード済みサーフェスを読み取る安全性ラッパー
+///
+/// `DecodedFrame` のライフタイムを `'static` にしているが、
+/// 実際のデータ寿命は呼び出し元の `sync_and_callback` が Unmap/Release するまで。
+/// Unmap/Release の前にコールバックが完了するため、実質的に安全。
+fn read_decoded_surface<T>(
+    out_surface: *mut sys::mfxFrameSurface1,
+    pending: PendingDecode<T>,
+) -> Result<DecodedFrame<'static, T>, Error> {
+    unsafe { read_decoded_surface_inner(out_surface, pending) }
+}
+
+/// セッションの解放ガード
+///
+/// エラー時に `MFXClose` / `MFXUnload` を呼ぶ。
+/// `cancel()` でガードを無効化し、正常系ではリソースを `Decoder` に移管する。
+struct CloseGuard {
+    lib: VplLibrary,
+    loader: sys::mfxLoader,
+    session: sys::mfxSession,
+    active: bool,
+}
+
+impl CloseGuard {
+    fn session(lib: VplLibrary, loader: sys::mfxLoader, session: sys::mfxSession) -> Self {
+        Self {
+            lib,
+            loader,
+            session,
+            active: true,
+        }
+    }
+
+    fn cancel(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
         }
         let _ = self.lib.mfx_close(self.session);
         self.lib.mfx_unload(self.loader);

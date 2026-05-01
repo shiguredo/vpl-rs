@@ -537,7 +537,7 @@ impl<T> EncodedFrame<T> {
 }
 
 /// デバイスビジー時の最大リトライ回数
-const DEVICE_BUSY_MAX_RETRIES: u32 = 10;
+const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 
 struct PendingFrame<T> {
     presentation_timestamp: u64,

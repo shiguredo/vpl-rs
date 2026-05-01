@@ -58,6 +58,30 @@
 //! let encoded = rx.recv().unwrap().unwrap();
 //! let _bitstream = encoded.data();
 //! ```
+//!
+//! # デコードの例
+//!
+//! ```no_run
+//! use shiguredo_vpl::{Decoder, DecoderConfig, DecoderCodec};
+//! use std::sync::mpsc;
+//!
+//! let config = DecoderConfig {
+//!     codec: DecoderCodec::H264,
+//!     async_depth: None,
+//! };
+//! let (tx, rx) = mpsc::channel();
+//! let mut decoder = Decoder::new(config, move |result| {
+//!     // DecodedFrame は借用データを含むため、コールバック内でコピーする
+//!     let info = result.map(|frame| (frame.y().to_vec(), frame.pitch(), frame.width(), frame.height()));
+//!     tx.send(info).unwrap();
+//! }).unwrap();
+//!
+//! // ビットストリームデータをデコードする
+//! let bitstream = vec![0u8; 1024];
+//! decoder.decode(&bitstream, ()).unwrap();
+//! decoder.finish().unwrap();
+//! let (y, _pitch, _width, _height) = rx.recv().unwrap().unwrap();
+//! ```
 
 mod codec_info;
 mod decode;
