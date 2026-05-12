@@ -59,10 +59,12 @@ DOCS_RS=1 cargo doc --no-deps
 
 ## 使い方
 
-### アダプタの列挙
+### GPU アダプタの指定
 
-複数 Intel GPU を搭載した環境では、使用するアダプタを `AdapterSelector` で指定します。
-利用可能なアダプタは `list_adapters()` で列挙できます。
+アダプタは Intel VPL が利用する Intel GPU デバイスのことで、Linux 上では `/dev/dri/renderD<N>` の DRM render node 番号で識別します。
+
+エンコーダーおよびデコーダーの初期化には、使用する GPU アダプタを `AdapterSelector` で指定する必要があります。
+システムに搭載されている Intel GPU は `list_adapters()` で列挙できます。
 
 ```rust
 use shiguredo_vpl::{AdapterSelector, list_adapters};
@@ -75,7 +77,7 @@ for adapter in &adapters {
     );
 }
 
-// 最初に見つかったアダプタを使う
+// 使用する GPU アダプタを DRM render node 番号で指定する
 let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
 ```
 
