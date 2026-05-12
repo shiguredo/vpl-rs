@@ -43,6 +43,9 @@ jobs:
       group: Self
       labels: [self-hosted, linux, x64, Intel-VPL]
     timeout-minutes: 15
+    env:
+      # 実機アダプタを使う統合テスト (tests/test_adapter.rs::test_real_adapter_session) を有効化する
+      INTEL_VPL: 1
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
