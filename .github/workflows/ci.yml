@@ -43,6 +43,9 @@ jobs:
       group: Self
       labels: [self-hosted, linux, x64, Intel-VPL]
     timeout-minutes: 15
+    env:
+      # 実機アダプタを使う統合テスト (tests/test_adapter.rs::test_real_adapter_session) を有効化する
+      INTEL_VPL: 1
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -52,7 +55,7 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - run: cargo build --workspace
       - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace -- --test-threads=1
+      - run: cargo test --workspace -- --test-threads=1 --nocapture
 
   # docs.rs 向けビルド確認
   docs-rs:

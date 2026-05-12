@@ -5,6 +5,14 @@ fn main() {
     println!("cargo::rerun-if-changed=Cargo.toml");
     println!("cargo::rerun-if-changed=build.rs");
 
+    // 実機 Intel GPU を使うテストを cfg(intel_vpl) でガードする
+    // 環境変数 INTEL_VPL=1 が設定されている場合のみ有効になる
+    println!("cargo::rustc-check-cfg=cfg(intel_vpl)");
+    println!("cargo::rerun-if-env-changed=INTEL_VPL");
+    if std::env::var("INTEL_VPL").as_deref() == Ok("1") {
+        println!("cargo::rustc-cfg=intel_vpl");
+    }
+
     // 各種変数やビルドディレクトリのセットアップ
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("infallible"));
     let output_bindings_path = out_dir.join("bindings.rs");

@@ -72,6 +72,15 @@ impl Error {
         }
     }
 
+    /// `status_message` のみを置き換えた新しい Error を返す
+    ///
+    /// `status_code` / `status_name` / `function` は保持する。
+    /// 動的に詳細情報を付加したいケース（DRM render node 番号を含めたい場合など）で使う。
+    pub(crate) fn with_message(mut self, message: String) -> Self {
+        self.status_message = Some(Cow::Owned(message));
+        self
+    }
+
     /// mfxStatus をチェックして、エラーなら Err を返す
     pub(crate) fn check_mfx(status: i32, function: &'static str) -> Result<(), Error> {
         if status == sys::mfxStatus_MFX_ERR_NONE {

@@ -1,6 +1,7 @@
 # 複数 Intel GPU 環境で使用するアダプタを選択できるようにする
 
 Created: 2026-05-12
+Completed: 2026-05-12
 Model: Opus 4.7
 
 ## 背景とユースケース

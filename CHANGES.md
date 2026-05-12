@@ -11,6 +11,11 @@
 
 ## develop
 
+- [ADD] shiguredo_vpl::list_adapters と AdapterSelector / AdapterInfo / PciAddress / MediaAdapterType を追加する
+  - @voluntas
+- [CHANGE] EncoderConfig::new / DecoderConfig::new / codec_info::supported_codecs にアダプタ指定を必須化する
+  - @voluntas
+
 ### misc
 
 

@@ -59,15 +59,37 @@ DOCS_RS=1 cargo doc --no-deps
 
 ## 使い方
 
+### アダプタの列挙
+
+複数 Intel GPU を搭載した環境では、使用するアダプタを `AdapterSelector` で指定します。
+利用可能なアダプタは `list_adapters()` で列挙できます。
+
+```rust
+use shiguredo_vpl::{AdapterSelector, list_adapters};
+
+let adapters = list_adapters()?;
+for adapter in &adapters {
+    println!(
+        "DRM render node {}: {} ({})",
+        adapter.drm_render_node, adapter.device_name, adapter.impl_name,
+    );
+}
+
+// 最初に見つかったアダプタを使う
+let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
+```
+
 ### エンコード
 
 ```rust
 use shiguredo_vpl::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
-    H264EncoderConfig, H264Profile, RateControlMode, frame_type,
+    AdapterSelector, CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
+    H264EncoderConfig, H264Profile, RateControlMode, frame_type, list_adapters,
 };
 
+let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
+    adapter,
     CodecConfig::H264(H264EncoderConfig {
         profile: Some(H264Profile::High),
     }),
@@ -113,11 +135,10 @@ while let Some(encoded) = encoder.next_frame() {
 ### デコード
 
 ```rust
-use shiguredo_vpl::{Decoder, DecoderCodec, DecoderConfig};
+use shiguredo_vpl::{AdapterSelector, Decoder, DecoderCodec, DecoderConfig, list_adapters};
 
-let config = DecoderConfig {
-    codec: DecoderCodec::H264,
-};
+let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
+let config = DecoderConfig::new(adapter, DecoderCodec::H264);
 let mut decoder = Decoder::new(config)?;
 
 // ビットストリームデータをデコード
