@@ -1,7 +1,7 @@
 //! コーデック情報の照会
 
 #[cfg(target_os = "linux")]
-use crate::{Error, VplLibrary, sys};
+use crate::{AdapterSelector, Error, VplLibrary, sys};
 
 /// コーデック種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,12 +138,16 @@ pub enum Av1EncodingProfile {
     Main,
 }
 
-/// このバックエンドで利用可能なコーデック情報の一覧を返す
+/// 指定アダプタで利用可能なコーデック情報の一覧を返す
 ///
-/// VPL ローダーを使って Intel GPU のハードウェア実装を照会し、
-/// 各コーデックのエンコード・デコード対応状況を返す。
+/// VPL ローダーで `mfxImplDescription.Impl = HW` と
+/// `mfxExtendedDeviceId.DRMRenderNodeNum` を絞り込み、対象アダプタの
+/// ハードウェア実装を照会して各コーデックのエンコード・デコード対応状況を返す。
 #[cfg(target_os = "linux")]
-pub fn supported_codecs() -> Result<Vec<CodecInfo>, Error> {
+pub fn supported_codecs(adapter: AdapterSelector) -> Result<Vec<CodecInfo>, Error> {
+    adapter.validate()?;
+    let AdapterSelector::DrmRenderNode(render_node) = adapter;
+
     let lib = VplLibrary::load()?;
 
     // ローダーを作成する
@@ -152,18 +156,34 @@ pub fn supported_codecs() -> Result<Vec<CodecInfo>, Error> {
         return Err(Error::new_custom("MFXLoad", "returned null"));
     }
 
-    // ハードウェア実装のフィルタを設定する
-    let cfg = unsafe { sys::MFXCreateConfig(loader) };
-    if cfg.is_null() {
+    // 1 つ目の cfg: HW 実装フィルタ
+    let cfg_impl = unsafe { sys::MFXCreateConfig(loader) };
+    if cfg_impl.is_null() {
         unsafe { sys::MFXUnload(loader) };
         return Err(Error::new_custom("MFXCreateConfig", "returned null"));
     }
-
     let name = b"mfxImplDescription.Impl\0";
     let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
     variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
     variant.Data.U32 = sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE;
-    let status = unsafe { sys::MFXSetConfigFilterProperty(cfg, name.as_ptr(), variant) };
+    let status = unsafe { sys::MFXSetConfigFilterProperty(cfg_impl, name.as_ptr(), variant) };
+    if status != sys::mfxStatus_MFX_ERR_NONE {
+        unsafe { sys::MFXUnload(loader) };
+        return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
+    }
+
+    // 2 つ目の cfg: DRM render node フィルタ
+    let cfg_drm = unsafe { sys::MFXCreateConfig(loader) };
+    if cfg_drm.is_null() {
+        unsafe { sys::MFXUnload(loader) };
+        return Err(Error::new_custom("MFXCreateConfig", "returned null"));
+    }
+    let drm_name = b"mfxExtendedDeviceId.DRMRenderNodeNum\0";
+    let mut drm_variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
+    drm_variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
+    drm_variant.Data.U32 = render_node;
+    let status =
+        unsafe { sys::MFXSetConfigFilterProperty(cfg_drm, drm_name.as_ptr(), drm_variant) };
     if status != sys::mfxStatus_MFX_ERR_NONE {
         unsafe { sys::MFXUnload(loader) };
         return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
@@ -181,7 +201,13 @@ pub fn supported_codecs() -> Result<Vec<CodecInfo>, Error> {
     };
     if status != sys::mfxStatus_MFX_ERR_NONE {
         unsafe { sys::MFXUnload(loader) };
-        return Err(Error::from_mfx(status, "MFXEnumImplementations"));
+        let err = Error::from_mfx(status, "MFXEnumImplementations");
+        if status == sys::mfxStatus_MFX_ERR_NOT_FOUND {
+            return Err(err.with_message(format!(
+                "no Intel HW implementation found for DRM render node {render_node}"
+            )));
+        }
+        return Err(err);
     }
 
     let desc = hdl as *const sys::mfxImplDescription;
