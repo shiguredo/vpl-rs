@@ -55,7 +55,7 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - run: cargo build --workspace
       - run: cargo clippy --workspace -- -D warnings
-      - run: cargo test --workspace -- --test-threads=1
+      - run: cargo test --workspace -- --test-threads=1 --nocapture
 
   # docs.rs 向けビルド確認
   docs-rs:

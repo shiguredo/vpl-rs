@@ -117,6 +117,9 @@ fn test_encoder_not_found_for_invalid_render_node() {
 fn test_real_adapter_session() {
     let adapters = list_adapters().expect("list_adapters に失敗");
     let listing = format_adapters(&adapters);
+    // CI ログでアダプタ一覧を確認できるよう stderr に出力する
+    // (cargo test の `--nocapture` 指定でログに残る)
+    eprintln!("検出されたアダプタ: {listing}");
     assert!(
         !adapters.is_empty(),
         "Intel HW アダプタが列挙されない: {listing}"
