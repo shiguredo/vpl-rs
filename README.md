@@ -59,15 +59,39 @@ DOCS_RS=1 cargo doc --no-deps
 
 ## 使い方
 
+### GPU アダプタの指定
+
+アダプタは Intel VPL が利用する Intel GPU デバイスのことで、Linux 上では `/dev/dri/renderD<N>` の DRM render node 番号で識別します。
+
+エンコーダーおよびデコーダーの初期化には、使用する GPU アダプタを `AdapterSelector` で指定する必要があります。
+システムに搭載されている Intel GPU は `list_adapters()` で列挙できます。
+
+```rust
+use shiguredo_vpl::{AdapterSelector, list_adapters};
+
+let adapters = list_adapters()?;
+for adapter in &adapters {
+    println!(
+        "DRM render node {}: {} ({})",
+        adapter.drm_render_node, adapter.device_name, adapter.impl_name,
+    );
+}
+
+// 使用する GPU アダプタを DRM render node 番号で指定する
+let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
+```
+
 ### エンコード
 
 ```rust
 use shiguredo_vpl::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
-    H264EncoderConfig, H264Profile, RateControlMode, frame_type,
+    AdapterSelector, CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
+    H264EncoderConfig, H264Profile, RateControlMode, frame_type, list_adapters,
 };
 
+let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
+    adapter,
     CodecConfig::H264(H264EncoderConfig {
         profile: Some(H264Profile::High),
     }),
@@ -113,11 +137,10 @@ while let Some(encoded) = encoder.next_frame() {
 ### デコード
 
 ```rust
-use shiguredo_vpl::{Decoder, DecoderCodec, DecoderConfig};
+use shiguredo_vpl::{AdapterSelector, Decoder, DecoderCodec, DecoderConfig, list_adapters};
 
-let config = DecoderConfig {
-    codec: DecoderCodec::H264,
-};
+let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
+let config = DecoderConfig::new(adapter, DecoderCodec::H264);
 let mut decoder = Decoder::new(config)?;
 
 // ビットストリームデータをデコード
