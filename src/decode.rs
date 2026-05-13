@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::{Error, VplLibrary, sys};
+use crate::{AdapterSelector, Error, VplLibrary, sys};
 
 /// デコーダ用コーデック識別子
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +30,13 @@ impl DecoderCodec {
 
 /// デコーダの設定
 ///
-/// デコードするビットストリームのコーデックを指定する。
+/// デコードするビットストリームのコーデックと使用するアダプタを指定する。
 /// 解像度やフレームレートはビットストリームのヘッダから自動的に検出される。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecoderConfig {
+    /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
+    pub adapter: AdapterSelector,
     /// コーデック識別子
     pub codec: DecoderCodec,
     /// 非同期深度（mfxVideoParam.AsyncDepth）
@@ -47,8 +50,9 @@ impl DecoderConfig {
     /// 必須パラメータのみ指定して DecoderConfig を作成する
     ///
     /// オプションパラメータはすべて None (デコーダのデフォルト) に設定される。
-    pub fn new(codec: DecoderCodec) -> DecoderConfig {
-        DecoderConfig {
+    pub fn new(adapter: AdapterSelector, codec: DecoderCodec) -> Self {
+        Self {
+            adapter,
             codec,
             async_depth: None,
         }
@@ -261,8 +265,8 @@ impl<H: DecodeHandler> Decoder<H> {
     pub fn new(config: DecoderConfig, handler: H) -> Result<Self, Error> {
         let lib = VplLibrary::load()?;
 
-        // API 2.x フローでセッションを作成する（ハードウェア実装を使用）
-        let (loader, session) = lib.create_session(sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE)?;
+        // API 2.x フローで指定アダプタのセッションを作成する
+        let (loader, session) = lib.create_session(config.adapter)?;
 
         // 初期化失敗時に MFXClose を呼ぶガード
         let session_guard = CloseGuard::session(lib, loader, session);

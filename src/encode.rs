@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::{Error, VplLibrary, sys};
+use crate::{AdapterSelector, Error, VplLibrary, sys};
 
 /// H.264 プロファイル
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,7 +259,12 @@ impl RateControlMode {
 /// VPL の mfxVideoParam / mfxInfoMFX / mfxFrameInfo に対応する。
 /// フィールド名は VPL API の構造体メンバ名に準拠する。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncoderConfig {
+    // --- アダプタ選択 ---
+    /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
+    pub adapter: AdapterSelector,
+
     // --- コーデック (mfxInfoMFX.CodecId / CodecProfile) ---
     /// コーデック設定
     pub codec: CodecConfig,
@@ -399,7 +404,9 @@ impl EncoderConfig {
     /// 必須パラメータのみ指定して EncoderConfig を作成する
     ///
     /// オプションパラメータはすべて None (エンコーダのデフォルト) に設定される。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        adapter: AdapterSelector,
         codec: CodecConfig,
         width: u32,
         height: u32,
@@ -409,6 +416,7 @@ impl EncoderConfig {
         rate_control_mode: RateControlMode,
     ) -> Self {
         Self {
+            adapter,
             codec,
             width,
             height,
@@ -718,8 +726,8 @@ impl<H: EncodeHandler> Encoder<H> {
 
         let lib = VplLibrary::load()?;
 
-        // API 2.x フローでセッションを作成する（ハードウェア実装を使用）
-        let (loader, session) = lib.create_session(sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE)?;
+        // API 2.x フローで指定アダプタのセッションを作成する
+        let (loader, session) = lib.create_session(config.adapter)?;
 
         // 初期化失敗時に MFXClose を呼ぶガード
         let session_guard = CloseGuard::session(lib, loader, session);

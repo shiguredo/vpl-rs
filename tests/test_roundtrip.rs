@@ -1,12 +1,29 @@
+#![cfg(target_os = "linux")]
+
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use shiguredo_vpl::{
-    Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodeOptions,
-    EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat,
-    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, RateControlMode,
-    frame_type,
+    AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec,
+    DecoderConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler,
+    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
+    PictureType, RateControlMode, frame_type, list_adapters,
 };
+
+/// テスト用アダプタを返す
+///
+/// `list_adapters()` の結果をテストバイナリ単位でキャッシュし、`MFXLoad` の
+/// 繰り返し呼び出しを避ける。Intel HW アダプタが見つからない環境では panic
+/// する（実機テストは Intel GPU 付きランナー上で実行する想定）。
+fn test_adapter() -> AdapterSelector {
+    static CACHED: OnceLock<AdapterSelector> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let adapters = list_adapters().expect("list_adapters に失敗");
+        let first = adapters.first().expect("Intel HW アダプタが見つからない");
+        AdapterSelector::DrmRenderNode(first.drm_render_node)
+    })
+}
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
 #[allow(dead_code)]
@@ -195,7 +212,7 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
 /// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
 fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
     let num_frames = bitstreams.len();
-    let config = DecoderConfig::new(decoder_codec);
+    let config = DecoderConfig::new(test_adapter(), decoder_codec);
     let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
     let mut decoder = Decoder::new(
         config,
@@ -322,6 +339,7 @@ fn roundtrip_colorbar(
 #[test]
 fn test_roundtrip_h264_cbr() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -342,6 +360,7 @@ fn test_roundtrip_h264_cbr() {
 #[test]
 fn test_roundtrip_h264_cqp() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::Main),
         }),
@@ -364,6 +383,7 @@ fn test_roundtrip_h264_cqp() {
 #[test]
 fn test_roundtrip_h264_force_idr() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -435,6 +455,7 @@ fn test_roundtrip_h264_force_idr() {
 #[test]
 fn test_encode_value_callback() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -490,6 +511,7 @@ fn test_encode_value_callback() {
 #[test]
 fn test_decode_value_callback() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -512,7 +534,7 @@ fn test_decode_value_callback() {
         .collect();
     let (_, bitstreams) = encode(config, &input_frames);
 
-    let decoder_config = DecoderConfig::new(DecoderCodec::H264);
+    let decoder_config = DecoderConfig::new(test_adapter(), DecoderCodec::H264);
     let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
     let mut decoder = Decoder::new(
         decoder_config,
@@ -548,6 +570,7 @@ fn test_decode_value_callback() {
 #[test]
 fn test_drop_cancels_pending_callbacks() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -609,6 +632,7 @@ fn test_drop_cancels_pending_callbacks() {
 #[test]
 fn test_roundtrip_hevc_cbr() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::Hevc(HevcEncoderConfig {
             profile: Some(HevcProfile::Main),
         }),
@@ -629,6 +653,7 @@ fn test_roundtrip_hevc_cbr() {
 #[test]
 fn test_roundtrip_hevc_cqp() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::Hevc(HevcEncoderConfig {
             profile: Some(HevcProfile::Main),
         }),
@@ -653,6 +678,7 @@ fn test_roundtrip_hevc_cqp() {
 #[test]
 fn test_roundtrip_av1_cbr() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::Av1(Av1EncoderConfig {
             profile: Some(Av1Profile::Main),
         }),
@@ -673,6 +699,7 @@ fn test_roundtrip_av1_cbr() {
 #[test]
 fn test_roundtrip_av1_cqp() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::Av1(Av1EncoderConfig {
             profile: Some(Av1Profile::Main),
         }),
@@ -803,6 +830,7 @@ fn roundtrip_format_with_size(
     height: u32,
 ) {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         codec_config,
         width,
         height,
@@ -872,6 +900,7 @@ fn test_roundtrip_h264_bgra() {
 #[test]
 fn test_roundtrip_h264_nv12_alignment_mismatch() {
     let mut config = EncoderConfig::new(
+        test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),

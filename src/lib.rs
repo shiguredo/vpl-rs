@@ -26,13 +26,14 @@
 //!
 //! ```no_run
 //! use shiguredo_vpl::{
-//!     Encoder, EncoderConfig, EncodeOptions, CodecConfig,
-//!     H264EncoderConfig, FrameFormat, RateControlMode, Error,
-//!     FnEncodeHandler, EncodedFrame,
+//!     AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
+//!     Error, FnEncodeHandler, FrameFormat, H264EncoderConfig, RateControlMode, list_adapters,
 //! };
 //! use std::sync::mpsc;
 //!
+//! let adapter = list_adapters().unwrap().into_iter().next().unwrap();
 //! let config = EncoderConfig::new(
+//!     AdapterSelector::DrmRenderNode(adapter.drm_render_node),
 //!     CodecConfig::H264(H264EncoderConfig { profile: None }),
 //!     1920,
 //!     1080,
@@ -63,13 +64,11 @@
 //! # デコードの例
 //!
 //! ```no_run
-//! use shiguredo_vpl::{Decoder, DecoderConfig, DecoderCodec, DecodedFrame, Error, FnDecodeHandler};
+//! use shiguredo_vpl::{AdapterSelector, Decoder, DecoderConfig, DecoderCodec, DecodedFrame, Error, FnDecodeHandler, list_adapters};
 //! use std::sync::mpsc;
 //!
-//! let config = DecoderConfig {
-//!     codec: DecoderCodec::H264,
-//!     async_depth: None,
-//! };
+//! let adapter = list_adapters().unwrap().into_iter().next().unwrap();
+//! let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(adapter.drm_render_node), DecoderCodec::H264);
 //! let (tx, rx) = mpsc::channel();
 //! let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, ()>, Error>| {
 //!     // DecodedFrame は借用データを含むため、コールバック内でコピーする
@@ -84,6 +83,7 @@
 //! let (y, _pitch, _width, _height) = rx.recv().unwrap().unwrap();
 //! ```
 
+mod adapter;
 mod codec_info;
 mod decode;
 mod encode;
@@ -96,6 +96,7 @@ pub mod ffi {
     pub use crate::sys::*;
 }
 
+pub use adapter::{AdapterInfo, AdapterSelector, MediaAdapterType, PciAddress, list_adapters};
 pub use codec_info::*;
 pub use decode::{
     DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, FnDecodeHandler,
@@ -159,42 +160,73 @@ impl VplLibrary {
 
     /// API 2.x フローでローダーを作成しセッションを生成する
     ///
-    /// MFXLoad → MFXCreateConfig → MFXSetConfigFilterProperty → MFXCreateSession の順に呼び出す。
-    /// 成功時はローダーとセッションのペアを返す。
-    /// ローダーはセッションが有効な間は保持する必要がある。
+    /// MFXLoad → MFXCreateConfig × 2 → MFXSetConfigFilterProperty × 2 → MFXCreateSession の順に
+    /// 呼び出す。HW 実装フィルタと DRM render node フィルタを別々の `mfxConfig` ハンドルに設定
+    /// するのは libvpl の慣用（ヘッダ `mfxdispatcher.h` の `MFX_ADD_PROPERTY_U32` マクロが
+    /// 1 プロパティ 1 cfg で組み立てるスタイル）に合わせるため。
+    ///
+    /// 成功時はローダーとセッションのペアを返す。ローダーはセッションが有効な間は保持する必要が
+    /// ある。指定の DRM render node に対応する Intel HW 実装が見つからない場合は libvpl の
+    /// `MFXCreateSession` が `MFX_ERR_NOT_FOUND` を返すため、エラーメッセージにその render
+    /// node 番号を含めて返す。
     pub(crate) fn create_session(
         &self,
-        impl_type: sys::mfxImplType,
+        adapter: AdapterSelector,
     ) -> Result<(sys::mfxLoader, sys::mfxSession), Error> {
+        adapter.validate()?;
+        let AdapterSelector::DrmRenderNode(render_node) = adapter;
+
         // ローダーを作成する
         let loader = unsafe { sys::MFXLoad() };
         if loader.is_null() {
             return Err(Error::new_custom("MFXLoad", "returned null"));
         }
 
-        // 実装タイプのフィルタを設定する
-        let cfg = unsafe { sys::MFXCreateConfig(loader) };
-        if cfg.is_null() {
+        // 1 つ目の cfg: HW 実装フィルタ
+        let cfg_impl = unsafe { sys::MFXCreateConfig(loader) };
+        if cfg_impl.is_null() {
             unsafe { sys::MFXUnload(loader) };
             return Err(Error::new_custom("MFXCreateConfig", "returned null"));
         }
-
         let name = b"mfxImplDescription.Impl\0";
         let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
         variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
-        variant.Data.U32 = impl_type;
-        let status = unsafe { sys::MFXSetConfigFilterProperty(cfg, name.as_ptr(), variant) };
+        variant.Data.U32 = sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE;
+        let status = unsafe { sys::MFXSetConfigFilterProperty(cfg_impl, name.as_ptr(), variant) };
         if status != sys::mfxStatus_MFX_ERR_NONE {
             unsafe { sys::MFXUnload(loader) };
             return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
         }
 
-        // 最初に見つかった実装（インデックス 0）でセッションを作成する
+        // 2 つ目の cfg: DRM render node フィルタ
+        let cfg_drm = unsafe { sys::MFXCreateConfig(loader) };
+        if cfg_drm.is_null() {
+            unsafe { sys::MFXUnload(loader) };
+            return Err(Error::new_custom("MFXCreateConfig", "returned null"));
+        }
+        let drm_name = b"mfxExtendedDeviceId.DRMRenderNodeNum\0";
+        let mut drm_variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
+        drm_variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
+        drm_variant.Data.U32 = render_node;
+        let status =
+            unsafe { sys::MFXSetConfigFilterProperty(cfg_drm, drm_name.as_ptr(), drm_variant) };
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            unsafe { sys::MFXUnload(loader) };
+            return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
+        }
+
+        // フィルタを通過した実装（インデックス 0）でセッションを作成する
         let mut session: sys::mfxSession = std::ptr::null_mut();
         let status = unsafe { sys::MFXCreateSession(loader, 0, &mut session) };
         if status != sys::mfxStatus_MFX_ERR_NONE {
             unsafe { sys::MFXUnload(loader) };
-            return Err(Error::from_mfx(status, "MFXCreateSession"));
+            let err = Error::from_mfx(status, "MFXCreateSession");
+            if status == sys::mfxStatus_MFX_ERR_NOT_FOUND {
+                return Err(err.with_message(format!(
+                    "no Intel HW implementation found for DRM render node {render_node}"
+                )));
+            }
+            return Err(err);
         }
 
         Ok((loader, session))
