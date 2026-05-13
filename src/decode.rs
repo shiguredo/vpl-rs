@@ -165,6 +165,46 @@ enum WorkerCommand<T> {
 // Safety: WorkerCommand はスレッド間で所有権を移動するだけで、同時アクセスはしない。
 unsafe impl<T: Send> Send for WorkerCommand<T> {}
 
+/// デコード結果を通知するためのハンドラー
+///
+/// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
+pub trait DecodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// デコード完了時に呼ばれる
+    fn on_decoded(&mut self, result: Result<DecodedFrame<'_, Self::UserData>, Self::Error>);
+}
+
+/// `FnMut(Result<DecodedFrame<T>, E>)` を [`DecodeHandler`] にするラッパー
+pub struct FnDecodeHandler<T, E = crate::Error> {
+    #[allow(clippy::type_complexity)]
+    f: Box<dyn for<'a> FnMut(Result<DecodedFrame<'a, T>, E>) + Send + 'static>,
+}
+
+impl<T, E> FnDecodeHandler<T, E> {
+    /// `FnMut(Result<DecodedFrame<T>, E>)` から [`DecodeHandler`] を構築する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: for<'a> FnMut(Result<DecodedFrame<'a, T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl<T, E> DecodeHandler for FnDecodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_decoded(&mut self, result: Result<DecodedFrame<'_, T>, E>) {
+        (self.f)(result);
+    }
+}
+
 /// Intel VPL ハードウェアデコーダ
 ///
 /// 圧縮されたビットストリームを NV12 フレームにデコードする。
@@ -186,7 +226,7 @@ unsafe impl<T: Send> Send for WorkerCommand<T> {}
 /// デコード完了通知は専用スレッド (`"vpl-decoder-sync"`) で行い、
 /// メインスレッドは `DecodeFrameAsync` の呼び出しのみを担当する。
 /// `Send` のみ実装し、`Sync` は実装しない（生ポインタにより自動的に `!Sync`）。
-pub struct Decoder<T> {
+pub struct Decoder<H: DecodeHandler> {
     lib: VplLibrary,
     loader: sys::mfxLoader,
     session: sys::mfxSession,
@@ -196,7 +236,7 @@ pub struct Decoder<T> {
     /// DecodeHeader + Init が完了しているか
     initialized: bool,
     /// Worker スレッドへの命令チャネル
-    worker_tx: mpsc::Sender<WorkerCommand<T>>,
+    worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     /// Worker スレッドの join ハンドル
     worker_handle: Option<thread::JoinHandle<()>>,
     /// decode() で渡された value の FIFO キュー
@@ -204,24 +244,21 @@ pub struct Decoder<T> {
     /// VPL は内部バッファにビットストリームを蓄積するため、
     /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない。
     /// このキューにより value と出力フレームの対応を管理する。
-    pending_values: VecDeque<T>,
+    pending_values: VecDeque<H::UserData>,
 }
 
 // Safety: デコード完了通知は専用スレッドで行い、メインスレッドは DecodeFrameAsync のみ実行する。
 // VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
-unsafe impl<T: Send> Send for Decoder<T> {}
+unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
-impl<T: Send + 'static> Decoder<T> {
+impl<H: DecodeHandler> Decoder<H> {
     /// デコーダを作成する
     ///
-    /// `callback` は Worker スレッドから呼ばれる。
+    /// `handler` は Worker スレッドから呼ばれる。
     /// `DecodedFrame` のライフタイムはコールバック呼び出し中のみ有効。
-    pub fn new<F>(config: DecoderConfig, callback: F) -> Result<Self, Error>
-    where
-        F: for<'a> FnMut(Result<DecodedFrame<'a, T>, Error>) + Send + 'static,
-    {
+    pub fn new(config: DecoderConfig, handler: H) -> Result<Self, Error> {
         let lib = VplLibrary::load()?;
 
         // API 2.x フローでセッションを作成する（ハードウェア実装を使用）
@@ -235,7 +272,7 @@ impl<T: Send + 'static> Decoder<T> {
         let worker_handle = thread::Builder::new()
             .name("vpl-decoder-sync".to_owned())
             .spawn(move || {
-                run_sync_worker(lib, session_handle, worker_rx, callback);
+                run_sync_worker(lib, session_handle, worker_rx, handler);
             })
             .map_err(|error| {
                 Error::new_custom_owned(
@@ -305,7 +342,7 @@ impl<T: Send + 'static> Decoder<T> {
     /// VPL は内部バッファにビットストリームを蓄積するため、
     /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない場合がある。
     /// value は `pending_values` キューで管理され、FIFO で出力フレームに割り当てられる。
-    pub fn decode(&mut self, data: &[u8], value: T) -> Result<(), Error> {
+    pub fn decode(&mut self, data: &[u8], value: H::UserData) -> Result<(), Error> {
         let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
         let data_len = u32::try_from(data.len()).map_err(|_| {
             Error::new_custom_owned(
@@ -478,7 +515,7 @@ impl<T: Send + 'static> Decoder<T> {
     fn send_worker_command(
         &mut self,
         function: &'static str,
-        command: WorkerCommand<T>,
+        command: WorkerCommand<H::UserData>,
     ) -> Result<(), Error> {
         self.worker_tx
             .send(command)
@@ -486,9 +523,7 @@ impl<T: Send + 'static> Decoder<T> {
     }
 }
 
-// Drop<T> 実装は `T: Send + 'static` 制約を付けられないため、
-// worker 停止処理だけを impl<T> 側へ分離して呼び出せるようにしている。
-impl<T> Decoder<T> {
+impl<H: DecodeHandler> Decoder<H> {
     fn stop_worker(&mut self) {
         if let Some(handle) = self.worker_handle.take() {
             // Stop を送って join した時点で worker は確実に終了するため、
@@ -499,7 +534,7 @@ impl<T> Decoder<T> {
     }
 }
 
-impl<T> Drop for Decoder<T> {
+impl<H: DecodeHandler> Drop for Decoder<H> {
     fn drop(&mut self) {
         self.stop_worker();
         if self.initialized {
@@ -515,23 +550,20 @@ impl<T> Drop for Decoder<T> {
 /// mpsc チャネルからコマンドを受信し、VPL API を呼び出す。
 /// セッション操作は全てこのスレッドで行うため、VPL のスレッド安全性に関する
 /// 暗黙の制約に抵触しない。
-fn run_sync_worker<T, F>(
+fn run_sync_worker<H: DecodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
-    worker_rx: mpsc::Receiver<WorkerCommand<T>>,
-    mut callback: F,
-) where
-    T: Send + 'static,
-    F: for<'a> FnMut(Result<DecodedFrame<'a, T>, Error>),
-{
+    worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
+    mut handler: H,
+) {
     while let Ok(command) = worker_rx.recv() {
         match command {
             WorkerCommand::DecodeFrame { sync_data, pending } => {
                 // SyncOperation + Map + 読み取り + callback + Unmap + Release
                 if let Err(error) =
-                    sync_and_callback(lib, session_handle, sync_data, pending, &mut callback)
+                    sync_and_callback(lib, session_handle, sync_data, pending, &mut handler)
                 {
-                    callback(Err(error));
+                    handler.on_decoded(Err(error.into()));
                 }
             }
             WorkerCommand::DrainFrame { sync_data } => {
@@ -602,19 +634,16 @@ impl Drop for DecodedSurfaceGuard {
 }
 
 /// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
-/// callback を呼び出す。
+/// handler の `on_decoded` を呼び出す。
 ///
-/// `DecodedFrame` 内の y/uv スライスは callback 呼び出し中のみ有効。
-fn sync_and_callback<T, F>(
+/// `DecodedFrame` 内の y/uv スライスは `on_decoded` 呼び出し中のみ有効。
+fn sync_and_callback<H: DecodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
     sync_data: DecodeSyncData,
-    pending: PendingDecode<T>,
-    callback: &mut F,
-) -> Result<(), Error>
-where
-    F: for<'a> FnMut(Result<DecodedFrame<'a, T>, Error>),
-{
+    pending: PendingDecode<H::UserData>,
+    handler: &mut H,
+) -> Result<(), crate::Error> {
     let DecodeSyncData { syncp, out_surface } = sync_data;
     let mut surface_guard = DecodedSurfaceGuard::new(lib, out_surface);
 
@@ -644,7 +673,7 @@ where
 
     // デコードされたフレームデータを読み取る
     let frame = read_decoded_surface(&surface_guard, pending)?;
-    callback(Ok(frame));
+    handler.on_decoded(Ok(frame));
     Ok(())
 }
 

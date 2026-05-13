@@ -63,8 +63,9 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_vpl::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
-    H264EncoderConfig, H264Profile, RateControlMode, frame_type,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
+    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile,
+    RateControlMode, frame_type,
 };
 use std::sync::mpsc;
 
@@ -82,9 +83,9 @@ let mut config = EncoderConfig::new(
 config.target_kbps = Some(5_000);
 
 let (tx, rx) = mpsc::channel();
-let mut encoder = Encoder::new(config, move |result| {
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |result| {
     tx.send(result).expect("failed to send callback result");
-})?;
+}))?;
 
 // フレームデータをエンコード
 let (coded_width, coded_height) = encoder.coded_size();
@@ -114,15 +115,15 @@ for _ in 0..2 {
 ### デコード
 
 ```rust
-use shiguredo_vpl::{Decoder, DecoderCodec, DecoderConfig};
+use shiguredo_vpl::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler};
 use std::sync::mpsc;
 
 let config = DecoderConfig::new(DecoderCodec::H264);
 
 let (tx, rx) = mpsc::channel();
-let mut decoder = Decoder::new(config, move |result| {
+let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
     tx.send(result).expect("failed to send callback result");
-})?;
+}))?;
 
 // ビットストリームデータをデコード (value で任意のユーザーデータを紐付け可能)
 let bitstream_data = vec![0u8; 1024];

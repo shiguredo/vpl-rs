@@ -27,7 +27,8 @@
 //! ```no_run
 //! use shiguredo_vpl::{
 //!     Encoder, EncoderConfig, EncodeOptions, CodecConfig,
-//!     H264EncoderConfig, FrameFormat, RateControlMode,
+//!     H264EncoderConfig, FrameFormat, RateControlMode, Error,
+//!     FnEncodeHandler, EncodedFrame,
 //! };
 //! use std::sync::mpsc;
 //!
@@ -41,9 +42,9 @@
 //!     RateControlMode::Cqp,
 //! );
 //! let (tx, rx) = mpsc::channel();
-//! let mut encoder = Encoder::new(config, move |result| {
+//! let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |result: Result<EncodedFrame<()>, Error>| {
 //!     tx.send(result).unwrap();
-//! }).unwrap();
+//! })).unwrap();
 //!
 //! // フレームデータをエンコードする
 //! let (coded_width, coded_height) = encoder.coded_size();
@@ -62,7 +63,7 @@
 //! # デコードの例
 //!
 //! ```no_run
-//! use shiguredo_vpl::{Decoder, DecoderConfig, DecoderCodec};
+//! use shiguredo_vpl::{Decoder, DecoderConfig, DecoderCodec, DecodedFrame, Error, FnDecodeHandler};
 //! use std::sync::mpsc;
 //!
 //! let config = DecoderConfig {
@@ -70,11 +71,11 @@
 //!     async_depth: None,
 //! };
 //! let (tx, rx) = mpsc::channel();
-//! let mut decoder = Decoder::new(config, move |result| {
+//! let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, ()>, Error>| {
 //!     // DecodedFrame は借用データを含むため、コールバック内でコピーする
 //!     let info = result.map(|frame| (frame.y().to_vec(), frame.pitch(), frame.width(), frame.height()));
 //!     tx.send(info).unwrap();
-//! }).unwrap();
+//! })).unwrap();
 //!
 //! // ビットストリームデータをデコードする
 //! let bitstream = vec![0u8; 1024];
@@ -96,11 +97,14 @@ pub mod ffi {
 }
 
 pub use codec_info::*;
-pub use decode::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig};
+pub use decode::{
+    DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, FnDecodeHandler,
+};
 pub use encode::{
-    Av1EncoderConfig, Av1Profile, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
-    EncoderStats, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
-    PictureType, RateControlMode, ReconfigureParams, Vp9EncoderConfig, Vp9Profile,
+    Av1EncoderConfig, Av1Profile, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
+    EncoderConfig, EncoderStats, FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile,
+    HevcEncoderConfig, HevcProfile, PictureType, RateControlMode, ReconfigureParams,
+    Vp9EncoderConfig, Vp9Profile,
 };
 pub use error::Error;
 

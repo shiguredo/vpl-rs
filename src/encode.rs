@@ -612,8 +612,47 @@ enum WorkerCommand<T> {
 // Safety: WorkerCommand はスレッド間で所有権を移動するだけで、同時アクセスはしない。
 unsafe impl<T: Send> Send for WorkerCommand<T> {}
 
+/// エンコード結果を通知するためのハンドラー
+///
+/// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
+pub trait EncodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// エンコード完了時に呼ばれる
+    fn on_encoded(&mut self, result: Result<EncodedFrame<Self::UserData>, Self::Error>);
+}
+
+/// `FnMut(Result<EncodedFrame<T>, E>)` を [`EncodeHandler`] にするラッパー
+pub struct FnEncodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<EncodedFrame<T>, E>) + Send + 'static>,
+}
+
+impl<T, E> FnEncodeHandler<T, E> {
+    /// `FnMut(Result<EncodedFrame<T>, E>)` から [`EncodeHandler`] を構築する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<EncodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl<T, E> EncodeHandler for FnEncodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, E>) {
+        (self.f)(result);
+    }
+}
+
 /// エンコーダ
-pub struct Encoder<T> {
+pub struct Encoder<H: EncodeHandler> {
     lib: VplLibrary,
     loader: sys::mfxLoader,
     session: sys::mfxSession,
@@ -621,7 +660,7 @@ pub struct Encoder<T> {
     frame_info: sys::mfxFrameInfo,
     frame_format: FrameFormat,
     bitstream_buffer_size: usize,
-    worker_tx: mpsc::Sender<WorkerCommand<T>>,
+    worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     worker_handle: Option<thread::JoinHandle<()>>,
     frame_count: u64,
     framerate_den: u64,
@@ -631,14 +670,11 @@ pub struct Encoder<T> {
 // VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
-unsafe impl<T: Send> Send for Encoder<T> {}
+unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
-impl<T: Send + 'static> Encoder<T> {
+impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダを作成する
-    pub fn new<F>(config: EncoderConfig, callback: F) -> Result<Self, Error>
-    where
-        F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
-    {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
             return Err(Error::new_custom(
@@ -890,7 +926,7 @@ impl<T: Send + 'static> Encoder<T> {
         let worker_handle = thread::Builder::new()
             .name("vpl-encoder-sync".to_owned())
             .spawn(move || {
-                run_sync_worker(lib, session_handle, worker_rx, callback);
+                run_sync_worker(lib, session_handle, worker_rx, handler);
             })
             .map_err(|error| {
                 Error::new_custom_owned(
@@ -1016,7 +1052,7 @@ impl<T: Send + 'static> Encoder<T> {
     pub fn encode(
         &mut self,
         frame_data: &[u8],
-        value: T,
+        value: H::UserData,
         options: &EncodeOptions,
     ) -> Result<(), Error> {
         // フレームサイズを検証する
@@ -1212,17 +1248,13 @@ impl<T: Send + 'static> Encoder<T> {
     fn send_worker_command(
         &mut self,
         function: &'static str,
-        command: WorkerCommand<T>,
+        command: WorkerCommand<H::UserData>,
     ) -> Result<(), Error> {
         self.worker_tx
             .send(command)
             .map_err(|_| Error::new_custom(function, "sync worker thread is not running"))
     }
-}
 
-// Drop<T> 実装は `T: Send + 'static` 制約を付けられないため、
-// worker 停止処理だけを impl<T> 側へ分離して呼び出せるようにしている。
-impl<T> Encoder<T> {
     fn stop_worker(&mut self) {
         if let Some(handle) = self.worker_handle.take() {
             // Stop を送って join した時点で worker は確実に終了するため、
@@ -1233,7 +1265,7 @@ impl<T> Encoder<T> {
     }
 }
 
-impl<T> Drop for Encoder<T> {
+impl<H: EncodeHandler> Drop for Encoder<H> {
     fn drop(&mut self) {
         self.stop_worker();
         let _ = self.lib.mfx_video_encode_close(self.session);
@@ -1279,15 +1311,12 @@ impl Drop for SurfaceGuard {
     }
 }
 
-fn run_sync_worker<T, F>(
+fn run_sync_worker<H: EncodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
-    worker_rx: mpsc::Receiver<WorkerCommand<T>>,
-    mut callback: F,
-) where
-    T: Send + 'static,
-    F: FnMut(Result<EncodedFrame<T>, Error>),
-{
+    worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
+    mut handler: H,
+) {
     let mut pending_store = PendingFrameStore::new();
     while let Ok(command) = worker_rx.recv() {
         match command {
@@ -1298,20 +1327,19 @@ fn run_sync_worker<T, F>(
                 // encode 呼び出し単位の pending frame を frame_seq で登録する。
                 // syncp == None の入力も必ずここで保持し、後続出力との一致で回収する。
                 if pending_store.insert(frame_seq, pending_frame).is_some() {
-                    callback(Err(Error::new_custom_owned(
+                    handler.on_encoded(Err(Error::new_custom_owned(
                         "Encoder::sync_worker",
                         format!("duplicate frame sequence in pending frames: {frame_seq}"),
-                    )));
+                    )
+                    .into()));
                 }
             }
             WorkerCommand::Sync(sync) => {
                 // 通常入力の sync 完了を待ち、bitstream.TimeStamp と frame_seq を完全一致で対応付ける。
-                callback(sync_and_build_frame(
-                    lib,
-                    session_handle,
-                    sync,
-                    &mut pending_store,
-                ));
+                handler.on_encoded(
+                    sync_and_build_frame(lib, session_handle, sync, &mut pending_store)
+                        .map_err(Into::into),
+                );
             }
             WorkerCommand::WaitIdle(reply_tx) => {
                 // finish 側のバリア。ここに到達した時点で、それ以前に送信された
@@ -1324,7 +1352,8 @@ fn run_sync_worker<T, F>(
                 let pending = pending_store.drain_all();
                 let remaining_count = pending.len();
                 for (frame_seq, _meta) in pending {
-                    callback(Err(finish_pending_error(frame_seq, remaining_count)));
+                    handler
+                        .on_encoded(Err(finish_pending_error(frame_seq, remaining_count).into()));
                 }
                 let _ = reply_tx.send(Err(Error::new_custom_owned(
                     "Encoder::finish",
@@ -1334,7 +1363,7 @@ fn run_sync_worker<T, F>(
             WorkerCommand::Stop => {
                 // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
                 for (_frame_seq, _pending) in pending_store.drain_all() {
-                    callback(Err(canceled_error()));
+                    handler.on_encoded(Err(canceled_error().into()));
                 }
                 break;
             }
@@ -1620,11 +1649,11 @@ mod tests {
                 VplLibrary,
                 0,
                 command_rx,
-                move |result: Result<EncodedFrame<u32>, Error>| {
+                FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
                     callback_tx
                         .send(result.map(|_| ()))
                         .expect("failed to forward callback result");
-                },
+                }),
             );
         });
 
@@ -1669,11 +1698,11 @@ mod tests {
                 VplLibrary,
                 0,
                 command_rx,
-                move |result: Result<EncodedFrame<u32>, Error>| {
+                FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
                     callback_tx
                         .send(result.map(|_| ()))
                         .expect("failed to forward callback result");
-                },
+                }),
             );
         });
 

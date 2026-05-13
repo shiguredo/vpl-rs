@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use shiguredo_vpl::{
     Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodeOptions,
-    EncodedFrame, Encoder, EncoderConfig, Error, FrameFormat, H264EncoderConfig, H264Profile,
-    HevcEncoderConfig, HevcProfile, PictureType, RateControlMode, frame_type,
+    EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat,
+    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, RateControlMode,
+    frame_type,
 };
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
@@ -142,10 +143,13 @@ fn psnr_y(original: &[u8], decoded_y: &[u8], pitch: usize, width: usize, height:
 /// エンコードしてフレーム一覧とフレームごとのビットストリームを返すヘルパー
 fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
     let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
-    let mut encoder = Encoder::new(config, move |result| {
-        tx.send(result)
-            .expect("failed to send encoded frame callback result");
-    })
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new(move |result| {
+            tx.send(result)
+                .expect("failed to send encoded frame callback result");
+        }),
+    )
     .expect("failed to create encoder");
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
@@ -193,20 +197,23 @@ fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFra
     let num_frames = bitstreams.len();
     let config = DecoderConfig::new(decoder_codec);
     let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
-    let mut decoder = Decoder::new(config, move |result| {
-        let info = result.map(|frame| {
-            let y_data = frame.y().to_vec();
-            DecodedFrameInfo {
-                y_data,
-                pitch: frame.pitch(),
-                width: frame.width(),
-                height: frame.height(),
-                value: *frame.value(),
-            }
-        });
-        tx.send(info)
-            .expect("failed to send decoded frame callback result");
-    })
+    let mut decoder = Decoder::new(
+        config,
+        FnDecodeHandler::new(move |result| {
+            let info = result.map(|frame| {
+                let y_data = frame.y().to_vec();
+                DecodedFrameInfo {
+                    y_data,
+                    pitch: frame.pitch(),
+                    width: frame.width(),
+                    height: frame.height(),
+                    value: *frame.value(),
+                }
+            });
+            tx.send(info)
+                .expect("failed to send decoded frame callback result");
+        }),
+    )
     .expect("failed to create decoder");
 
     for (index, bs) in bitstreams.iter().enumerate() {
@@ -268,8 +275,9 @@ fn roundtrip(
 
 /// 指定エンコーダ設定の coded サイズを取得する
 fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
-    let encoder: Encoder<()> =
-        Encoder::new(config.clone(), |_| {}).expect("failed to create encoder");
+    let encoder: Encoder<FnEncodeHandler<()>> =
+        Encoder::new(config.clone(), FnEncodeHandler::new(|_| {}))
+            .expect("failed to create encoder");
     encoder.coded_size()
 }
 
@@ -372,10 +380,13 @@ fn test_roundtrip_h264_force_idr() {
     let width = config.width as usize;
     let height = config.height as usize;
     let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
-    let mut encoder = Encoder::new(config, move |result| {
-        tx.send(result)
-            .expect("failed to send encoded frame callback result");
-    })
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new(move |result| {
+            tx.send(result)
+                .expect("failed to send encoded frame callback result");
+        }),
+    )
     .expect("failed to create encoder");
     let (coded_width, coded_height) = encoder.coded_size();
     let mut encoded_frames = Vec::new();
@@ -438,10 +449,13 @@ fn test_encode_value_callback() {
     config.gop_pic_size = Some(30);
 
     let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
-    let mut encoder = Encoder::new(config, move |result| {
-        tx.send(result)
-            .expect("failed to send encoded frame callback result");
-    })
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new(move |result| {
+            tx.send(result)
+                .expect("failed to send encoded frame callback result");
+        }),
+    )
     .expect("failed to create encoder");
     let (coded_width, coded_height) = encoder.coded_size();
     let options = EncodeOptions {
@@ -500,11 +514,14 @@ fn test_decode_value_callback() {
 
     let decoder_config = DecoderConfig::new(DecoderCodec::H264);
     let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
-    let mut decoder = Decoder::new(decoder_config, move |result| {
-        let value = result.map(|frame| *frame.value());
-        tx.send(value)
-            .expect("failed to send decoded frame callback result");
-    })
+    let mut decoder = Decoder::new(
+        decoder_config,
+        FnDecodeHandler::new(move |result| {
+            let value = result.map(|frame| *frame.value());
+            tx.send(value)
+                .expect("failed to send decoded frame callback result");
+        }),
+    )
     .expect("failed to create decoder");
 
     for (i, bs) in bitstreams.iter().enumerate() {
@@ -549,10 +566,13 @@ fn test_drop_cancels_pending_callbacks() {
 
     let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
     {
-        let mut encoder = Encoder::new(config, move |result| {
-            tx.send(result)
-                .expect("failed to send encoded frame callback result");
-        })
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |result| {
+                tx.send(result)
+                    .expect("failed to send encoded frame callback result");
+            }),
+        )
         .expect("failed to create encoder");
         let (coded_width, coded_height) = encoder.coded_size();
         let options = EncodeOptions {
