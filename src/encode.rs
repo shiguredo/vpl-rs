@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::{AdapterSelector, Error, VplLibrary, sys};
+use crate::vpl::{FrameSurface, Session, VplLibrary};
+use crate::{AdapterSelector, Error, sys};
 
 /// H.264 プロファイル
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,9 +662,7 @@ where
 
 /// エンコーダ
 pub struct Encoder<H: EncodeHandler> {
-    lib: VplLibrary,
-    loader: sys::mfxLoader,
-    session: sys::mfxSession,
+    session: Session,
     video_param: sys::mfxVideoParam,
     frame_info: sys::mfxFrameInfo,
     frame_format: FrameFormat,
@@ -727,10 +726,9 @@ impl<H: EncodeHandler> Encoder<H> {
         let lib = VplLibrary::load()?;
 
         // API 2.x フローで指定アダプタのセッションを作成する
-        let (loader, session) = lib.create_session(config.adapter)?;
+        let session = lib.create_session(config.adapter)?;
 
-        // 初期化失敗時に MFXClose を呼ぶガード
-        let session_guard = CloseGuard::session(lib, loader, session);
+        // --- Init 前のエラー → session が Drop されて MFXClose + MFXUnload が自動実行される ---
 
         // mfxFrameInfo を設定する
         let mut frame_info: sys::mfxFrameInfo = unsafe { std::mem::zeroed() };
@@ -915,41 +913,38 @@ impl<H: EncodeHandler> Encoder<H> {
             video_param.NumExtParam = ext_bufs.len() as u16;
         }
 
-        lib.mfx_video_encode_init(session, &mut video_param)?;
+        lib.mfx_video_encode_init(session.as_ptr(), &mut video_param)?;
+
+        let lib = session.lib();
+        let session_ptr = session.as_ptr();
 
         // Init 後に ExtParam ポインタをクリアする（ローカルの ext_bufs が drop されるため）
         video_param.ExtParam = std::ptr::null_mut();
         video_param.NumExtParam = 0;
 
         // 初期化後の実効パラメータを反映する
-        lib.mfx_video_encode_get_video_param(session, &mut video_param)?;
+        lib.mfx_video_encode_get_video_param(session_ptr, &mut video_param)?;
         frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
-
-        // エンコーダ初期化後のガード（エラー時に MFXVideoENCODE_Close を呼ぶ）
-        let encoder_guard = CloseGuard::encoder(lib, loader, session);
 
         let bitstream_buffer_size = (buffer_size_in_kb as usize) * 1024;
         let (worker_tx, worker_rx) = mpsc::channel();
-        let session_handle = session as usize;
+        let session_handle = session_ptr as usize;
         let worker_handle = thread::Builder::new()
             .name("vpl-encoder-sync".to_owned())
             .spawn(move || {
                 run_sync_worker(lib, session_handle, worker_rx, handler);
             })
             .map_err(|error| {
+                // スレッド生成失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
+                let _ = lib.mfx_video_encode_close(session_ptr);
                 Error::new_custom_owned(
                     "Encoder::new",
                     format!("failed to spawn sync worker thread: {error}"),
                 )
             })?;
 
-        // ガードをキャンセルして所有権を Encoder に移す
-        encoder_guard.cancel();
-        session_guard.cancel();
-
+        // すべて成功 → Session の所有権を Encoder に移す
         Ok(Encoder {
-            lib,
-            loader,
             session,
             video_param,
             frame_info,
@@ -978,7 +973,10 @@ impl<H: EncodeHandler> Encoder<H> {
         input: &mut sys::mfxVideoParam,
         output: &mut sys::mfxVideoParam,
     ) -> Result<(), Error> {
-        let status = self.lib.mfx_video_encode_query(self.session, input, output);
+        let status =
+            self.session
+                .lib()
+                .mfx_video_encode_query(self.session.as_ptr(), input, output);
         Error::check_mfx_allow_warn(status, "MFXVideoENCODE_Query")
     }
 
@@ -1018,8 +1016,9 @@ impl<H: EncodeHandler> Encoder<H> {
             }
         }
 
-        self.lib
-            .mfx_video_encode_reset(self.session, &mut self.video_param)
+        self.session
+            .lib()
+            .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param)
     }
 
     /// Init 後の実効パラメータを取得する
@@ -1033,8 +1032,9 @@ impl<H: EncodeHandler> Encoder<H> {
         let mut param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
         // 現在のパラメータをコピーしてから GetVideoParam で上書きする
         param.IOPattern = self.video_param.IOPattern;
-        self.lib
-            .mfx_video_encode_get_video_param(self.session, &mut param)?;
+        self.session
+            .lib()
+            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param)?;
         Ok(param)
     }
 
@@ -1047,8 +1047,9 @@ impl<H: EncodeHandler> Encoder<H> {
     /// エンコード統計情報を取得する
     pub fn get_encode_stat(&self) -> Result<EncoderStats, Error> {
         let mut stat: sys::mfxEncodeStat = unsafe { std::mem::zeroed() };
-        self.lib
-            .mfx_video_encode_get_encode_stat(self.session, &mut stat)?;
+        self.session
+            .lib()
+            .mfx_video_encode_get_encode_stat(self.session.as_ptr(), &mut stat)?;
         Ok(EncoderStats {
             num_frame: stat.NumFrame,
             num_bit: stat.NumBit,
@@ -1093,29 +1094,30 @@ impl<H: EncodeHandler> Encoder<H> {
         // エンコード用内部サーフェスを取得する
         let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
         let status = self
-            .lib
-            .mfx_memory_get_surface_for_encode(self.session, &mut surface);
+            .session
+            .lib()
+            .mfx_memory_get_surface_for_encode(self.session.as_ptr(), &mut surface);
         if status != sys::mfxStatus_MFX_ERR_NONE {
             return Err(Error::from_mfx(status, "MFXMemory_GetSurfaceForEncode"));
         }
-        let mut surface_guard = SurfaceGuard::new(self.lib, surface);
+        let mut frame_surface = FrameSurface::new(self.session.lib(), surface)?;
 
         // Map して CPU から書き込めるようにする
-        surface_guard.map_write()?;
+        frame_surface.map_write()?;
 
         // フレームデータを内部サーフェスにコピーする
         unsafe {
-            (*surface_guard.surface()).Data.TimeStamp = frame_seq;
+            (*frame_surface.as_ptr()).Data.TimeStamp = frame_seq;
             self.frame_format.copy_to_surface_planes(
                 &frame_data[..expected],
-                &(*surface_guard.surface()).Data,
+                &(*frame_surface.as_ptr()).Data,
                 coded_width,
                 coded_height,
             );
         }
 
         // Unmap して書き込み完了を通知する
-        surface_guard.unmap()?;
+        frame_surface.unmap()?;
 
         // エンコード制御を設定する
         let mut ctrl: sys::mfxEncodeCtrl = unsafe { std::mem::zeroed() };
@@ -1127,8 +1129,7 @@ impl<H: EncodeHandler> Encoder<H> {
         };
 
         let (mut bitstream, bitstream_buffer) = self.create_bitstream();
-        let syncp =
-            self.encode_frame_async(ctrl_ptr, surface_guard.surface(), bitstream.as_mut())?;
+        let syncp = self.encode_frame_async(ctrl_ptr, Some(&frame_surface), bitstream.as_mut())?;
 
         // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
         self.send_worker_command(
@@ -1166,15 +1167,16 @@ impl<H: EncodeHandler> Encoder<H> {
     fn encode_frame_async(
         &mut self,
         ctrl: *mut sys::mfxEncodeCtrl,
-        surface: *mut sys::mfxFrameSurface1,
+        surface: Option<&FrameSurface>,
         bitstream: &mut sys::mfxBitstream,
     ) -> Result<Option<sys::mfxSyncPoint>, Error> {
+        let surface_ptr = surface.map(|s| s.as_ptr()).unwrap_or(std::ptr::null_mut());
         for _ in 0..DEVICE_BUSY_MAX_RETRIES {
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
-            let status = self.lib.mfx_video_encode_frame_async(
-                self.session,
+            let status = self.session.lib().mfx_video_encode_frame_async(
+                self.session.as_ptr(),
                 ctrl,
-                surface,
+                surface_ptr,
                 bitstream,
                 &mut syncp,
             );
@@ -1205,11 +1207,8 @@ impl<H: EncodeHandler> Encoder<H> {
             // null surface でエンコードを呼び出して、残りのフレームをすべて排出する
             let (mut bitstream, bitstream_buffer) = self.create_bitstream();
 
-            let Some(syncp) = self.encode_frame_async(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                bitstream.as_mut(),
-            )?
+            let Some(syncp) =
+                self.encode_frame_async(std::ptr::null_mut(), None, bitstream.as_mut())?
             else {
                 // すべて排出済み
                 break;
@@ -1264,66 +1263,11 @@ impl<H: EncodeHandler> Encoder<H> {
 impl<H: EncodeHandler> Drop for Encoder<H> {
     fn drop(&mut self) {
         self.stop_worker();
-        let _ = self.lib.mfx_video_encode_close(self.session);
-        let _ = self.lib.mfx_close(self.session);
-        self.lib.mfx_unload(self.loader);
-    }
-}
-
-/// エンコード用内部サーフェスの `Map` / `Unmap` / `Release` を保証するガード
-///
-/// `Drop` で `Unmap` と `Release` を自動実行する。
-struct SurfaceGuard {
-    lib: VplLibrary,
-    surface: *mut sys::mfxFrameSurface1,
-    mapped: bool,
-}
-
-impl SurfaceGuard {
-    fn new(lib: VplLibrary, surface: *mut sys::mfxFrameSurface1) -> Self {
-        Self {
-            lib,
-            surface,
-            mapped: false,
-        }
-    }
-
-    fn surface(&self) -> *mut sys::mfxFrameSurface1 {
-        self.surface
-    }
-
-    fn map_write(&mut self) -> Result<(), Error> {
-        let status = self
-            .lib
-            .mfx_frame_surface_map(self.surface, sys::mfxMemoryFlags_MFX_MAP_WRITE);
-        Error::check_mfx(status, "mfxFrameSurfaceInterface::Map")?;
-        self.mapped = true;
-        Ok(())
-    }
-
-    fn unmap(&mut self) -> Result<(), Error> {
-        let status = self.lib.mfx_frame_surface_unmap(self.surface);
-        Error::check_mfx(status, "mfxFrameSurfaceInterface::Unmap")?;
-        self.mapped = false;
-        Ok(())
-    }
-}
-
-impl Drop for SurfaceGuard {
-    fn drop(&mut self) {
-        if self.surface.is_null() {
-            return;
-        }
-        if self.mapped {
-            let _ = Error::check_mfx(
-                self.lib.mfx_frame_surface_unmap(self.surface),
-                "mfxFrameSurfaceInterface::Unmap",
-            );
-        }
-        let _ = Error::check_mfx(
-            self.lib.mfx_frame_surface_release(self.surface),
-            "mfxFrameSurfaceInterface::Release",
-        );
+        let _ = self
+            .session
+            .lib()
+            .mfx_video_encode_close(self.session.as_ptr());
+        // self.session が続けて Drop され、MFXClose + MFXUnload が実行される
     }
 }
 
@@ -1515,54 +1459,6 @@ fn picture_type_from_frame_type(frame_type: u16) -> PictureType {
         PictureType::B
     } else {
         PictureType::Unknown
-    }
-}
-
-/// セッションまたはエンコーダの解放ガード（エラー時に MFXClose / MFXVideoENCODE_Close / MFXUnload を呼ぶ）
-struct CloseGuard {
-    lib: VplLibrary,
-    loader: sys::mfxLoader,
-    session: sys::mfxSession,
-    active: bool,
-    close_encoder: bool,
-}
-
-impl CloseGuard {
-    fn session(lib: VplLibrary, loader: sys::mfxLoader, session: sys::mfxSession) -> Self {
-        Self {
-            lib,
-            loader,
-            session,
-            active: true,
-            close_encoder: false,
-        }
-    }
-
-    fn encoder(lib: VplLibrary, loader: sys::mfxLoader, session: sys::mfxSession) -> Self {
-        Self {
-            lib,
-            loader,
-            session,
-            active: true,
-            close_encoder: true,
-        }
-    }
-
-    fn cancel(mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for CloseGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        if self.close_encoder {
-            let _ = self.lib.mfx_video_encode_close(self.session);
-        }
-        let _ = self.lib.mfx_close(self.session);
-        self.lib.mfx_unload(self.loader);
     }
 }
 

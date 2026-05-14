@@ -1,7 +1,9 @@
 //! コーデック情報の照会
 
 #[cfg(target_os = "linux")]
-use crate::{AdapterSelector, Error, VplLibrary, sys};
+use crate::vpl::VplLibrary;
+#[cfg(target_os = "linux")]
+use crate::{AdapterSelector, Error, sys};
 
 /// コーデック種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

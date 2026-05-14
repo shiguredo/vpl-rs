@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::{AdapterSelector, Error, VplLibrary, sys};
+use crate::vpl::{FrameSurface, Session, VplLibrary};
+use crate::{AdapterSelector, Error, sys};
 
 /// デコーダ用コーデック識別子
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,11 +131,8 @@ impl<'a, T> DecodedFrame<'a, T> {
 /// `syncp` で SyncOperation を待機し、`out_surface` から Map でデータを読み取る。
 struct DecodeSyncData {
     syncp: sys::mfxSyncPoint,
-    out_surface: *mut sys::mfxFrameSurface1,
+    frame_surface: FrameSurface,
 }
-
-// Safety: DecodeSyncData はスレッド間で所有権を移動するだけで、同時アクセスはしない。
-unsafe impl Send for DecodeSyncData {}
 
 /// Worker スレッドへの命令
 ///
@@ -214,9 +212,7 @@ where
 /// メインスレッドは `DecodeFrameAsync` の呼び出しのみを担当する。
 /// `Send` のみ実装し、`Sync` は実装しない（生ポインタにより自動的に `!Sync`）。
 pub struct Decoder<H: DecodeHandler> {
-    lib: VplLibrary,
-    loader: sys::mfxLoader,
-    session: sys::mfxSession,
+    session: Session,
     codec: DecoderCodec,
     /// mfxVideoParam.AsyncDepth に設定する値
     async_depth: u16,
@@ -243,13 +239,11 @@ impl<H: DecodeHandler> Decoder<H> {
         let lib = VplLibrary::load()?;
 
         // API 2.x フローで指定アダプタのセッションを作成する
-        let (loader, session) = lib.create_session(config.adapter)?;
-
-        // 初期化失敗時に MFXClose を呼ぶガード
-        let session_guard = CloseGuard::session(lib, loader, session);
+        let session = lib.create_session(config.adapter)?;
 
         let (worker_tx, worker_rx) = mpsc::channel();
-        let session_handle = session as usize;
+        let lib = session.lib();
+        let session_handle = session.as_ptr() as usize;
         let worker_handle = thread::Builder::new()
             .name("vpl-decoder-sync".to_owned())
             .spawn(move || {
@@ -262,12 +256,7 @@ impl<H: DecodeHandler> Decoder<H> {
                 )
             })?;
 
-        // ガードをキャンセルして所有権を Decoder に移す
-        session_guard.cancel();
-
         Ok(Decoder {
-            lib,
-            loader,
             session,
             codec: config.codec,
             async_depth: config.async_depth.unwrap_or(4),
@@ -301,12 +290,16 @@ impl<H: DecodeHandler> Decoder<H> {
         }
 
         // DecodeHeader でビットストリームから解像度などのパラメータを読み取る
-        self.lib
-            .mfx_video_decode_decode_header(self.session, bs, &mut video_param)?;
+        self.session.lib().mfx_video_decode_decode_header(
+            self.session.as_ptr(),
+            bs,
+            &mut video_param,
+        )?;
 
         // デコーダを初期化する。警告を返すことがあるが初期化自体は成功している
-        self.lib
-            .mfx_video_decode_init(self.session, &mut video_param)?;
+        self.session
+            .lib()
+            .mfx_video_decode_init(self.session.as_ptr(), &mut video_param)?;
 
         self.initialized = true;
 
@@ -361,8 +354,8 @@ impl<H: DecodeHandler> Decoder<H> {
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
             // surface_work=NULL で VPL 内部割り当てを使用する
-            let status = self.lib.mfx_video_decode_frame_async(
-                self.session,
+            let status = self.session.lib().mfx_video_decode_frame_async(
+                self.session.as_ptr(),
                 bs,
                 std::ptr::null_mut(),
                 &mut out_surface,
@@ -389,10 +382,14 @@ impl<H: DecodeHandler> Decoder<H> {
             // MFX_ERR_NONE または MFX_WRN_*（DEVICE_BUSY 以外）。
             // syncp が非 null ならデコード済みフレームが存在する
             if !syncp.is_null() {
+                let frame_surface = FrameSurface::new(self.session.lib(), out_surface)?;
                 self.send_worker_command(
                     "Decoder::decode",
                     WorkerCommand::Sync {
-                        sync_data: DecodeSyncData { syncp, out_surface },
+                        sync_data: DecodeSyncData {
+                            syncp,
+                            frame_surface,
+                        },
                     },
                 )?;
             }
@@ -419,8 +416,8 @@ impl<H: DecodeHandler> Decoder<H> {
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
             // null bitstream で残留フレームを排出する
-            let status = self.lib.mfx_video_decode_frame_async(
-                self.session,
+            let status = self.session.lib().mfx_video_decode_frame_async(
+                self.session.as_ptr(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 &mut out_surface,
@@ -440,10 +437,17 @@ impl<H: DecodeHandler> Decoder<H> {
             }
 
             if !syncp.is_null() {
+                let frame_surface = match FrameSurface::new(self.session.lib(), out_surface) {
+                    Ok(fs) => fs,
+                    Err(_) => continue,
+                };
                 self.send_worker_command(
                     "Decoder::finish",
                     WorkerCommand::Sync {
-                        sync_data: DecodeSyncData { syncp, out_surface },
+                        sync_data: DecodeSyncData {
+                            syncp,
+                            frame_surface,
+                        },
                     },
                 )?;
             }
@@ -484,10 +488,12 @@ impl<H: DecodeHandler> Drop for Decoder<H> {
     fn drop(&mut self) {
         self.stop_worker();
         if self.initialized {
-            let _ = self.lib.mfx_video_decode_close(self.session);
+            let _ = self
+                .session
+                .lib()
+                .mfx_video_decode_close(self.session.as_ptr());
         }
-        let _ = self.lib.mfx_close(self.session);
-        self.lib.mfx_unload(self.loader);
+        // self.session が続けて Drop され、MFXClose + MFXUnload が実行される
     }
 }
 
@@ -544,56 +550,6 @@ fn run_sync_worker<H: DecodeHandler>(
     }
 }
 
-/// デコード済みサーフェスの `Map` / `Unmap` / `Release` を保証するガード
-///
-/// `Drop` で `Unmap` と `Release` を自動実行する。
-struct DecodedSurfaceGuard {
-    lib: VplLibrary,
-    surface: *mut sys::mfxFrameSurface1,
-    mapped: bool,
-}
-
-impl DecodedSurfaceGuard {
-    fn new(lib: VplLibrary, surface: *mut sys::mfxFrameSurface1) -> Self {
-        Self {
-            lib,
-            surface,
-            mapped: false,
-        }
-    }
-
-    fn surface(&self) -> *mut sys::mfxFrameSurface1 {
-        self.surface
-    }
-
-    fn map_read(&mut self) -> Result<(), Error> {
-        let status = self
-            .lib
-            .mfx_frame_surface_map(self.surface, sys::mfxMemoryFlags_MFX_MAP_READ);
-        Error::check_mfx(status, "mfxFrameSurfaceInterface::Map")?;
-        self.mapped = true;
-        Ok(())
-    }
-}
-
-impl Drop for DecodedSurfaceGuard {
-    fn drop(&mut self) {
-        if self.surface.is_null() {
-            return;
-        }
-        if self.mapped {
-            let _ = Error::check_mfx(
-                self.lib.mfx_frame_surface_unmap(self.surface),
-                "mfxFrameSurfaceInterface::Unmap",
-            );
-        }
-        let _ = Error::check_mfx(
-            self.lib.mfx_frame_surface_release(self.surface),
-            "mfxFrameSurfaceInterface::Release",
-        );
-    }
-}
-
 /// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
 /// handler の `on_decoded` を呼び出す。
 ///
@@ -605,20 +561,15 @@ fn sync_and_callback<H: DecodeHandler>(
     user_data: H::UserData,
     handler: &mut H,
 ) -> Result<(), crate::Error> {
-    let DecodeSyncData { syncp, out_surface } = sync_data;
-    let mut surface_guard = DecodedSurfaceGuard::new(lib, out_surface);
+    let DecodeSyncData {
+        syncp,
+        mut frame_surface,
+    } = sync_data;
 
     if syncp.is_null() {
         return Err(Error::new_custom(
             "Decoder::sync_worker",
             "sync point is null",
-        ));
-    }
-
-    if out_surface.is_null() {
-        return Err(Error::new_custom(
-            "Decoder::sync_worker",
-            "output surface is null",
         ));
     }
 
@@ -630,10 +581,10 @@ fn sync_and_callback<H: DecodeHandler>(
     );
     Error::check_mfx(status, "MFXVideoCORE_SyncOperation")?;
 
-    surface_guard.map_read()?;
+    frame_surface.map_read()?;
 
     // デコードされたフレームデータを読み取る
-    let frame = read_decoded_surface(&surface_guard, user_data)?;
+    let frame = read_decoded_surface(&frame_surface, user_data)?;
     handler.on_decoded(Ok(frame));
     Ok(())
 }
@@ -643,10 +594,12 @@ fn sync_and_callback<H: DecodeHandler>(
 /// ドレインフレームには user_data がないため、データは読み取らずに解放のみ行う。
 /// エラーはすべて無視する（データ破棄が目的のため）。
 fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncData) {
-    let DecodeSyncData { syncp, out_surface } = sync_data;
-    let mut surface_guard = DecodedSurfaceGuard::new(lib, out_surface);
+    let DecodeSyncData {
+        syncp,
+        mut frame_surface,
+    } = sync_data;
 
-    if syncp.is_null() || out_surface.is_null() {
+    if syncp.is_null() {
         return;
     }
 
@@ -657,20 +610,18 @@ fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncD
     );
 
     // Drop での自動解放を使ってクリーンアップする
-    let _ = surface_guard.map_read();
+    let _ = frame_surface.map_read();
 }
 
 /// デコード済みサーフェスから Y/UV スライスを読み取り `DecodedFrame` を構築する
 ///
-/// # Safety
-///
-/// 呼び出し元は `out_surface` が Map 済みで有効なデータを持つことを保証すること。
-/// 戻り値の `DecodedFrame` が生存している間、`out_surface` のデータは有効でなければならない。
-unsafe fn read_decoded_surface_inner<'a, T>(
-    out_surface: *mut sys::mfxFrameSurface1,
+/// Map 済みであることと、戻り値の `DecodedFrame` が生存している間
+/// サーフェスデータが有効であることの保証は呼び出し元の責任。
+fn read_decoded_surface<'a, T>(
+    frame_surface: &'a FrameSurface,
     user_data: T,
 ) -> Result<DecodedFrame<'a, T>, Error> {
-    let surface = unsafe { &*out_surface };
+    let surface = unsafe { &*frame_surface.as_ptr() };
     let (crop_w, crop_h) = unsafe {
         let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
         (fi.CropW as usize, fi.CropH as usize)
@@ -720,51 +671,4 @@ unsafe fn read_decoded_surface_inner<'a, T>(
         height: crop_h,
         user_data,
     })
-}
-
-/// デコード済みサーフェスを読み取る安全性ラッパー
-///
-/// `DecodedFrame` のライフタイムを `DecodedSurfaceGuard` に束縛し、
-/// callback 呼び出し中のみデータ参照が有効になるようにする。
-fn read_decoded_surface<'a, T>(
-    surface_guard: &'a DecodedSurfaceGuard,
-    user_data: T,
-) -> Result<DecodedFrame<'a, T>, Error> {
-    unsafe { read_decoded_surface_inner(surface_guard.surface(), user_data) }
-}
-
-/// セッションの解放ガード
-///
-/// エラー時に `MFXClose` / `MFXUnload` を呼ぶ。
-/// `cancel()` でガードを無効化し、正常系ではリソースを `Decoder` に移管する。
-struct CloseGuard {
-    lib: VplLibrary,
-    loader: sys::mfxLoader,
-    session: sys::mfxSession,
-    active: bool,
-}
-
-impl CloseGuard {
-    fn session(lib: VplLibrary, loader: sys::mfxLoader, session: sys::mfxSession) -> Self {
-        Self {
-            lib,
-            loader,
-            session,
-            active: true,
-        }
-    }
-
-    fn cancel(mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for CloseGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let _ = self.lib.mfx_close(self.session);
-        self.lib.mfx_unload(self.loader);
-    }
 }

@@ -36,6 +36,13 @@
   - DEVICE_BUSY 最大リトライ回数を 10 → 30 に変更
   - ドレイン時の空ビットストリームをエラーではなく空データとして正常処理するよう修正
   - @melpon
+- [UPDATE] Guard 系の実装をやめてリソースに対するライフタイムで管理する
+  - `VplLibrary` / `frame_type` / `gop_opt_flag` を `src/vpl.rs` に移動する
+  - `SurfaceGuard` / `DecodedSurfaceGuard` を `FrameSurface` に統合する
+  - `Session` 型を新設し、Encoder/Decoder の lib/loader/session フィールドを統合する
+  - `CloseGuard` を廃止し、`Session` の Drop による RAII 解放に移行する
+  - @melpon
+
 
 ### misc
 
