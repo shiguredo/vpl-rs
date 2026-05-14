@@ -509,7 +509,7 @@ pub struct EncodedFrame<T> {
     data: Vec<u8>,
     timestamp: u64,
     picture_type: PictureType,
-    value: T,
+    user_data: T,
 }
 
 impl<T> EncodedFrame<T> {
@@ -533,14 +533,14 @@ impl<T> EncodedFrame<T> {
         self.picture_type
     }
 
-    /// エンコード時に渡した値を取得する
-    pub fn value(&self) -> &T {
-        &self.value
+    /// エンコード時に渡したユーザーデータを取得する
+    pub fn user_data(&self) -> &T {
+        &self.user_data
     }
 
-    /// エンコード時に渡した値を取得する（所有権を移動）
-    pub fn into_value(self) -> T {
-        self.value
+    /// エンコード時に渡したユーザーデータを取得する（所有権を移動）
+    pub fn into_user_data(self) -> T {
+        self.user_data
     }
 }
 
@@ -549,7 +549,7 @@ const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 
 struct PendingFrame<T> {
     presentation_timestamp: u64,
-    value: T,
+    user_data: T,
 }
 
 // Safety: PendingFrame はスレッド間で所有権を移動するだけで、同時アクセスはしない。
@@ -1060,7 +1060,7 @@ impl<H: EncodeHandler> Encoder<H> {
     pub fn encode(
         &mut self,
         frame_data: &[u8],
-        value: H::UserData,
+        user_data: H::UserData,
         options: &EncodeOptions,
     ) -> Result<(), Error> {
         // フレームサイズを検証する
@@ -1137,7 +1137,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 frame_seq,
                 pending_frame: PendingFrame {
                     presentation_timestamp,
-                    value,
+                    user_data,
                 },
             },
         )?;
@@ -1408,7 +1408,7 @@ fn sync_and_build_frame<T>(
         data: synced.data,
         timestamp: pending.presentation_timestamp,
         picture_type: synced.picture_type,
-        value: pending.value,
+        user_data: pending.user_data,
     })
 }
 
@@ -1630,10 +1630,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn make_pending(presentation_timestamp: u64, value: u32) -> PendingFrame<u32> {
+    fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {
         PendingFrame {
             presentation_timestamp,
-            value,
+            user_data,
         }
     }
 
@@ -1647,12 +1647,12 @@ mod tests {
             .take_by_frame_seq(20)
             .expect("pending frame for frame sequence 20 should exist");
         assert_eq!(second.presentation_timestamp, 2000);
-        assert_eq!(second.value, 2);
+        assert_eq!(second.user_data, 2);
         let first = store
             .take_by_frame_seq(10)
             .expect("pending frame for frame sequence 10 should exist");
         assert_eq!(first.presentation_timestamp, 1000);
-        assert_eq!(first.value, 1);
+        assert_eq!(first.user_data, 1);
         assert_eq!(store.len(), 0);
     }
 

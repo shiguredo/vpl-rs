@@ -190,17 +190,17 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
 
     let mut seen = vec![0u32; frames.len()];
     for frame in &encoded_frames {
-        let value = *frame.value();
+        let user_data = *frame.user_data();
         assert!(
-            value < frames.len(),
-            "encoded value {value} is out of range"
+            user_data < frames.len(),
+            "encoded user_data {user_data} is out of range"
         );
-        seen[value] += 1;
+        seen[user_data] += 1;
     }
     for (index, count) in seen.iter().enumerate() {
         assert_eq!(
             *count, 1,
-            "callback value {index} was expected once but appeared {count} times"
+            "callback user_data {index} was expected once but appeared {count} times"
         );
     }
 
@@ -448,9 +448,9 @@ fn test_roundtrip_h264_force_idr() {
     assert_eq!(decoded_frames.len(), 15);
 }
 
-/// encode に渡した value が callback で回収できることを確認する
+/// encode に渡した user_data が callback で回収できることを確認する
 #[test]
-fn test_encode_value_callback() {
+fn test_encode_user_data_callback() {
     let mut config = EncoderConfig::new(
         test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
@@ -494,19 +494,19 @@ fn test_encode_value_callback() {
             .recv_timeout(Duration::from_secs(10))
             .expect("timed out waiting for encoded frame callback")
             .expect("failed to encode");
-        let value = *encoded.value();
-        assert!(value < 8, "value {value} is out of range");
-        seen[value] = true;
+        let user_data = *encoded.user_data();
+        assert!(user_data < 8, "user_data {user_data} is out of range");
+        seen[user_data] = true;
     }
 
     for (index, appeared) in seen.iter().enumerate() {
-        assert!(*appeared, "value {index} did not appear in callback");
+        assert!(*appeared, "user_data {index} did not appear in callback");
     }
 }
 
-/// decode に渡した value が callback で回収できることを確認する
+/// decode に渡した user_data が callback で回収できることを確認する
 #[test]
-fn test_decode_value_callback() {
+fn test_decode_user_data_callback() {
     let mut config = EncoderConfig::new(
         test_adapter(),
         CodecConfig::H264(H264EncoderConfig {
@@ -536,8 +536,8 @@ fn test_decode_value_callback() {
     let mut decoder = Decoder::new(
         decoder_config,
         FnDecodeHandler::new(move |result| {
-            let value = result.map(|frame| *frame.user_data());
-            tx.send(value)
+            let user_data = result.map(|frame| *frame.user_data());
+            tx.send(user_data)
                 .expect("failed to send decoded frame callback result");
         }),
     )
@@ -550,16 +550,19 @@ fn test_decode_value_callback() {
 
     let mut seen = [false; 8];
     for _ in 0..num_frames {
-        let value = rx
+        let user_data = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("timed out waiting for decoded frame callback")
             .expect("failed to decode");
-        assert!(value < num_frames, "value {value} is out of range");
-        seen[value] = true;
+        assert!(
+            user_data < num_frames,
+            "user_data {user_data} is out of range"
+        );
+        seen[user_data] = true;
     }
 
     for (index, appeared) in seen.iter().enumerate() {
-        assert!(*appeared, "value {index} did not appear in callback");
+        assert!(*appeared, "user_data {index} did not appear in callback");
     }
 }
 

@@ -138,7 +138,7 @@ unsafe impl Send for DecodeSyncData {}
 
 /// Worker スレッドへの命令
 ///
-/// - `QueueFrame`: Main スレッドから Worker へ value を転送する。
+/// - `QueueFrame`: Main スレッドから Worker へ user_data を転送する。
 /// - `Sync`: デコード済みフレームの SyncOperation。Worker 側で QueueFrame と対応付ける。
 /// - `WaitIdle`: finish() のバリア。全コマンド処理後に応答を返す。
 /// - `Stop`: Drop 時の中断。残りの pending_values を通知して Worker を停止する。
