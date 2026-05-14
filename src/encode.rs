@@ -1098,15 +1098,10 @@ impl<H: EncodeHandler> Encoder<H> {
         if status != sys::mfxStatus_MFX_ERR_NONE {
             return Err(Error::from_mfx(status, "MFXMemory_GetSurfaceForEncode"));
         }
-        let surface_guard = SurfaceGuard::new(self.lib, surface);
+        let mut surface_guard = SurfaceGuard::new(self.lib, surface);
 
         // Map して CPU から書き込めるようにする
-        let status = self
-            .lib
-            .mfx_frame_surface_map(surface_guard.surface(), sys::mfxMemoryFlags_MFX_MAP_WRITE);
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Map"));
-        }
+        surface_guard.map_write()?;
 
         // フレームデータを内部サーフェスにコピーする
         unsafe {
@@ -1120,10 +1115,7 @@ impl<H: EncodeHandler> Encoder<H> {
         }
 
         // Unmap して書き込み完了を通知する
-        let status = self.lib.mfx_frame_surface_unmap(surface_guard.surface());
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Unmap"));
-        }
+        surface_guard.unmap()?;
 
         // エンコード制御を設定する
         let mut ctrl: sys::mfxEncodeCtrl = unsafe { std::mem::zeroed() };
@@ -1278,30 +1270,60 @@ impl<H: EncodeHandler> Drop for Encoder<H> {
     }
 }
 
-/// エンコード用内部サーフェスの解放を保証するガード
+/// エンコード用内部サーフェスの `Map` / `Unmap` / `Release` を保証するガード
 ///
-/// `encode_frame_async` などのエラーパスで `mfxFrameSurfaceInterface::Release`
-/// が呼ばれないことを防ぐため、ガード構造体でラップして安全に管理する。
+/// `Drop` で `Unmap` と `Release` を自動実行する。
 struct SurfaceGuard {
     lib: VplLibrary,
     surface: *mut sys::mfxFrameSurface1,
+    mapped: bool,
 }
 
 impl SurfaceGuard {
     fn new(lib: VplLibrary, surface: *mut sys::mfxFrameSurface1) -> Self {
-        Self { lib, surface }
+        Self {
+            lib,
+            surface,
+            mapped: false,
+        }
     }
 
     fn surface(&self) -> *mut sys::mfxFrameSurface1 {
         self.surface
     }
+
+    fn map_write(&mut self) -> Result<(), Error> {
+        let status = self
+            .lib
+            .mfx_frame_surface_map(self.surface, sys::mfxMemoryFlags_MFX_MAP_WRITE);
+        Error::check_mfx(status, "mfxFrameSurfaceInterface::Map")?;
+        self.mapped = true;
+        Ok(())
+    }
+
+    fn unmap(&mut self) -> Result<(), Error> {
+        let status = self.lib.mfx_frame_surface_unmap(self.surface);
+        Error::check_mfx(status, "mfxFrameSurfaceInterface::Unmap")?;
+        self.mapped = false;
+        Ok(())
+    }
 }
 
 impl Drop for SurfaceGuard {
     fn drop(&mut self) {
-        if !self.surface.is_null() {
-            let _ = self.lib.mfx_frame_surface_release(self.surface);
+        if self.surface.is_null() {
+            return;
         }
+        if self.mapped {
+            let _ = Error::check_mfx(
+                self.lib.mfx_frame_surface_unmap(self.surface),
+                "mfxFrameSurfaceInterface::Unmap",
+            );
+        }
+        let _ = Error::check_mfx(
+            self.lib.mfx_frame_surface_release(self.surface),
+            "mfxFrameSurfaceInterface::Release",
+        );
     }
 }
 
