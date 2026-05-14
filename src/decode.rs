@@ -78,7 +78,7 @@ pub struct DecodedFrame<'a, T> {
     pitch: usize,
     width: usize,
     height: usize,
-    value: T,
+    user_data: T,
 }
 
 impl<'a, T> DecodedFrame<'a, T> {
@@ -114,13 +114,13 @@ impl<'a, T> DecodedFrame<'a, T> {
     }
 
     /// デコード時に渡した値を取得する
-    pub fn value(&self) -> &T {
-        &self.value
+    pub fn user_data(&self) -> &T {
+        &self.user_data
     }
 
     /// デコード時に渡した値を取得する（所有権を移動）
-    pub fn into_value(self) -> T {
-        self.value
+    pub fn into_user_data(self) -> T {
+        self.user_data
     }
 }
 
@@ -136,32 +136,15 @@ struct DecodeSyncData {
 // Safety: DecodeSyncData はスレッド間で所有権を移動するだけで、同時アクセスはしない。
 unsafe impl Send for DecodeSyncData {}
 
-/// デコード予約情報
-///
-/// `decode()` で渡された value を保持し、Worker がコールバックを呼ぶ際に
-/// `DecodedFrame` に含めて返す。
-struct PendingDecode<T> {
-    value: T,
-}
-
-// Safety: PendingDecode はスレッド間で所有権を移動するだけで、同時アクセスはしない。
-unsafe impl<T: Send> Send for PendingDecode<T> {}
-
 /// Worker スレッドへの命令
 ///
-/// - `DecodeFrame`: 通常のデコードフレーム。value を含み、コールバックで通知する。
-/// - `DrainFrame`: ドレインで排出されたフレーム、または value 枯渇時のフレーム。
-///   Sync + Map + Unmap + Release のみ行い、コールバックは呼ばない。
+/// - `QueueFrame`: Main スレッドから Worker へ value を転送する。
+/// - `Sync`: デコード済みフレームの SyncOperation。Worker 側で QueueFrame と対応付ける。
 /// - `WaitIdle`: finish() のバリア。全コマンド処理後に応答を返す。
-/// - `Stop`: Drop 時の中断。Worker を停止する。
+/// - `Stop`: Drop 時の中断。残りの pending_values を通知して Worker を停止する。
 enum WorkerCommand<T> {
-    DecodeFrame {
-        sync_data: DecodeSyncData,
-        pending: PendingDecode<T>,
-    },
-    DrainFrame {
-        sync_data: DecodeSyncData,
-    },
+    QueueFrame(T),
+    Sync { sync_data: DecodeSyncData },
     WaitIdle(mpsc::Sender<Result<(), Error>>),
     Stop,
 }
@@ -183,7 +166,7 @@ pub trait DecodeHandler: Send + 'static {
 
 /// `FnMut(Result<DecodedFrame<T>, E>)` を [`DecodeHandler`] にするラッパー
 pub struct FnDecodeHandler<T, E = crate::Error> {
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     f: Box<dyn for<'a> FnMut(Result<DecodedFrame<'a, T>, E>) + Send + 'static>,
 }
 
@@ -243,12 +226,6 @@ pub struct Decoder<H: DecodeHandler> {
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     /// Worker スレッドの join ハンドル
     worker_handle: Option<thread::JoinHandle<()>>,
-    /// decode() で渡された value の FIFO キュー
-    ///
-    /// VPL は内部バッファにビットストリームを蓄積するため、
-    /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない。
-    /// このキューにより value と出力フレームの対応を管理する。
-    pending_values: VecDeque<H::UserData>,
 }
 
 // Safety: デコード完了通知は専用スレッドで行い、メインスレッドは DecodeFrameAsync のみ実行する。
@@ -297,7 +274,6 @@ impl<H: DecodeHandler> Decoder<H> {
             initialized: false,
             worker_tx,
             worker_handle: Some(worker_handle),
-            pending_values: VecDeque::new(),
         })
     }
 
@@ -342,11 +318,11 @@ impl<H: DecodeHandler> Decoder<H> {
     /// 最初の呼び出し時にヘッダ解析とデコーダ初期化を自動的に行う。
     /// デコード完了時にはコンストラクタで登録したコールバックが呼ばれる。
     ///
-    /// `value` は対応するフレームがデコードされたときに [`DecodedFrame::value`] で取得できる。
+    /// `user_data` は対応するフレームがデコードされたときに [`DecodedFrame::user_data`] で取得できる。
     /// VPL は内部バッファにビットストリームを蓄積するため、
     /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない場合がある。
-    /// value は `pending_values` キューで管理され、FIFO で出力フレームに割り当てられる。
-    pub fn decode(&mut self, data: &[u8], value: H::UserData) -> Result<(), Error> {
+    /// user_data は Worker スレッド内で FIFO キューにより管理される。
+    pub fn decode(&mut self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
         let data_len = u32::try_from(data.len()).map_err(|_| {
             Error::new_custom_owned(
@@ -359,22 +335,16 @@ impl<H: DecodeHandler> Decoder<H> {
         bs.DataLength = data_len;
         bs.MaxLength = data_len;
 
-        // 未初期化の場合は初期化する。value は初期化成功後に push する。
-        // これにより初期化エラー時に value が pending_values に残留するのを防ぐ。
+        // 未初期化の場合は初期化する。初期化エラー時に QueueFrame を送信しない。
         if !self.initialized {
             self.initialize(&mut bs)?;
         }
 
-        self.pending_values.push_back(value);
+        // QueueFrame を送信してからデコードを開始する。
+        // これにより Worker 内で user_data と出力フレームが FIFO 対応付けられる。
+        self.send_worker_command("Decoder::decode", WorkerCommand::QueueFrame(user_data))?;
 
-        match self.decode_bitstream(&mut bs) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // エラー時は残留 value をすべて破棄して状態をリセットする
-                self.pending_values.clear();
-                Err(e)
-            }
-        }
+        self.decode_bitstream(&mut bs)
     }
 
     /// ビットストリームをデコードしてフレームを収集する
@@ -383,8 +353,8 @@ impl<H: DecodeHandler> Decoder<H> {
     /// VPL は `MORE_DATA` 時にビットストリームを内部バッファに蓄積し、
     /// 十分なデータが溜まった時点でフレームを出力する。
     ///
-    /// 出力フレームには `pending_values` から値を取り出して割り当てる。
-    /// 値が枯渇した場合は `DrainFrame` として処理する（コールバックなし）。
+    /// 出力フレームはすべて Worker に送信され、Worker 内の FIFO キューで
+    /// user_data と対応付けられる。user_data が枯渇した場合は drain 扱いで破棄する。
     fn decode_bitstream(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
         while bs.DataLength > 0 {
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
@@ -419,25 +389,12 @@ impl<H: DecodeHandler> Decoder<H> {
             // MFX_ERR_NONE または MFX_WRN_*（DEVICE_BUSY 以外）。
             // syncp が非 null ならデコード済みフレームが存在する
             if !syncp.is_null() {
-                if let Some(pending_value) = self.pending_values.pop_front() {
-                    self.send_worker_command(
-                        "Decoder::decode",
-                        WorkerCommand::DecodeFrame {
-                            sync_data: DecodeSyncData { syncp, out_surface },
-                            pending: PendingDecode {
-                                value: pending_value,
-                            },
-                        },
-                    )?;
-                } else {
-                    // pending_values が枯渇しているので drain 扱いで破棄する
-                    self.send_worker_command(
-                        "Decoder::decode",
-                        WorkerCommand::DrainFrame {
-                            sync_data: DecodeSyncData { syncp, out_surface },
-                        },
-                    )?;
-                }
+                self.send_worker_command(
+                    "Decoder::decode",
+                    WorkerCommand::Sync {
+                        sync_data: DecodeSyncData { syncp, out_surface },
+                    },
+                )?;
             }
         }
         Ok(())
@@ -446,8 +403,8 @@ impl<H: DecodeHandler> Decoder<H> {
     /// これ以上データが来ないことをデコーダに伝え、残留フレームを排出する
     ///
     /// null bitstream で `DecodeFrameAsync` を `MORE_DATA` が返るまで繰り返す。
-    /// ドレイン時に `pending_values` に値が残っていれば `DecodeFrame`（コールバックあり）、
-    /// 枯渇していれば `DrainFrame`（コールバックなし）で処理する。
+    /// 出力フレームはすべて Worker に送信され、Worker 内の FIFO キューで
+    /// user_data と対応付けられる。
     ///
     /// この関数は全ての Worker コマンドの完了を待ち、
     /// コールバックが呼び出され終わるまでブロックする。
@@ -483,26 +440,12 @@ impl<H: DecodeHandler> Decoder<H> {
             }
 
             if !syncp.is_null() {
-                // 残留 value があればコールバック付きで送信する。
-                // これにより pending_values の全エントリが消費される。
-                if let Some(pending_value) = self.pending_values.pop_front() {
-                    self.send_worker_command(
-                        "Decoder::finish",
-                        WorkerCommand::DecodeFrame {
-                            sync_data: DecodeSyncData { syncp, out_surface },
-                            pending: PendingDecode {
-                                value: pending_value,
-                            },
-                        },
-                    )?;
-                } else {
-                    self.send_worker_command(
-                        "Decoder::finish",
-                        WorkerCommand::DrainFrame {
-                            sync_data: DecodeSyncData { syncp, out_surface },
-                        },
-                    )?;
-                }
+                self.send_worker_command(
+                    "Decoder::finish",
+                    WorkerCommand::Sync {
+                        sync_data: DecodeSyncData { syncp, out_surface },
+                    },
+                )?;
             }
         }
 
@@ -530,8 +473,7 @@ impl<H: DecodeHandler> Decoder<H> {
 impl<H: DecodeHandler> Decoder<H> {
     fn stop_worker(&mut self) {
         if let Some(handle) = self.worker_handle.take() {
-            // Stop を送って join した時点で worker は確実に終了するため、
-            // 以降に worker へデータが届くケースは考慮しない。
+            // Worker 内の pending_values は Stop ハンドラで処理される。
             let _ = self.worker_tx.send(WorkerCommand::Stop);
             let _ = handle.join();
         }
@@ -554,25 +496,33 @@ impl<H: DecodeHandler> Drop for Decoder<H> {
 /// mpsc チャネルからコマンドを受信し、VPL API を呼び出す。
 /// セッション操作は全てこのスレッドで行うため、VPL のスレッド安全性に関する
 /// 暗黙の制約に抵触しない。
+///
+/// `pending_values` は Main スレッドからの `QueueFrame` で蓄積され、
+/// `Sync` で消費される FIFO キュー。
 fn run_sync_worker<H: DecodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
     mut handler: H,
 ) {
+    let mut pending_values: VecDeque<H::UserData> = VecDeque::new();
     while let Ok(command) = worker_rx.recv() {
         match command {
-            WorkerCommand::DecodeFrame { sync_data, pending } => {
-                // SyncOperation + Map + 読み取り + callback + Unmap + Release
-                if let Err(error) =
-                    sync_and_callback(lib, session_handle, sync_data, pending, &mut handler)
-                {
-                    handler.on_decoded(Err(error.into()));
-                }
+            WorkerCommand::QueueFrame(user_data) => {
+                pending_values.push_back(user_data);
             }
-            WorkerCommand::DrainFrame { sync_data } => {
-                // SyncOperation + Map + Unmap + Release のみ。コールバックなし
-                sync_and_drain(lib, session_handle, sync_data);
+            WorkerCommand::Sync { sync_data } => {
+                if let Some(user_data) = pending_values.pop_front() {
+                    // SyncOperation + Map + 読み取り + callback + Unmap + Release
+                    if let Err(error) =
+                        sync_and_callback(lib, session_handle, sync_data, user_data, &mut handler)
+                    {
+                        handler.on_decoded(Err(error.into()));
+                    }
+                } else {
+                    // user_data が枯渇しているので drain 扱いで破棄する
+                    sync_and_drain(lib, session_handle, sync_data);
+                }
             }
             WorkerCommand::WaitIdle(reply_tx) => {
                 // finish 側のバリア。ここに到達した時点で、それ以前に送信された
@@ -580,7 +530,14 @@ fn run_sync_worker<H: DecodeHandler>(
                 let _ = reply_tx.send(Ok(()));
             }
             WorkerCommand::Stop => {
-                // drop 時の中断。未完了処理は破棄する。
+                // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
+                for _user_data in pending_values.drain(..) {
+                    handler.on_decoded(Err(Error::from_mfx(
+                        sys::mfxStatus_MFX_ERR_ABORTED,
+                        "Decoder::drop",
+                    )
+                    .into()));
+                }
                 break;
             }
         }
@@ -645,7 +602,7 @@ fn sync_and_callback<H: DecodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
     sync_data: DecodeSyncData,
-    pending: PendingDecode<H::UserData>,
+    user_data: H::UserData,
     handler: &mut H,
 ) -> Result<(), crate::Error> {
     let DecodeSyncData { syncp, out_surface } = sync_data;
@@ -676,14 +633,14 @@ fn sync_and_callback<H: DecodeHandler>(
     surface_guard.map_read()?;
 
     // デコードされたフレームデータを読み取る
-    let frame = read_decoded_surface(&surface_guard, pending)?;
+    let frame = read_decoded_surface(&surface_guard, user_data)?;
     handler.on_decoded(Ok(frame));
     Ok(())
 }
 
 /// ドレインフレームの Sync + Map/Unmap + Release を行う
 ///
-/// ドレインフレームには value がないため、データは読み取らずに解放のみ行う。
+/// ドレインフレームには user_data がないため、データは読み取らずに解放のみ行う。
 /// エラーはすべて無視する（データ破棄が目的のため）。
 fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncData) {
     let DecodeSyncData { syncp, out_surface } = sync_data;
@@ -711,7 +668,7 @@ fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncD
 /// 戻り値の `DecodedFrame` が生存している間、`out_surface` のデータは有効でなければならない。
 unsafe fn read_decoded_surface_inner<'a, T>(
     out_surface: *mut sys::mfxFrameSurface1,
-    pending: PendingDecode<T>,
+    user_data: T,
 ) -> Result<DecodedFrame<'a, T>, Error> {
     let surface = unsafe { &*out_surface };
     let (crop_w, crop_h) = unsafe {
@@ -761,7 +718,7 @@ unsafe fn read_decoded_surface_inner<'a, T>(
         pitch,
         width: crop_w,
         height: crop_h,
-        value: pending.value,
+        user_data,
     })
 }
 
@@ -771,9 +728,9 @@ unsafe fn read_decoded_surface_inner<'a, T>(
 /// callback 呼び出し中のみデータ参照が有効になるようにする。
 fn read_decoded_surface<'a, T>(
     surface_guard: &'a DecodedSurfaceGuard,
-    pending: PendingDecode<T>,
+    user_data: T,
 ) -> Result<DecodedFrame<'a, T>, Error> {
-    unsafe { read_decoded_surface_inner(surface_guard.surface(), pending) }
+    unsafe { read_decoded_surface_inner(surface_guard.surface(), user_data) }
 }
 
 /// セッションの解放ガード

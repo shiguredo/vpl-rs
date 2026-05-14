@@ -404,7 +404,7 @@ impl EncoderConfig {
     /// 必須パラメータのみ指定して EncoderConfig を作成する
     ///
     /// オプションパラメータはすべて None (エンコーダのデフォルト) に設定される。
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         adapter: AdapterSelector,
         codec: CodecConfig,
@@ -1138,10 +1138,6 @@ impl<H: EncodeHandler> Encoder<H> {
         let syncp =
             self.encode_frame_async(ctrl_ptr, surface_guard.surface(), bitstream.as_mut())?;
 
-        // エンコードを投げたら内部サーフェスの参照を解除する
-        // （エンコーダ内部でまだ使用中でも安全に保持される）
-        surface_guard.release()?;
-
         // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
         self.send_worker_command(
             "Encoder::encode",
@@ -1298,16 +1294,6 @@ impl SurfaceGuard {
 
     fn surface(&self) -> *mut sys::mfxFrameSurface1 {
         self.surface
-    }
-
-    /// サーフェスの参照を明示的に解除する
-    fn release(mut self) -> Result<(), Error> {
-        let status = self.lib.mfx_frame_surface_release(self.surface);
-        self.surface = std::ptr::null_mut();
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            return Err(Error::from_mfx(status, "mfxFrameSurfaceInterface::Release"));
-        }
-        Ok(())
     }
 }
 

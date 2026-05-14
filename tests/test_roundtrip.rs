@@ -26,13 +26,11 @@ fn test_adapter() -> AdapterSelector {
 }
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
-#[allow(dead_code)]
 struct DecodedFrameInfo {
     y_data: Vec<u8>,
     pitch: usize,
     width: usize,
     height: usize,
-    value: usize,
 }
 
 /// ダミー NV12 フレームを生成する
@@ -224,7 +222,6 @@ fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFra
                     pitch: frame.pitch(),
                     width: frame.width(),
                     height: frame.height(),
-                    value: *frame.value(),
                 }
             });
             tx.send(info)
@@ -539,7 +536,7 @@ fn test_decode_value_callback() {
     let mut decoder = Decoder::new(
         decoder_config,
         FnDecodeHandler::new(move |result| {
-            let value = result.map(|frame| *frame.value());
+            let value = result.map(|frame| *frame.user_data());
             tx.send(value)
                 .expect("failed to send decoded frame callback result");
         }),
