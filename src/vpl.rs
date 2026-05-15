@@ -284,11 +284,10 @@ impl VplLibrary {
             if iface.is_null() {
                 return sys::mfxStatus_MFX_ERR_NULL_PTR;
             }
-            let map_fn = (*iface).Map;
-            if map_fn.is_none() {
+            let Some(map_fn) = (*iface).Map else {
                 return sys::mfxStatus_MFX_ERR_NULL_PTR;
-            }
-            map_fn.unwrap()(surface, flags)
+            };
+            map_fn(surface, flags)
         }
     }
 
@@ -299,11 +298,10 @@ impl VplLibrary {
             if iface.is_null() {
                 return sys::mfxStatus_MFX_ERR_NULL_PTR;
             }
-            let unmap_fn = (*iface).Unmap;
-            if unmap_fn.is_none() {
+            let Some(unmap_fn) = (*iface).Unmap else {
                 return sys::mfxStatus_MFX_ERR_NULL_PTR;
-            }
-            unmap_fn.unwrap()(surface)
+            };
+            unmap_fn(surface)
         }
     }
 
@@ -314,11 +312,10 @@ impl VplLibrary {
             if iface.is_null() {
                 return sys::mfxStatus_MFX_ERR_NULL_PTR;
             }
-            let release_fn = (*iface).Release;
-            if release_fn.is_none() {
+            let Some(release_fn) = (*iface).Release else {
                 return sys::mfxStatus_MFX_ERR_NULL_PTR;
-            }
-            release_fn.unwrap()(surface)
+            };
+            release_fn(surface)
         }
     }
 }
@@ -355,33 +352,22 @@ impl FrameSurface {
     ///
     /// 既にマップ済みの場合は `Error` を返す。
     pub fn map_write(&mut self) -> Result<(), Error> {
-        if self.mapped {
-            return Err(Error::new_custom(
-                "FrameSurface::map_write",
-                "surface is already mapped",
-            ));
-        }
-        let status = self
-            .lib
-            .mfx_frame_surface_map(self.as_ptr(), sys::mfxMemoryFlags_MFX_MAP_WRITE);
-        Error::check_mfx(status, "mfxFrameSurfaceInterface::Map")?;
-        self.mapped = true;
-        Ok(())
+        self.map_inner("FrameSurface::map_write", sys::mfxMemoryFlags_MFX_MAP_WRITE)
     }
 
     /// サーフェスを読み取りモードでマップする
     ///
     /// 既にマップ済みの場合は `Error` を返す。
     pub fn map_read(&mut self) -> Result<(), Error> {
+        self.map_inner("FrameSurface::map_read", sys::mfxMemoryFlags_MFX_MAP_READ)
+    }
+
+    /// サーフェスを指定フラグでマップする内部ヘルパー
+    fn map_inner(&mut self, function: &'static str, flags: u32) -> Result<(), Error> {
         if self.mapped {
-            return Err(Error::new_custom(
-                "FrameSurface::map_read",
-                "surface is already mapped",
-            ));
+            return Err(Error::new_custom(function, "surface is already mapped"));
         }
-        let status = self
-            .lib
-            .mfx_frame_surface_map(self.as_ptr(), sys::mfxMemoryFlags_MFX_MAP_READ);
+        let status = self.lib.mfx_frame_surface_map(self.as_ptr(), flags);
         Error::check_mfx(status, "mfxFrameSurfaceInterface::Map")?;
         self.mapped = true;
         Ok(())

@@ -132,7 +132,7 @@ for _ in 0..2 {
     println!("encoded bytes: {}", encoded.data().len());
     println!("timestamp: {}", encoded.timestamp());
     println!("picture type: {:?}", encoded.picture_type());
-    println!("value: {}", encoded.value());
+    println!("user_data: {:?}", encoded.user_data());
 }
 ```
 
@@ -164,8 +164,8 @@ decoder.finish()?;
 // コールバック経由でデコード結果を受け取る
 while let Ok(result) = rx.try_recv() {
     let frame = result?;
-    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, value: {}",
-        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.value());
+    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, user_data: {:?}",
+        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.user_data());
 }
 ```
 

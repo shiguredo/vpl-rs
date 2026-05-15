@@ -435,22 +435,19 @@ impl<H: DecodeHandler> Decoder<H> {
             if status < 0 {
                 return Err(Error::from_mfx(status, "MFXVideoDECODE_DecodeFrameAsync"));
             }
-
-            if !syncp.is_null() {
-                let frame_surface = match FrameSurface::new(self.session.lib(), out_surface) {
-                    Ok(fs) => fs,
-                    Err(_) => continue,
-                };
-                self.send_worker_command(
-                    "Decoder::finish",
-                    WorkerCommand::Sync {
-                        sync_data: DecodeSyncData {
-                            syncp,
-                            frame_surface,
-                        },
-                    },
-                )?;
+            let frame_surface = FrameSurface::new(self.session.lib(), out_surface)?;
+            if syncp.is_null() {
+                continue;
             }
+            self.send_worker_command(
+                "Decoder::finish",
+                WorkerCommand::Sync {
+                    sync_data: DecodeSyncData {
+                        syncp,
+                        frame_surface,
+                    },
+                },
+            )?;
         }
 
         // ここまでに送ったコマンドが Worker 側で全て処理されるまで待つ
