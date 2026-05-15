@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use shiguredo_vpl::{
-    AdapterSelector, CodecConfig, Decoder, DecoderCodec, DecoderConfig, Encoder, EncoderConfig,
-    Error, FrameFormat, H264EncoderConfig, RateControlMode, list_adapters, supported_codecs,
+    AdapterSelector, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodedFrame, Encoder,
+    EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat, H264EncoderConfig,
+    RateControlMode, list_adapters, supported_codecs,
 };
 
 /// `Encoder` / `Decoder` は `Debug` を実装しないため、`expect_err` の代わりにこのヘルパーで
@@ -59,7 +60,13 @@ fn test_encoder_rejects_render_node_zero() {
         1,
         RateControlMode::Cqp,
     );
-    let err = into_err(Encoder::new(config), "Encoder::new が成功してはいけない");
+    let err = into_err(
+        Encoder::new(
+            config,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+        ),
+        "Encoder::new が成功してはいけない",
+    );
     assert_eq!(err.function(), "AdapterSelector::validate");
 }
 
@@ -67,7 +74,13 @@ fn test_encoder_rejects_render_node_zero() {
 #[test]
 fn test_decoder_rejects_render_node_zero() {
     let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(0), DecoderCodec::H264);
-    let err = into_err(Decoder::new(config), "Decoder::new が成功してはいけない");
+    let err = into_err(
+        Decoder::new(
+            config,
+            FnDecodeHandler::new(|_: Result<shiguredo_vpl::DecodedFrame<()>, Error>| {}),
+        ),
+        "Decoder::new が成功してはいけない",
+    );
     assert_eq!(err.function(), "AdapterSelector::validate");
 }
 
@@ -93,7 +106,13 @@ fn test_encoder_not_found_for_invalid_render_node() {
         1,
         RateControlMode::Cqp,
     );
-    let err = into_err(Encoder::new(config), "Encoder::new が成功してはいけない");
+    let err = into_err(
+        Encoder::new(
+            config,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+        ),
+        "Encoder::new が成功してはいけない",
+    );
     assert_eq!(
         err.status_name(),
         Some("MFX_ERR_NOT_FOUND"),
@@ -139,14 +158,20 @@ fn test_real_adapter_session() {
         1,
         RateControlMode::Cqp,
     );
-    let _encoder = match Encoder::new(encoder_config) {
+    let _encoder = match Encoder::new(
+        encoder_config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    ) {
         Ok(e) => e,
         Err(err) => panic!("Encoder::new に失敗 ({err}) for render node {node}: {listing}"),
     };
 
     // Decoder を作って即破棄する
     let decoder_config = DecoderConfig::new(adapter, DecoderCodec::H264);
-    let _decoder = match Decoder::new(decoder_config) {
+    let _decoder = match Decoder::new(
+        decoder_config,
+        FnDecodeHandler::new(|_: Result<shiguredo_vpl::DecodedFrame<()>, Error>| {}),
+    ) {
         Ok(d) => d,
         Err(err) => panic!("Decoder::new に失敗 ({err}) for render node {node}: {listing}"),
     };

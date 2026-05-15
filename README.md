@@ -85,9 +85,11 @@ let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
-    H264EncoderConfig, H264Profile, RateControlMode, frame_type, list_adapters,
+    AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
+    Error, FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile,
+    RateControlMode, frame_type, list_adapters,
 };
+use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
@@ -104,7 +106,10 @@ let mut config = EncoderConfig::new(
 );
 config.target_kbps = Some(5_000);
 
-let mut encoder = Encoder::new(config)?;
+let (tx, rx) = mpsc::channel();
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |result| {
+    tx.send(result).expect("failed to send callback result");
+}))?;
 
 // フレームデータをエンコード
 let (coded_width, coded_height) = encoder.coded_size();
@@ -113,48 +118,54 @@ let frame_size = FrameFormat::Nv12
     .ok_or("frame size overflowed")?;
 let frame_data = vec![0u8; frame_size];
 let options = EncodeOptions { frame_type: frame_type::UNKNOWN };
-encoder.encode(&frame_data, &options)?;
+encoder.encode(&frame_data, "normal", &options)?;
 
 // IDR フレームを強制してエンコード
-encoder.encode(&frame_data, &EncodeOptions {
+encoder.encode(&frame_data, "force-idr", &EncodeOptions {
     frame_type: frame_type::IDR | frame_type::I | frame_type::REF,
 })?;
 
-// エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame() {
+// 残りのフレームをすべて取得する
+encoder.finish()?;
+for _ in 0..2 {
+    let encoded = rx.recv().expect("failed to receive callback result")?;
     println!("encoded bytes: {}", encoded.data().len());
     println!("timestamp: {}", encoded.timestamp());
     println!("picture type: {:?}", encoded.picture_type());
-}
-
-// 残りのフレームをすべて取得する
-encoder.finish()?;
-while let Some(encoded) = encoder.next_frame() {
-    println!("flushed: {} bytes", encoded.data().len());
+    println!("user_data: {:?}", encoded.user_data());
 }
 ```
 
 ### デコード
 
 ```rust
-use shiguredo_vpl::{AdapterSelector, Decoder, DecoderCodec, DecoderConfig, list_adapters};
+use shiguredo_vpl::{
+    AdapterSelector, Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler,
+    list_adapters,
+};
+use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let config = DecoderConfig::new(adapter, DecoderCodec::H264);
-let mut decoder = Decoder::new(config)?;
 
-// ビットストリームデータをデコード
-decoder.decode(&bitstream_data)?;
+let (tx, rx) = mpsc::channel();
+let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
+    tx.send(result).expect("failed to send callback result");
+}))?;
 
-// デコード済みフレームを取得 (NV12 フォーマット)
-while let Some(frame) = decoder.next_frame() {
-    println!("decoded: {}x{}, {} bytes", frame.width(), frame.height(), frame.data().len());
-}
+// ビットストリームデータをデコード (value で任意のユーザーデータを紐付け可能)
+let bitstream_data = vec![0u8; 1024];
+decoder.decode(&bitstream_data, "frame-0")?;
+decoder.decode(&bitstream_data, "frame-1")?;
 
 // 残りのフレームをすべて取得する
 decoder.finish()?;
-while let Some(frame) = decoder.next_frame() {
-    println!("flushed: {}x{}", frame.width(), frame.height());
+
+// コールバック経由でデコード結果を受け取る
+while let Ok(result) = rx.try_recv() {
+    let frame = result?;
+    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, user_data: {:?}",
+        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.user_data());
 }
 ```
 
