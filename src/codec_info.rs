@@ -1,7 +1,7 @@
 //! コーデック情報の照会
 
 #[cfg(target_os = "linux")]
-use crate::{AdapterSelector, Error, VplLibrary, sys};
+use crate::{AdapterSelector, Error, sys};
 
 /// コーデック種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,8 +148,6 @@ pub fn supported_codecs(adapter: AdapterSelector) -> Result<Vec<CodecInfo>, Erro
     adapter.validate()?;
     let AdapterSelector::DrmRenderNode(render_node) = adapter;
 
-    let lib = VplLibrary::load()?;
-
     // ローダーを作成する
     let loader = unsafe { sys::MFXLoad() };
     if loader.is_null() {
@@ -225,7 +223,6 @@ pub fn supported_codecs(adapter: AdapterSelector) -> Result<Vec<CodecInfo>, Erro
         sys::MFXDispReleaseImplDescription(loader, hdl);
         sys::MFXUnload(loader);
     }
-    let _ = lib;
 
     Ok(result)
 }
