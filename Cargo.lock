@@ -234,7 +234,7 @@ checksum = "b475c218cf15d056ed3e48c9e98693135b261b79530881e63b162650b236fdec"
 
 [[package]]
 name = "shiguredo_vpl"
-version = "2026.2.0"
+version = "2026.3.0-canary.0"
 dependencies = [
  "bindgen",
  "shiguredo_cmake",
