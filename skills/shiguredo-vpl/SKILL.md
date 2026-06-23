@@ -1,11 +1,11 @@
 ---
 name: shiguredo-vpl
-description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.16 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder::encode / next_frame / finish のフレーム駆動 API、Decoder のヘッダ自動検出、frame_type / gop_opt_flag のビットフラグ、coded_size と frame_size の関係、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
+description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.16 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、coded_size と frame_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
 ---
 
 # shiguredo_vpl クレート
 
-- **バージョン**: 2026.1.2 (依存する libvpl は 2.16.0)
+- **バージョン**: 2026.3.0 (依存する libvpl は 2.16.0)
 - **リポジトリ**: https://github.com/shiguredo/vpl-rs
 - **Rust エディション**: 2024 (rust-version: 1.88)
 - **ライセンス**: Apache-2.0
@@ -20,7 +20,8 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 - 性能より堅牢性を優先する。 速い実装より「VPL のセマンティクスに正確な」実装を選ぶ。
 - 良い設計のためには破壊的変更を積極的に行う。 互換のためのレガシー API を残さない。
 - 依存は最小限。 現状 `[dependencies]` は空で、`build-dependencies` に `bindgen` / `shiguredo_cmake` / `shiguredo_toml` のみ。
-- VPL ヘッダの構造体・関数を呼ぶ部分は `src/sys.rs` (= bindgen 出力) と `VplLibrary` ラッパーに閉じ込める。 利用者が直接触るのは安全な高レベル API のみ。
+- VPL ヘッダの構造体・関数を呼ぶ部分は `src/sys.rs` (= bindgen 出力) と `src/vpl.rs` の `VplLibrary` / `Session` / `FrameSurface` に閉じ込める。 利用者が直接触るのは安全な高レベル API のみ。
+- リソース管理はライフタイムベース。 `Session` の Drop で `MFXClose` + `MFXUnload` が、`FrameSurface` の Drop で `Unmap` + `Release` が必ず実行される。 利用者が手動解放する API は存在しない。
 
 ## 公開モジュール構成
 
@@ -28,12 +29,14 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
 - `codec_info` — `VideoCodecType` / `CodecInfo` / `DecodingInfo` / `EncodingInfo` / 各コーデックプロファイル一覧型
-- `decode` — `Decoder` / `DecoderConfig` / `DecoderCodec` / `DecodedFrame`
-- `encode` — `Encoder` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame` / `EncoderStats` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / 各プロファイル enum
+- `decode` — `Decoder<H>` / `DecoderConfig` / `DecoderCodec` / `DecodedFrame<'_, T>` / `DecodeHandler` / `FnDecodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>` / 各プロファイル enum
 - `error` — `Error`
-- `frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
-- `gop_opt_flag` (定数モジュール) — `CLOSED` / `STRICT`
+- `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
+- `vpl::gop_opt_flag` (定数モジュール) — `CLOSED` / `STRICT`
 - `BUILD_VERSION` — ビルド時参照した libvpl のバージョン文字列
+
+`vpl` モジュール自体は非公開で、`frame_type` / `gop_opt_flag` のみが `pub use vpl::{frame_type, gop_opt_flag};` で `shiguredo_vpl::frame_type` / `shiguredo_vpl::gop_opt_flag` として参照できる。
 
 テスト用に `ffi` モジュールが `#[doc(hidden)]` で公開されているが、利用側コードからは呼ばない。
 
@@ -82,15 +85,19 @@ libvpl 側の関連実装:
 
 エンコーダ・デコーダはどちらもこの関数を内部で呼んでセッションを得てから `MFXVideoENCODE_Init` / `MFXVideoDECODE_Init` する。
 
-## エンコーダ (`Encoder`)
+## エンコーダ (`Encoder<H>`)
 
 ### 最小フロー
 
+エンコーダはハンドラー方式。 `Encoder<H: EncodeHandler>` 型パラメータでハンドラー実装を指定し、`encode()` 呼び出しごとに `H::UserData` を一緒に渡す。 出力ビットストリームはハンドラの `on_encoded` で `EncodedFrame<H::UserData>` として渡される。
+
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameFormat,
-    H264EncoderConfig, H264Profile, RateControlMode, frame_type, list_adapters,
+    AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
+    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, RateControlMode, frame_type,
+    list_adapters,
 };
+use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
@@ -105,7 +112,12 @@ let mut config = EncoderConfig::new(
 );
 config.target_kbps = Some(5_000);
 
-let mut encoder = Encoder::new(config)?;
+// ハンドラを mpsc にブリッジするのが定番。worker スレッドから呼ばれる
+let (tx, rx) = mpsc::channel();
+let handler = FnEncodeHandler::new(move |result: Result<EncodedFrame<u64>, Error>| {
+    let _ = tx.send(result);
+});
+let mut encoder = Encoder::new(config, handler)?;
 
 let (coded_width, coded_height) = encoder.coded_size();
 let frame_size = FrameFormat::Nv12
@@ -113,15 +125,16 @@ let frame_size = FrameFormat::Nv12
     .ok_or("frame size overflowed")?;
 let frame_data = vec![0u8; frame_size];
 
-encoder.encode(&frame_data, &EncodeOptions { frame_type: frame_type::UNKNOWN })?;
+// user_data に元フレーム ID やタイムスタンプを乗せると、出力 EncodedFrame と紐付く
+encoder.encode(&frame_data, /* user_data */ 0u64, &EncodeOptions { frame_type: frame_type::UNKNOWN })?;
 
-while let Some(encoded) = encoder.next_frame() {
-    let _bitstream = encoded.data();
-}
-
+// finish はバリア。 ここに到達した時点で worker は全フレーム処理済み
 encoder.finish()?;
-while let Some(encoded) = encoder.next_frame() {
-    let _flushed = encoded.data();
+
+while let Ok(result) = rx.try_recv() {
+    let encoded = result?;
+    let _frame_id: &u64 = encoded.user_data();
+    let _bitstream = encoded.data();
 }
 ```
 
@@ -134,6 +147,7 @@ while let Some(encoded) = encoder.next_frame() {
   - `CodecConfig::H264(H264EncoderConfig)` / `Hevc(...)` / `Vp9(...)` / `Av1(...)`
   - 各設定は `profile: Option<...>` を持つ。 `None` でコーデックのデフォルトプロファイル。
 - フレーム情報 (`mfxFrameInfo` 対応): `width` / `height` / `frame_format` / `framerate_num` / `framerate_den` / `aspect_ratio_w` / `aspect_ratio_h`
+- 非同期深度: `async_depth` (`mfxVideoParam.AsyncDepth`)。 `None` の場合は 4 を使用。 1 は最小メモリだが性能が低く、4 が高スループット寄りの推奨値。
 - エンコード制御 (`mfxInfoMFX` 対応): `low_power` / `brc_param_multiplier` / `target_usage` (1=最高品質, 4=バランス, 7=最高速)
 - GOP 構造: `gop_pic_size` / `gop_ref_dist` (1=Bなし, 2=1B, 3=2B) / `gop_opt_flag` (`gop_opt_flag::CLOSED | STRICT`) / `idr_interval`
 - レート制御: `rate_control_mode: RateControlMode` と、 そのモードで使われる union メンバ群
@@ -191,13 +205,33 @@ let idr = EncodeOptions {
 
 `UNKNOWN = 0` は「エンコーダが自動決定」。 IDR を強制したいときは `IDR | I | REF` の組合せで、 `I` と `REF` を落とすと VPL 側でフレームタイプを再決定されることがある。
 
-### `Encoder::encode` / `next_frame` / `finish` のセマンティクス
+### `EncodeHandler` / `FnEncodeHandler` とハンドラー駆動
 
-- `encode` 1 回 = 入力フレーム 1 枚。 エンコーダ内部の遅延 (LookAhead / B フレーム並び替え) のため、 `encode` した直後に必ずしも `next_frame` で何か取れるとは限らない。
-- `next_frame` は **取れるものを取り切る** インタフェース。 `while let Some(frame) = encoder.next_frame()` で全部排出する。
-- `finish` を呼ぶと残留フレームを全部吐き出させる EOS シグナル。 `finish` の後にもう一度 `while let Some(...) = next_frame()` で取り切る。
-- `MFX_ERR_MORE_DATA` / `MFX_WRN_DEVICE_BUSY` は内部で吸収される。 `Result` で返るのは本当に致命的なエラーのみ。
-- `EncodedFrame::data()` で `&[u8]`、 `into_data()` で `Vec<u8>` を取り出す。 `timestamp()` と `picture_type()` (`PictureType`) も取れる。
+```rust
+pub trait EncodeHandler: Send + 'static {
+    type UserData: Send + 'static;
+    type Error: From<shiguredo_vpl::Error> + Send + 'static;
+    fn on_encoded(&mut self, result: Result<EncodedFrame<Self::UserData>, Self::Error>);
+}
+```
+
+押さえておく挙動:
+
+- `Encoder::new(config, handler)` 内部で `vpl-encoder-sync` 名前付きの専用 worker スレッドが起動する。 `on_encoded` はこの worker スレッドから呼ばれる。 ハンドラ実装は `Send + 'static`。
+- `UserData` 型は呼び出し側が自由に決める。 元フレームの ID やタイムスタンプ、トレーシング ID などを乗せる。 出力 `EncodedFrame::user_data()` / `into_user_data()` で取り出す。
+- `Error` 関連型は `From<shiguredo_vpl::Error>` を実装した型なら何でも使える。 自前のエラー型に持ち上げたいケースに対応する。
+- `FnEncodeHandler<T, E = shiguredo_vpl::Error>` は `FnMut(Result<EncodedFrame<T>, E>) + Send + 'static` を `EncodeHandler` に持ち上げるラッパー。 mpsc にブリッジするなら `FnEncodeHandler::new(move |r| tx.send(r).unwrap())` が定番。
+- VPL の遅延 (LookAhead / B フレーム並び替え) のため、`encode` 1 回が即 1 回の `on_encoded` 呼び出しに対応するわけではない。 `encode` を複数回呼んでから `on_encoded` がまとめて呼ばれることもある。
+- `encode` のたびに渡した `user_data` は worker 内の `PendingFrameStore` に `frame_seq` で登録され、 出力 bitstream の `TimeStamp` と完全一致で引き当てられる (B フレーム並び替えがあっても元の入力に正しく戻る)。 1 ID が二度使われると重複エラーになる。
+- `MFX_ERR_MORE_DATA` と `MFX_WRN_DEVICE_BUSY` は内部で吸収される。 `DEVICE_BUSY` は 1ms スリープで最大 30 回までリトライ (旧 10 回から拡張)。 30 回を超えると致命的エラー。
+
+### `Encoder::encode` / `finish` のセマンティクス
+
+- `encode(&mut self, frame_data: &[u8], user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame_data` の長さは `FrameFormat::frame_size(coded_w, coded_h)` 以上が必要。 不足すると即エラー。
+- `finish(&mut self) -> Result<(), Error>` は EOS シグナル + バリア。 null surface でドレインを呼び切り、worker に `WaitIdle` を送って **すべてのハンドラ呼び出しが完了するまでブロック** する。 戻ったときには `on_encoded` がすべて呼ばれ終わっている。
+- `Encoder` を `Drop` すると worker スレッドへ `Stop` が送られ、 ペンディング中のフレームはすべて `MFX_ERR_ABORTED` のエラー結果として `on_encoded` に通知される。 失敗フレームを取りこぼさない設計。
+- `EncodedFrame<T>` から取れる情報: `data() -> &[u8]` / `into_data() -> Vec<u8>` / `timestamp() -> u64` / `picture_type() -> PictureType` / `user_data() -> &T` / `into_user_data() -> T`。
+- ドレイン時の空ビットストリーム (PictureType 未確定の null フレーム) はエラーではなく空 `data` の `EncodedFrame` として正常通知される。 利用側で空チェックして捨てる。
 
 ### 動的再構成 (`reconfigure`)
 
@@ -221,33 +255,77 @@ encoder.reconfigure(ReconfigureParams {
 - `query` で `MFXVideoENCODE_Query` を叩いてパラメータのサポート可否を検証できる (どこまで通るかを確認したいとき)。
 - `EncoderStats` (`num_frame` / `num_bit` / `num_cached_frame`) は `MFXVideoENCODE_GetEncodeStat` の結果。
 
-## デコーダ (`Decoder`)
+## デコーダ (`Decoder<H>`)
+
+デコーダもエンコーダと同じくハンドラー方式。 `Decoder<H: DecodeHandler>` 型パラメータでハンドラ実装を指定し、`decode()` 呼び出しごとに `H::UserData` を一緒に渡す。 デコード結果は `on_decoded` で **借用** された `DecodedFrame<'_, H::UserData>` として渡される。
 
 ```rust
-use shiguredo_vpl::{AdapterSelector, Decoder, DecoderCodec, DecoderConfig, list_adapters};
+use shiguredo_vpl::{
+    AdapterSelector, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler,
+    list_adapters,
+};
+use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
-let mut decoder = Decoder::new(DecoderConfig::new(adapter, DecoderCodec::H264))?;
+let config = DecoderConfig::new(adapter, DecoderCodec::H264);
 
-decoder.decode(&bitstream_data)?;
+// DecodedFrame は借用ベース。コールバック内で Vec にコピーしてから外へ渡す
+let (tx, rx) = mpsc::channel();
+let handler = FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, u64>, Error>| {
+    let copied = result.map(|frame| {
+        (
+            frame.y().to_vec(),
+            frame.uv().to_vec(),
+            frame.pitch(),
+            frame.width(),
+            frame.height(),
+        )
+    });
+    let _ = tx.send(copied);
+});
+let mut decoder = Decoder::new(config, handler)?;
 
-while let Some(frame) = decoder.next_frame() {
-    let _nv12 = frame.data();
-    let _w = frame.width();
-    let _h = frame.height();
-}
+decoder.decode(&bitstream_data, /* user_data */ 0u64)?;
 
+// finish はバリア。 ここに到達した時点で worker は全フレーム処理済み
 decoder.finish()?;
-while let Some(frame) = decoder.next_frame() { /* ... */ }
+
+while let Ok(result) = rx.try_recv() {
+    let (_y, _uv, _pitch, _w, _h) = result?;
+}
 ```
 
 押さえておく挙動:
 
 - `DecoderConfig` は `#[non_exhaustive]`。 必須は `adapter` と `codec` のみ。 解像度・フレームレートはビットストリームヘッダ (SPS/PPS など) から自動検出される。
-- 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 ヘッダ未到達のうちは `MFX_ERR_MORE_DATA` を内部で吸収して何も出さない。
-- 出力フォーマットは **NV12 固定** (`DecodedFrame::data()` のサイズは `width * height * 3 / 2`)。 別フォーマットへの変換は VPP 等で別途処理する。
-- サーフェスプールは固定サイズ (`DECODE_SURFACE_POOL_SIZE = 8`)。 つまり「同時に保持できるデコード中サーフェス数」は 8。
-- `next_frame` / `finish` の振る舞いはエンコーダと同じ。 `finish` 後にもう一度 `next_frame` で排出する。
+- `async_depth: Option<u16>` を持つ。 `None` の場合は 4。 エンコーダと同じ意味。
+- 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 ヘッダ未到達のうちは `MFX_ERR_MORE_DATA` を内部で吸収して何も出さない (`initialized` フラグで管理)。
+- 出力フォーマットは **NV12 固定** (`IOPattern = OUT_SYSTEM_MEMORY`)。 別フォーマットへの変換は VPP 等で別途処理する。
+- サーフェスは VPL の **内部割り当て** (`surface_work = NULL`)。 アプリ側でサーフェスプールを持つ必要はなく、`FrameSurface` の Drop で `Release` が自動的に呼ばれる。
+- worker スレッド名は `vpl-decoder-sync`。 `user_data` は **FIFO キュー** (`VecDeque`) で `decode()` 呼び出し順に対応付く。 ビットストリームがフレーム境界をまたいでも順序は保たれる。
+- `decode` 呼び出しごとに `user_data` を 1 つ供給する。 VPL が内部蓄積でフレームを出さないターンでは消費されず、出力フレーム数より供給数が多い場合の残余は `finish` 後の Drop までキューに残る。
+- `finish(&mut self) -> Result<(), Error>` はエンコーダと同じくバリア。 null bitstream でドレインを呼び切り、worker の `WaitIdle` が応答するまでブロックする。 `decode` を一度も呼んでいない (未初期化) 場合は即 `Ok(())` を返す。
+- `Decoder` を `Drop` すると worker スレッドへ `Stop` が送られ、未消費の `user_data` は `MFX_ERR_ABORTED` のエラー結果として `on_decoded` に通知される。
+
+### `DecodedFrame<'_, T>` の使い方
+
+```rust
+pub struct DecodedFrame<'a, T> { /* private */ }
+
+impl<'a, T> DecodedFrame<'a, T> {
+    pub fn y(&self) -> &[u8];    // 長さ pitch() * height() バイト
+    pub fn uv(&self) -> &[u8];   // 長さ pitch() * height() / 2 バイト
+    pub fn pitch(&self) -> usize;
+    pub fn width(&self) -> usize;
+    pub fn height(&self) -> usize;
+    pub fn user_data(&self) -> &T;
+    pub fn into_user_data(self) -> T;
+}
+```
+
+- `y()` / `uv()` は **ピッチ込みの生サーフェス**。 各行の先頭 `width()` バイトのみが有効データで、残りはパディング。 `pitch() != width()` が普通なので、 そのまま `width * height * 3 / 2` バイトのバッファにコピーすると壊れる。 行ごとにコピーする。
+- スライスのライフタイム `'a` は `on_decoded` 呼び出し中のみ。 コールバックの外に持ち出そうとするとコンパイルエラーになる。 外で使いたいなら `to_vec()` でコピーする。
+- VPL から返るサーフェスが不正 (null プレーン / `crop = 0` / `pitch < crop_w`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
 
 ## コーデック情報の照会 (`codec_info`)
 
@@ -281,9 +359,12 @@ while let Some(frame) = decoder.next_frame() { /* ... */ }
 - **DRM render node 0**: 「未設定」を意味するので絶対に `AdapterSelector::DrmRenderNode(0)` を渡さない。
 - **`coded_size` vs `width`/`height`**: 入力フレームのバッファ確保は **必ず** `Encoder::coded_size()` の結果で行う。 `EncoderConfig.width` / `height` は 16 ピクセルアラインされて内部で大きくなりうる。
 - **union メンバ**: `RateControlMode` ごとに有効な `EncoderConfig` フィールドが違う。 関係ないフィールドを埋めても効かないが、 別 union メンバを同時に埋めると意図しない値が選ばれる。
-- **`finish` 忘れ**: `encode` だけ呼んで `finish` を呼ばないとエンコーダ内部に滞留するフレームが取れない。 EOS で必ず `finish` → `next_frame` ループを回す。
+- **`finish` 忘れ**: `encode` / `decode` だけ呼んで `finish` を呼ばないと内部に滞留するフレームのハンドラ通知が抜ける。 EOS では必ず `finish` を呼んで完了を待つ。 `finish` はバリアなので、 リターン後にはハンドラ呼び出しがすべて済んでいる。
 - **`frame_type` の組合せ**: IDR を強制したいときは `IDR | I | REF`。 IDR 単体だと VPL が再決定することがある。
 - **`MFX_WRN_*` の解釈**: `Init` / `Reset` 系では警告は「成功」扱い。 自分でラッパーを書くときは `check_mfx_allow_warn` の方を使う。
+- **ハンドラはワーカースレッドから呼ばれる**: `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は `vpl-encoder-sync` / `vpl-decoder-sync` のワーカースレッドから呼ばれる。 ハンドラ実装は `Send + 'static`。 メインスレッドへ届けるなら mpsc などのチャネルにブリッジする。
+- **`DecodedFrame` の借用**: `DecodedFrame<'_, T>` の `y()` / `uv()` スライスはコールバック呼び出し中のみ有効。 外に持ち出すには `to_vec()` などでコピーする必要がある。 `pitch() != width()` が普通で、 単純連結すると壊れる。
+- **`user_data` の枯渇**: `Decoder` 側で `decode` の呼び出し数より VPL の出力フレーム数が多い (= キューが枯渇する) と、 余分なフレームは worker 内で drain 扱いとなり破棄される。 1 入力で複数枚出ることはないが、 順序保証は **FIFO のみ** なので元入力との 1:1 対応が必要なら `decode` 1 回ごとに `user_data` を必ず供給する。
 - **動作 OS の制約**: 実機サポートは Linux x86_64 + Intel GPU のみ。 macOS / Windows でビルドできるとしても `list_adapters()` は空を返し、 セッション生成は失敗する。
 - **静的リンク**: 実行時に libvpl 共有ライブラリは不要だが、 ビルド時に対応 GPU ドライバ (Intel Media Driver / iHD) が動作環境にないと実機テストは通らない。
 
@@ -298,5 +379,9 @@ while let Some(frame) = decoder.next_frame() { /* ... */ }
 
 ## チェンジログ・破壊的変更の方針
 
-- 変更は `CHANGES.md` の `## develop` セクションへ `[UPDATE]` / `[ADD]` / `[CHANGE]` / `[FIX]` の順で追記する。 担当者は次行に `  - @user` で書く。
+- 変更は `CHANGES.md` の `## develop` セクションへ追記する。 種別ラベルは `[CHANGE]` / `[UPDATE]` / `[ADD]` / `[FIX]` (CHANGES.md 冒頭の凡例順) を使う。 担当者は内容のサブ箇条書きの最後に `- @user` で書く。
 - **vpl-rs は良い設計のためには破壊的変更を積極的に行う**。 古い API を残すよりも、 VPL の概念に正しくマップした新 API に置き換える。 互換シムは作らない。
+- 直近の破壊的変更例:
+  - `2026.3.0` — `Encoder<H>` / `Decoder<H>` のハンドラー方式化、`next_frame` 廃止、`async_depth` 追加、`DECODE_SURFACE_POOL_SIZE` を廃止し VPL 内部割り当てに移行、`DEVICE_BUSY` リトライ 10 → 30
+  - `2026.2.0` — `EncoderConfig::new` / `DecoderConfig::new` / `codec_info::supported_codecs` にアダプタ指定を必須化
+- 詳細は `shiguredo-changelog` スキルの規約も併用すること。

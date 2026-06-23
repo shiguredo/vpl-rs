@@ -11,6 +11,10 @@
 
 ## develop
 
+## 2026.3.0
+
+**リリース日**: 2026-06-23
+
 - [UPDATE] Guard 系の実装をやめてリソースに対するライフタイムで管理する
   - `VplLibrary` / `frame_type` / `gop_opt_flag` を `src/vpl.rs` に移動する
   - `SurfaceGuard` / `DecodedSurfaceGuard` を `FrameSurface` に統合する
