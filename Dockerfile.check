@@ -1,0 +1,42 @@
+# Apple Silicon Mac でもネイティブ arm64 上で x86_64-unknown-linux-gnu ターゲットを
+# クロスコンパイルする構成
+# libvpl は build.rs が GitHub から git clone し shiguredo_cmake で static build する
+# 設計のため、CMake のクロスコンパイル設定 (CC/CXX/LINKER) と bindgen の clang target
+# 指定だけで完結する (重い sysroot 構築は不要)
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# bindgen / build.rs (git clone で libvpl 取得) / libvpl の CMake クロスビルド /
+# x86_64 クロスリンカに必要な最小限のパッケージ
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    libclang-dev \
+    clang \
+    gcc-x86-64-linux-gnu \
+    g++-x86-64-linux-gnu \
+    pkg-config \
+    curl \
+    ca-certificates \
+    git
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add x86_64-unknown-linux-gnu
+
+# x86_64-unknown-linux-gnu ターゲット用のクロスコンパイル設定
+# cmake クレートは CC_<target> / CXX_<target> を読んで CMAKE_C_COMPILER /
+# CMAKE_CXX_COMPILER として libvpl の CMake build に渡す
+# bindgen には clang を x86_64 ABI (wchar_t = signed int) に切り替えるためのフラグを渡す
+ENV CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc
+ENV CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+ENV BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu="--target=x86_64-linux-gnu"
+
+COPY . /workspace
+WORKDIR /workspace
+
+# CI と同じ clippy コマンドを x86_64-unknown-linux-gnu ターゲットで実行する
+# clippy は実行を伴わないため GPU も Intel VPL ランタイムも不要
+CMD ["cargo", "clippy", "--workspace", "--target", "x86_64-unknown-linux-gnu", "--", "-D", "warnings"]
