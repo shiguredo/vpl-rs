@@ -43,6 +43,10 @@
 
 ### misc
 
+- [ADD] container コマンドで macOS から clippy 検証ができるようにする
+  - Apple Silicon Mac の arm64 ネイティブで x86_64-unknown-linux-gnu へクロスビルドする
+  - @voluntas
+
 ## 2026.2.0
 
 **リリース日**: 2026-05-13
