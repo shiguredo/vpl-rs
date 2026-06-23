@@ -45,6 +45,8 @@
 
 - [ADD] container コマンドで macOS から clippy 検証ができるようにする
   - Apple Silicon Mac の arm64 ネイティブで x86_64-unknown-linux-gnu へクロスビルドする
+  - `.devcontainer/Dockerfile` を VS Code Dev Container と prek の cargo-clippy フックで共用する
+  - `make container-build` でイメージを用意し `prek run cargo-clippy` で実行する
   - @voluntas
 
 ## 2026.2.0
