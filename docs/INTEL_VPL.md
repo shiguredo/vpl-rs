@@ -2,7 +2,7 @@
 
 ## 概要
 
-Intel oneVPL (Video Processing Library) v2.16.0 の Rust バインディング。
+Intel oneVPL (Video Processing Library) v2.17.0 の Rust バインディング。
 エンコーダのみを対象とする。
 
 ## 対応コーデック
@@ -153,7 +153,7 @@ src/
 
 ## ビルド構成
 
-- `build.rs` が GitHub から libvpl v2.16.0 を `git clone --depth=1` で取得する
+- `build.rs` が GitHub から libvpl v2.17.0 を `git clone --depth=1` で取得する
 - bindgen でヘッダからバインディングを生成し `src/bindings.rs` に書き込む
 - Linux では CMake で libvpl を static build してリンクする
 - `DOCS_RS=1` 環境変数が設定されている場合、ライブラリのビルドとリンクをスキップする
