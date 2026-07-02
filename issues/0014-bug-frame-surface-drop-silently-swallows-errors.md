@@ -2,10 +2,9 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-frame-surface-drop-silent-errors
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -63,28 +62,22 @@ impl Drop for FrameSurface {
 
 ## 設計方針
 
-### 案 A: eprintln! でログ出力（推奨、簡易）
+### 案 A: eprintln! でログ出力（推奨）
 
-Drop で失敗したら `eprintln!("mfxFrameSurfaceInterface::Release failed: status={}", status)` を出す。
+Drop で失敗したら `eprintln!("[vpl-rs] mfxFrameSurfaceInterface::Release failed: status={}", status)` を出す。
 
 - 長所: 実装コスト最小。テストや実運用で発生したら stderr で観測できる。
-- 短所: `log` crate を使っていないため、アプリ側でログルーティングを制御できない。ただし本 crate は `[dependencies]` が空で、外部ログ crate を導入する方針かどうかは要検討。
+- 短所: `log` crate を使っていないため、アプリ側でログルーティングを制御できない。ただし本 crate は `[dependencies]` が空で、外部ログ crate を導入する方針かどうかは別 issue とする。
 
-### 案 B: debug_assert! で開発時検出
+### 案 B（不採用）: debug_assert! で開発時検出
 
-`debug_assert!(status == sys::mfxStatus_MFX_ERR_NONE, ...)` で開発時のみ panic させる。
+`debug_assert!` は Drop 内で panic すると二重パニック（別の panic の unwind 中に Drop が走った場合）により即座に process abort するリスクがある。Rust の標準ドキュメントでも Drop 内での panic は強く非推奨。このため不採用とする。
 
-- 長所: リリースビルドではオーバーヘッドなし。
-- 短所: リリースビルド（本番）では検出不能。
+### 案 C（不採用）: FrameSurface に `debug_check` の外部 API を追加
 
-### 案 C: FrameSurface に `debug_check` の外部 API を追加
+既存 API の変更が必要で実装コストに見合わない。
 
-`FrameSurface::release(&mut self) -> Result<(), Error>` のような明示的な release API を追加し、呼び出し側でエラーを判定させる。Drop は最後の安全網に留める。
-
-- 長所: 正常経路では確実にエラーを検出できる。
-- 短所: 既存 API の変更が必要。テストコードも修正。
-
-推奨は **案 A + 案 B の併用**。実装コストが小さく、開発時と本番の両方で最低限の観測性が得られる。将来的に `log` crate を導入するなら `log::warn!` に切り替える。
+推奨は **案 A** 単独。将来的に `log` crate を導入するなら `log::warn!` に切り替える。
 
 ### 併せて対応: Session::Drop も同じ扱い
 
@@ -98,11 +91,12 @@ Drop で失敗したら `eprintln!("mfxFrameSurfaceInterface::Release failed: st
 
 以下すべてを満たす。
 
-1. `FrameSurface::Drop` の `Unmap` / `Release` 失敗が `eprintln!` などで観測可能になる。
-2. `debug_assert!` を併用し、開発ビルドでは失敗が即座に panic として検出される。
-3. `Session::Drop` / `Encoder::Drop` / `Decoder::Drop` も同じ扱いに揃える。
-4. `#[cfg(test)] mod tests` に「Drop 経路の失敗ログが観測されるユニットテスト」を追加する（`FrameSurface` を強制的に不正な状態にして Drop するテストなど、モック不使用で実現可能なもの）。
-5. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する（バグ修正ではなく観測性改善）。
+1. `FrameSurface::Drop` の `Unmap` / `Release` 失敗が `eprintln!` で観測可能になる。
+2. `Session::Drop` / `Encoder::Drop` / `Decoder::Drop` も `eprintln!` で同様に観測可能にする。
+3. `Encoder::stop_worker` / `Decoder::stop_worker` 内の `let _ = worker_tx.send(Stop)` および `let _ = handle.join()` のエラー黙殺も `eprintln!` で観測可能にする。
+4. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する（バグ修正ではなく観測性改善）。
+
+注: 異常系 Drop テスト（Release 失敗を強制するテスト）は、`AGENTS.md` の「モック禁止」下では実装不能のため実施しない。正常系（Drop が panic しないこと）は既存テストで担保されている。
 
 ## 影響範囲
 
@@ -113,5 +107,4 @@ Drop で失敗したら `eprintln!("mfxFrameSurfaceInterface::Release failed: st
 
 ## 参考
 
-- `/review-code` の致命的指摘 F7
-- 関連: 将来的な `log` crate 導入の是非は別 issue で議論
+- 将来的な `log` crate 導入の是非は別 issue で議論

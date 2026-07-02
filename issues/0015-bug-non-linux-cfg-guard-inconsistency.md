@@ -1,11 +1,10 @@
 # 非 Linux 環境で Encoder / Decoder の cfg ガードが欠落しリンカエラーになる
 
-- Priority: Medium
+- Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-non-linux-cfg-guard-inconsistency
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -13,11 +12,11 @@
 
 ## 優先度根拠
 
-Medium。以下による。
+High。以下による。
 
 - **開発者体験の悪さ**: macOS / Windows で `cargo build` を試みるとリンカ・エラーが返るが、原因が「Linux 前提のクレート」と伝わらない。undef sym をひとつずつ調べることになる。
 - **API の一貫性の欠如**: `list_adapters` / `supported_codecs` は cfg 分岐しているのに、`Encoder::new` / `Decoder::new` は分岐なし。同じ crate で扱いが揃っていない。
-- **本番運用への直接影響はない**: 実運用は Linux 前提で回っているため、Priority は High ではなく Medium とする。開発体験と API の整合性の観点から早期対応が望ましい。
+- **誤誘導**: `list_adapters()` が非 Linux で `Ok(Vec::new())` を返す実装は「非 Linux でも API を触れる」と積極的に誤認させるバグであり、早期修正が必要。
 
 ## 現状
 
@@ -64,17 +63,16 @@ lib.rs L21 に「動作要件: Linux (x86_64)」と明記しているが、コ�
 
 ### 案 A: crate 全体を `#[cfg(target_os = "linux")]` でガードする（推奨）
 
-`src/lib.rs` に:
+`src/lib.rs` のドキュメントコメント直後（`mod` 宣言の前）に `compile_error!` を配置する:
 
 ```rust
 #[cfg(not(target_os = "linux"))]
 compile_error!("shiguredo_vpl requires Linux x86_64. Non-Linux targets are not supported.");
 ```
 
-さらに全 public API を `#[cfg(target_os = "linux")]` でガードするか、モジュール宣言に付ける。
-
-- 長所: 非 Linux では明確なコンパイルエラーで拒否できる。生のリンカエラーに悩まされない。
-- 短所: `docs.rs` ビルドを Linux で走らせる必要がある（現在 CI で `docs-rs` ジョブを Ubuntu で回しているため問題なし）。
+- 長所: 非 Linux ではドキュメントコメントのパースのみで即座に拒否され、モジュールの型検査まで走らない（コンパイル時間が無駄にならない）。
+- 短所: `docs.rs` ビルドを Linux で走らせる必要がある。`docs.rs` のデフォルトビルド環境は Ubuntu であり、本 crate の `build.rs` の `DOCS_RS` 分岐とも整合するため問題なし。
+- macOS での `DOCS_RS=1 cargo doc --no-deps` は `compile_error!` で拒否されるが、これは意図通り（macOS 向けのドキュメント生成は不要）。
 
 ### 案 B: 非 Linux でも API を空実装で提供する
 
@@ -96,12 +94,10 @@ compile_error!("shiguredo_vpl requires Linux x86_64. Non-Linux targets are not s
 
 以下すべてを満たす。
 
-1. 非 Linux で `cargo build` すると `compile_error!("shiguredo_vpl requires Linux x86_64. Non-Linux targets are not supported.")` で拒否される。
-2. `list_adapters` の非 Linux 空 `Vec` 実装を削除する（案 A 採用時）。
-3. `README.md` / `CHANGES.md` に Linux 専用であることを明記する（README 既存の「動作要件」を強調 / CHANGES で `[CHANGE]` として非 Linux ビルドの拒否を通知）。
-4. `docs.rs` ビルド（`DOCS_RS=1 cargo doc --no-deps`）は Linux 上で通ることを CI で確認する。
-5. `.devcontainer/Dockerfile` は既に Linux コンテナなので影響なし。
-6. `CHANGES.md` の `## develop` に `[CHANGE]` として追記する（非 Linux での API 提供停止は破壊的変更）。
+1. `src/lib.rs` の先頭（ドキュメントコメント直後、`mod` 宣言の前）に `#[cfg(not(target_os = "linux"))] compile_error!(...)` を追加する。
+2. `src/adapter.rs` の非 Linux 版 `list_adapters`（空 `Vec` を返す実装）を削除する。
+3. `CHANGES.md` の `## develop` に `[FIX]` として追記する（非 Linux で誤誘導するバグの修正）。
+4. `docs.rs` ビルド（`DOCS_RS=1`）が Linux 上で通ることを確認する（現在の CI の `docs-rs` ジョブまたは手動確認）。
 
 ## 影響範囲
 
@@ -112,5 +108,4 @@ compile_error!("shiguredo_vpl requires Linux x86_64. Non-Linux targets are not s
 
 ## 参考
 
-- `/review-code` の致命的指摘 F8
-- 参考にする pattern: `Encoder` / `Decoder` を非 Linux でエクスポートしていない類似 crate（`shiguredo/nvcodec-rs`, `shiguredo/amf-rs`）
+- `build.rs:57-60` の `DOCS_RS` 対応
