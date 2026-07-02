@@ -4,7 +4,7 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/fix-ci-run-cargo-test-in-non-gpu-job
-- Polished: 2026-07-01
+- Polished: 2026-07-02
 
 ## 目的
 
@@ -117,7 +117,7 @@ Linux ホストで GPU なしでもコンパイル・実行できるテスト:
 
 ### workspace オプション
 
-現状の `--workspace` は単一クレートで意味を持たないので、この機会に削除する。
+現状の `--workspace` は単一クレートで意味を持たないが、削除は issue 0021（workspace 化）の進捗に依存するため本 issue のスコープ外とする。issue 0021 完了後に別途対応する。
 
 ## 完了条件
 
