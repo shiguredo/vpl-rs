@@ -4,7 +4,7 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/doc-fix-readme-input-format-mismatch
-- Polished: 2026-07-01
+- Polished: 2026-07-02
 
 ## 目的
 
