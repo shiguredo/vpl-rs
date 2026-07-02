@@ -2,10 +2,9 @@
 
 - Priority: Medium
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/refactor-extract-vpl-loader-builder
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -56,12 +55,13 @@ let drm_name = b"mfxExtendedDeviceId.DRMRenderNodeNum\0";
 
 ### 案 A: `LoaderBuilder`（内部 API）を新設する（推奨）
 
-`src/vpl.rs` に共通の `LoaderBuilder` を導入する。
+`src/vpl.rs` に共通の `LoaderBuilder` を導入する。`LoaderBuilder` は `mfxLoader` のライフタイムを管理し、Drop で `MFXUnload` を呼ぶ。
 
 ```rust
 pub(crate) struct LoaderBuilder {
     loader: sys::mfxLoader,
-    // MFXCreateConfig は複数保持可能だが VPL 側で loader Drop 時に一括破棄されるので追跡不要
+    render_node: u32,
+    consumed: bool,  // create_session 呼び出し後に二重解放を防ぐ
 }
 
 impl LoaderBuilder {
@@ -73,19 +73,18 @@ impl LoaderBuilder {
         // MFXCreateConfig + MFXSetConfigFilterProperty("mfxImplDescription.Impl", HARDWARE)
     }
 
-    pub(crate) fn require_drm_render_node(&self, render_node: u32) -> Result<(), Error> {
+    pub(crate) fn require_drm_render_node(&mut self, render_node: u32) -> Result<(), Error> {
+        self.render_node = render_node;
         // MFXCreateConfig + MFXSetConfigFilterProperty("mfxExtendedDeviceId.DRMRenderNodeNum", render_node)
     }
 
-    pub(crate) fn create_session(self) -> Result<Session, Error> {
-        // MFXCreateSession(loader, 0, ...) → Session を返す。self は consume される
-    }
-
-    pub(crate) fn enumerate_impls<F>(&self, callback: F) -> Result<(), Error>
-    where
-        F: FnMut(usize) -> Result<(), Error>,
-    {
-        // MFXEnumImplementations loop
+    pub(crate) fn create_session(mut self) -> Result<Session, Error> {
+        // loader の所有権を Session に移す。成功したら consumed = true にして
+        // LoaderBuilder::Drop で二重に MFXUnload しないようにする。
+        // 失敗時は consumed = false のまま Drop に任せる。
+        let session = /* MFXCreateSession(self.loader, 0, ...) */;
+        self.consumed = true;
+        Ok(Session { lib: ..., loader: self.loader, session })
     }
 
     pub(crate) fn as_loader(&self) -> sys::mfxLoader {
@@ -95,42 +94,26 @@ impl LoaderBuilder {
 
 impl Drop for LoaderBuilder {
     fn drop(&mut self) {
-        // MFXUnload
+        if !self.consumed {
+            unsafe { sys::MFXUnload(self.loader); }
+        }
     }
 }
 ```
 
-以下のように各呼び出し元をリファクタする。
+各呼び出し元の移行:
 
-- `create_session`:
+- **`create_session`**: `LoaderBuilder::new()?` → `require_hardware()` → `require_drm_render_node(rn)` → `create_session()`（builder は consume）
+- **`list_adapters`**: `LoaderBuilder::new()?` → `require_hardware()` → `as_loader()` で loader を取得し、従来の `MFXEnumImplementations` ループを行う。`HdlGuard` は維持するが、`loader` フィールドを `sys::mfxLoader` の値コピーに変更する（`as_loader()` から取得）。
+  - `HdlGuard` の `MFXDispReleaseImplDescription(loader, hdl)` は `LoaderBuilder` Drop（`MFXUnload`）より前に呼ばれる必要がある。`HdlGuard` を `LoaderBuilder` より先に Drop させることで順序を保証する。
+- **`supported_codecs`**: `create_session` と同様のパターン。`MFXDispReleaseImplDescription` は `LoaderBuilder` Drop の前に完了させる。
 
-```rust
-let builder = LoaderBuilder::new()?;
-builder.require_hardware()?;
-builder.require_drm_render_node(render_node)?;
-builder.create_session()  // Session を返す（builder は consume）
-```
+`enumerate_impls` メソッドは `list_adapters` が index 1 つにつき `IMPLDESCSTRUCTURE` と `DEVICE_ID_EXTENDED` の 2 回の `MFXEnumImplementations` を必要とするため、単純なコールバックでは置き換えられない。`as_loader()` 経由で各呼び出し元が直接ループを書く。
 
-- `list_adapters`:
+注意: `as_loader()` は生の `sys::mfxLoader` を返す。`LoaderBuilder` が Drop されてからこのポインタを使うと use-after-free になるため、呼び出し元は `LoaderBuilder` の生存期間中にのみ `as_loader()` の戻り値を使用すること。
 
-```rust
-let builder = LoaderBuilder::new()?;
-builder.require_hardware()?;
-builder.enumerate_impls(|i| { /* per impl 処理 */ })?;
-// builder は関数スコープの Drop で MFXUnload
-```
-
-- `supported_codecs`:
-
-```rust
-let builder = LoaderBuilder::new()?;
-builder.require_hardware()?;
-builder.require_drm_render_node(render_node)?;
-builder.enumerate_impls(|i| { /* per impl 処理 */ })?;
-```
-
-- 長所: 3 箇所を 1 箇所に集約。RAII で失敗パスのリーク防止。
-- 短所: 内部 API の増設。既存の `LoaderGuard` / `HdlGuard` との整合を取る必要がある。
+- 長所: 3 箇所の `MFXLoad` / `MFXCreateConfig` / `MFXSetConfigFilterProperty` を 1 箇所に集約。RAII で失敗パスのリーク防止。
+- 短所: 内部 API の増設。既存の `LoaderGuard`（adapter.rs）は削除、`HdlGuard` は loader 所有権を除去して維持。
 
 ### 案 B: 現状維持 + コメントで注意喚起
 
@@ -160,5 +143,4 @@ builder.enumerate_impls(|i| { /* per impl 処理 */ })?;
 
 ## 参考
 
-- `/review-code` の致命的指摘 F12
 - 関連コード: `src/adapter.rs:253-277` の `LoaderGuard` / `HdlGuard`（既存 RAII）
