@@ -2,10 +2,9 @@
 
 - Priority: Medium
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/add-pbt-fuzz-infrastructure
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -117,12 +116,13 @@ Fuzz で書ける対象:
 
 ### 案 C: 段階的に案 A を進める（推奨）
 
-1. まず Makefile の `.PHONY` 誤記（`pbt-cover` → `pbt-with-cover`）を修正
-2. `pbt/` サブディレクトリと最小限のテスト（`FrameFormat::frame_size` の PBT）を追加
-3. `[workspace]` セクションを追加して Cargo.toml を workspace 構成にする
-4. CI に `make pbt` を組み込む
-5. 追加の PBT を随時足す
-6. `fuzz/` は後回し（`cargo fuzz` は nightly 依存で導入コスト高）
+1. まず Makefile の `.PHONY` 誤記（`pbt-cover` → `pbt-with-cover`）を修正する（PBT 実装の有無にかかわらず独立したバグ修正）。
+2. `pbt/` サブディレクトリと最小限のテスト（`FrameFormat::frame_size` の PBT）を追加する。
+3. `Cargo.toml` に `[workspace] members = ["pbt"]` を追加し workspace 構成にする。
+   - **workspace 化の副作用**: `make test` (`cargo test --workspace`) と `prek` フックの `cargo test --workspace` が `pbt/` も実行するようになる。proptest はデフォルトで 256 ケース生成するため、コミット時のテスト時間が伸びることに留意する。
+4. `make pbt` が成功すること、および既存の `make test` が workspace 化後も成功することを確認する。
+5. CI への組込みは issue 0022 で対応する（本 issue では行わない）。
+6. `fuzz/` は後回し（`cargo fuzz` は nightly 依存で導入コスト高）。
 
 推奨は **案 C**。段階的に規約準拠を進める。
 
@@ -130,15 +130,16 @@ Fuzz で書ける対象:
 
 以下すべてを満たす（案 C の場合）。
 
-1. Makefile の `.PHONY` 誤記を修正する。
-2. `pbt/` サブディレクトリと `pbt/Cargo.toml` を作成する。
+1. Makefile の `.PHONY` 誤記を修正する（`pbt-cover` → `pbt-with-cover`、`fuzz` の追加または削除）。
+2. `pbt/` サブディレクトリと `pbt/Cargo.toml`（`[package].name = "pbt"` を含む）を作成する。
 3. `Cargo.toml` に `[workspace] members = ["pbt"]` を追加する。
 4. `pbt/tests/prop_frame_format.rs` に `FrameFormat::frame_size` の PBT を最低 1 個追加する。
-5. `make pbt` が成功する。
-6. `.github/workflows/ci.yml` の `ci` ジョブに `cargo test -p pbt` を追加する（issue 0022 と統合）。
-7. `fuzz/` は本 issue のスコープ外とする（別 issue で対応）。
-8. SKILL.md の PBT 規約記述を「配置済み」に更新する。
-9. `CHANGES.md` の `## develop` に `[ADD]` として追記する。
+5. `make pbt` が成功し、かつ `make test`（workspace 全体の `cargo test`）も pass することを確認する。
+6. `fuzz/` は本 issue のスコープ外とする（別 issue で対応）。
+7. SKILL.md の PBT 規約記述を「配置済み」に更新する。
+8. `CHANGES.md` の `## develop` に `[ADD]` として追記する。
+
+注: CI への組込み（`cargo test -p pbt`）は issue 0022 側で対応する。
 
 ## 影響範囲
 
@@ -151,6 +152,5 @@ Fuzz で書ける対象:
 
 ## 参考
 
-- `/review-code` の致命的指摘 F14 と削除候補（大）の 3 番目
 - shiguredo-rust スキル規約
 - 関連 issue: 0022（ci ジョブが cargo test を実行しない）、0023（silent pass テスト）
