@@ -2,20 +2,19 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-frame-seq-zero-timestamp-collision
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
 `Encoder::encode` の 1 フレーム目は `frame_seq = 0` を `mfxFrameSurface1.Data.TimeStamp` として渡す。VPL の一部ドライバ実装では TimeStamp = 0 を「未設定」として扱い、`bitstream.TimeStamp` に `MFX_TIMESTAMP_UNKNOWN` (0xFFFF_FFFF_FFFF_FFFF) や別の値を書き戻す挙動が観測されている。この場合 `pending_store.take_by_frame_seq(bitstream.TimeStamp)` が空振りし、1 フレーム目が「no pending frame for bitstream timestamp」で必ずエラーになる。
 
-現状のテストで顕在化していないため、本 issue はまず **現実に発生するかの検証** を先に行い、発生するなら修正、しないならドキュメント化する。
+現状のテストで顕在化していないが、別世代/別実装の GPU で当たる可能性がある。修正コストが `frame_count` 初期値の 1 行変更のみであるため、予防的に対処する。
 
 ## 優先度根拠
 
-High（要検証）。以下による。
+High。以下による。
 
 - **1 フレーム目が必ず失敗する可能性**: もし該当ドライバに当たると、Encoder を起動して最初の入力が **確実に失敗する**。回避不能で、原因は表面的にはコード変更なしでの環境依存となる。
 - **対応方針が単純**: `frame_count` を 1 スタートにするだけで回避可能。修正コスト極小。
@@ -72,44 +71,29 @@ fn sync_and_build_frame<T>(
 
 ## 設計方針
 
-### 案 A: frame_count を 1 スタートにする（推奨）
+**frame_count を 1 スタートにする。**
 
-`Encoder::new` で `frame_count: 1` に初期化し、pending_store の登録キーと `Data.TimeStamp` の両方が 1 以上になるようにする。
+- `Encoder::new` で `frame_count: 1` に初期化する（現在は 0、`src/encode.rs:955`）。
+- `pending_store` の登録キーと `Data.TimeStamp` の両方が 1 以上になるため、VPL ドライバが TimeStamp = 0 を「未設定」扱いしても衝突しない。
+- frame_seq は内部の連番で公開 API に直接露出しないが、`EncodedFrame::timestamp()` の値は `frame_seq * framerate_den` で計算されるため影響を受ける。修正後は最初のフレームの `timestamp()` が 0 ではなく `framerate_den` になる。この変更は破壊的ではないが、timestamp の開始値に依存するコードは修正が必要。
+- 修正は初期化 1 行の変更のみで、`frame_count.checked_add(1)` のロジックはそのまま利用できる。
 
-- 長所: 実装変更 1 行。既存の frame_seq 意味論（単調増加）を壊さない。
-- 短所: 特になし（frame_seq を「入力連番」として使う内部の他コードも 1 スタートに切り替わるが、公開 API には露出しない）。
-
-### 案 B: TimeStamp と frame_seq を分離する
-
-`Data.TimeStamp` には別の値（例: `frame_count + 1` や `presentation_timestamp`）を使い、pending_store のキーには内部で管理する frame_seq を使う。VPL が TimeStamp を書き戻す仕様に依存しない実装にする。
-
-- 長所: VPL の TimeStamp 挙動の変化に強い。
-- 短所: 実装が複雑になる。frame_seq と TimeStamp の対応表を持つ必要がある。
-
-### 案 C: 現状維持 + doc に注意書き
-
-「一部 VPL ドライバで frame_seq = 0 が誤動作する可能性」を doc に記載し、対応は保留。
-
-- 短所: 実装者がドライバ依存で当たる。
-
-推奨は **案 A**。案 B は将来の設計改善で余裕があれば検討。
+`TimeStamp` と `frame_seq` を分離する案や、`Data.TimeStamp = frame_seq + 1` とする案は、実装変更が増えるわりに本質的な利点がないため不採用。
 
 ## 完了条件
 
 以下すべてを満たす。
 
-1. **検証を先行する**: 手元で入手可能な複数世代の Intel GPU（例: iGPU + dGPU）で `frame_seq = 0` を `Data.TimeStamp` に載せて encode し、`bitstream.TimeStamp` に 0 がそのまま返るかを確認する。少なくとも 2 種類以上の GPU で検証する。
-2. 1 で発生することが確認できたら案 A を採用して `Encoder::new` で `frame_count: 1` に初期化する。発生しなくても、他ドライバでの潜在的リスクを避けるため案 A で対処する（実装コストが極小なので）。
-3. `Encoder` の frame_seq が 1 スタートになったことを確認する単体テスト、または pending_frame の内部状態を検証するテストを追加する。
-4. `CHANGES.md` の `## develop` に `[FIX]` として追記する（発生する場合）または `[CHANGE]` として追記する（予防的修正の場合）。
+1. `Encoder::new` で `frame_count: 1` に初期化する（`src/encode.rs:955`、現在は `frame_count: 0`）。
+2. 既存の全ラウンドトリップテストが pass することを確認する。`EncodedFrame::timestamp()` の値が 1 フレーム目から `framerate_den` になることをテストで確認する必要はないが、変更を認識した上で pass すること。
+3. `CHANGES.md` の `## develop` に `[FIX]` として追記する。`timestamp()` の開始値が 0 から `framerate_den` に変わることに言及する。
 
 ## 影響範囲
 
-- `src/encode.rs`（`Encoder::new` の `frame_count` 初期化のみ）
+- `src/encode.rs`（`Encoder::new` の `frame_count` 初期化、L955 の 1 行）
 - `CHANGES.md`
-- 検証時のみ実 GPU テスト環境
 
 ## 参考
 
-- `/review-code` の致命的指摘 F6
-- 関連コード: `src/encode.rs:669, 954, 1088, 1110, 1157-1160, 1341-1357, 1424`
+- `src/encode.rs:955` の `frame_count: 0`（修正対象）
+- `mfxdefs.h` に `MFX_TIMESTAMP_UNKNOWN` (0xFFFF_FFFF_FFFF_FFFF) が定義されている
