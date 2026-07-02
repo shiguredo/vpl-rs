@@ -2,22 +2,21 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-does-not-drain-pending
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
-`Encoder::reconfigure` が呼ぶ `MFXVideoENCODE_Reset` は VPL 内部の未出力フレームを破棄する仕様。しかし現在の実装は `pending_store` を drain せず、Reset 前後で `frame_seq` の対応付けが破綻する。ユーザーは意図せず「以前入力したフレームの user_data」が「Reset 後に入力したフレームの出力」に紐付く、あるいは `finish()` で「pending frames remained」エラーとして未処理フレームが顕在化する。
+`Encoder::reconfigure` が呼ぶ `MFXVideoENCODE_Reset` は VPL 内部の未出力フレームを破棄する仕様。しかし現在の実装は `pending_store` を drain せず、Reset 後に pending が残留して `finish()` で「pending frames remained」エラーが顕在化する。ユーザーは reconfigure との因果関係が分からないままエラーに遭遇する。
 
 ## 優先度根拠
 
 High。以下による。
 
-- **サイレントなデータ破損**: `Reset` が VPL 内部フレームを破棄しても pending_store 側の frame_seq は残るため、後続の Sync 出力と誤って対応付けが成立するリスクがある（frame_seq が衝突しない限り気付けない）。
-- **`finish()` エラーの表出**: 対応する Sync が来ないまま pending_store に残り、`finish()` で drain されて「pending frames remained」の一括エラー通知になる。ユーザーには Reset との因果が分からない。
+- **`finish()` エラーの表出**: Reset で破棄されたフレームに対応する Sync が来ないまま pending_store に残り、`finish()` で drain されて「pending frames remained」の一括エラー通知になる。ユーザーには Reset との因果が分からない。
 - **`Encoder::reconfigure` の doc に注意書きがない**: 現在の doc（`src/encode.rs:983-985`）は「エンコーダパラメータを動的に変更する」としか書いておらず、Reset の副作用（VPL 内部フレーム破棄）が説明されていない。
+- **frame_seq の単調増加により誤対応付けは発生しないが、残留自体が異常**: frame_seq は u64 でラップアラウンドしないため Reset 後の Sync と誤って対応付くことはない。しかし pending_store に残るエントリ自体が設計上の欠陥であり、reconfigure の意味論として破綻している。
 
 ## 現状
 
@@ -27,18 +26,11 @@ High。以下による。
 
 ```rust
 pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
-    if let Some(0) = params.framerate_den {
-        return Err(Error::new_custom(
-            "Encoder::reconfigure",
-            "framerate_den must be non-zero",
-        ));
-    }
-
+    // ... バリデーション ...
     // 現在の video_param をベースに変更を適用する
     unsafe {
         // ... target_kbps / max_kbps / framerate を書き換え ...
     }
-
     self.session
         .lib()
         .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param)
@@ -49,7 +41,7 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 
 ### pending_store の状態
 
-`Encoder::encode` は `pending_store.insert(frame_seq, pending_frame)` で入力ごとに登録し、Sync 到着時に `take_by_frame_seq` で回収する（`src/encode.rs:1341-1357`）。B フレーム並び替えを含めて frame_seq の完全一致で対応付ける設計。
+`Encoder::encode` は `pending_store.insert(frame_seq, pending_frame)` で入力ごとに登録し、Sync 到着時に `take_by_frame_seq` で回収する（`src/encode.rs:1341-1357`）。
 
 Reset が発生すると、VPL は入力済みだが未出力のフレームを破棄する。しかし pending_store には frame_seq が残り、対応する Sync がもう来ないので、`finish()` の `pending_store.drain_all()` (`src/encode.rs:1312`) でまとめてエラー通知される。
 
@@ -72,61 +64,105 @@ fn finish_pending_error(frame_seq: u64, pending_count: usize) -> Error {
 
 ### frame_seq 衝突のリスク
 
-frame_seq は Encoder のライフタイムを通じて単調増加する（`self.frame_count.checked_add(1)`）ので、Reset 後に新規入力しても既存の frame_seq とは衝突しない。したがって「誤って対応付けが成立する」ケースは frame_seq がラップアラウンドしない限り発生しない（u64 なので現実的にありえない）。
-
-ただし、Reset 前の未回収 pending が「消えることなく残る」設計自体が、`finish()` エラーとして顕在化する。エラーで気付けるのは救いだが、reconfigure の意味論としては破損している。
+frame_seq は Encoder のライフタイムを通じて単調増加する（`self.frame_count.checked_add(1)`）ので、Reset 後に新規入力しても既存の frame_seq とは衝突しない。u64 のためラップアラウンドは現実的に発生しない。
 
 ## 設計方針
 
-以下のいずれか。
+**Reset の直前に pending_store を drain する。**
 
-### 案 A: reconfigure() の中で finish() を呼ぶ（推奨）
+制御フロー:
 
-`reconfigure()` の直前に既存 pending を全てフラッシュする。
+1. パラメータバリデーション（`framerate_den` チェック）
+2. `self.video_param` に `ReconfigureParams` を適用する（0011 の ExtParam 再構築もここで行う）
+3. `pending_store` を drain し、全エントリを `MFX_ERR_ABORTED` 相当のエラーとしてハンドラに通知する
+4. `MFXVideoENCODE_Reset` を呼ぶ
 
 ```rust
 pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
-    // pending をフラッシュしてから Reset する
-    self.finish()?;
-    // ... 既存の Reset 処理 ...
+    if let Some(0) = params.framerate_den {
+        return Err(Error::new_custom(
+            "Encoder::reconfigure",
+            "framerate_den must be non-zero",
+        ));
+    }
+
+    // 現在の video_param をベースに変更を適用する（0011 の ExtParam 再構築を含む）
+    unsafe {
+        // ... target_kbps / max_kbps / framerate を書き換え ...
+    }
+
+    // Reset により VPL 内部で破棄されるフレームに対応する pending を事前に drain する
+    // ワーカー側の drain 完了を同期してから Reset を呼ぶ（逆順だと VPL 内部フレームが先に破棄される）
+    let (tx, rx) = mpsc::channel();
+    self.send_worker_command(
+        "Encoder::reconfigure",
+        WorkerCommand::DrainPending(tx),
+    )?;
+    rx.recv().map_err(|_| {
+        Error::new_custom("Encoder::reconfigure", "sync worker thread stopped unexpectedly")
+    })?;
+
+    self.session
+        .lib()
+        .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param)
 }
 ```
 
-- 長所: reconfigure の意味論が明確になる（「既存フレームは全て処理してから設定変更」）。
-- 短所: reconfigure がブロッキングになる（既存フレームの Sync 完了まで待つ）。ただしこれは reconfigure の正しい意味論。
+### WorkerCommand::DrainPending の追加
 
-### 案 B: pending_store が非空なら Err を返す
+`WorkerCommand` enum に `DrainPending(mpsc::Sender<()>)` バリアントを新設する。Worker 側では:
 
-呼び出し側の責任で `finish()` を先に呼ばせる。pending が残っている状態で reconfigure を呼ぶとエラー。
+- `pending_store.drain_all()` で全エントリを取り出す
+- 各エントリに対して `handler.on_encoded(Err(canceled_error()))` を呼び出す
+- 全エントリ処理後に `reply_tx.send(())` で呼び出し元に完了を通知する
 
-- 長所: reconfigure のブロッキング時間が読める。
-- 短所: 呼び出し側の負担が増える。「なぜエラーになったか」の理解が必要。
+呼び出し元（`reconfigure`）は `rx.recv()` で完了を待ってから `Reset` を実行する。これにより pending_store の drain が Reset より先に完了することが保証される。
 
-### 案 C: reconfigure() で pending_store を drain（明示エラー通知）
+### 設計判断の根拠
 
-Reset を呼ぶ前に `pending_store` を drain し、各 user_data に対して `MFX_ERR_ABORTED` 相当のエラーを通知する。
+**案 A（finish() で drain）を採用しない理由**:
 
-- 長所: 待たずに reconfigure できる。
-- 短所: 「reconfigure したら未処理フレームが失われる」挙動が非直感的。
+- `finish()` は EOS 信号を VPL に送る。EOS 後の Reset → encode() 再開は VPL 仕様で保証されていない（未検証の VPL 挙動に依存する）
+- `finish()` が Err を返した場合、EOS が部分的に送られた状態で Reset を呼べず、Encoder が回復不能になる
+- `finish()` は全 pending の Sync 完了 + コールバック完了を待つため、reconfigure が長時間ブロックする（数百 ms〜数秒）。動的パラメータ変更として不相応な待機時間になる
+- `finish()` の成功後に Reset が失敗した場合も Encoder が動作不能になる（EOS 済み、Reset 失敗）が、このケースへの対処がない
 
-推奨は **案 A**。ユーザーが reconfigure を呼ぶユースケース（ビットレート動的変更）では、既存フレームの完了を待つのが自然。
+**本方式の特徴**:
+
+- VPL に依存せず pending_store のみを操作するため、Reset 前後で Encoder の状態が破壊されない
+- Reset 失敗時も pending は drain 済みだが Encoder 自体は再利用可能（Drop + 再作成は不要）
+- pending はエラー通知されるため、データ消失が呼び出し側に伝わる
+- フレームロスを伴うが、`MFXVideoENCODE_Reset` 自体が VPL 内部フレームを破棄する仕様である以上、フレームロスは不可避
+
+### ブロッキング挙動
+
+本方式では `finish()` を呼ばないため、reconfigure は Sync 完了を待たずに即座にリターンする。既存の挙動と一致する。
+
+### reconfigure の doc 更新
+
+以下の内容を reconfigure の doc に追記する:
+
+- `MFXVideoENCODE_Reset` が VPL 内部の未出力フレームを破棄すること
+- 破棄されたフレームに対応する user_data は `MFX_ERR_ABORTED` としてハンドラに通知されること
+- frame_seq は reconfigure 後も継続しリセットされないこと
 
 ## 完了条件
 
 以下すべてを満たす。
 
-1. `Encoder::reconfigure` の実装が上記いずれかの案で修正される。案 A の場合、reconfigure の doc に「既存 pending が全て完了してから Reset を実行する」旨を明記する。
-2. reconfigure 後に `encode()` した結果の user_data が、reconfigure 前の frame_seq と衝突せず正しく対応付くことを検証するテストを追加する（実 GPU 依存で `tests/test_roundtrip.rs`）。
-3. `finish()` 経由の「pending frames remained」エラーが reconfigure 起因で発生しないことを確認する。
-4. `CHANGES.md` の `## develop` に `[FIX]` として追記する。
+1. `WorkerCommand` enum に `DrainPending` バリアントを追加し、Worker 側で `pending_store.drain_all()` + 全エントリ `canceled_error()` 通知を行う。
+2. `Encoder::reconfigure` が Reset 直前に `WorkerCommand::DrainPending` を送信するよう修正する。
+3. reconfigure の doc に、Reset の副作用（VPL 内部フレーム破棄、対応する user_data のエラー通知、frame_seq 継続）を明記する。
+4. reconfigure の前後で encode した全フレームの user_data が、reconfigure 前のフレームはエラー通知、reconfigure 後のフレームは正常通知されることを検証するテストを `tests/test_roundtrip.rs` に追加する。テストは encode → reconfigure → encode → finish のシーケンスで検証する。
+5. `CHANGES.md` の `## develop` に `[FIX]` として追記する。
 
 ## 影響範囲
 
-- `src/encode.rs`（`Encoder::reconfigure`）
-- `tests/test_roundtrip.rs`（reconfigure のラウンドトリップテスト。実 GPU 依存）
+- `src/encode.rs`（`WorkerCommand` enum に `DrainPending` 追加、`run_sync_worker` の `DrainPending` アーム追加、`Encoder::reconfigure` に `DrainPending` 送信追加、reconfigure の doc 更新）
+- `tests/test_roundtrip.rs`（reconfigure 前後の user_data 検証テスト追加、実 GPU 依存）
 - `CHANGES.md`
 
 ## 参考
 
-- `/review-code` の致命的指摘 F4
-- 関連 issue: 0011（reconfigure が ExtParam を送らない別問題）
+- 関連 issue: 0011（reconfigure が ExtParam を送らない別問題。reconfigure の修正順序に注意）
+- `canceled_error()`: `src/encode.rs:1429-1436`
