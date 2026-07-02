@@ -4,7 +4,7 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/refactor-unify-codec-and-profile-types
-- Polished: 2026-07-01
+- Polished: 2026-07-02
 
 ## 目的
 
@@ -92,6 +92,14 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 
 次のリリースで `[CHANGE]` として一括置き換え（`#[deprecated]` は残さない）。vpl-rs は破壊的変更を積極的に行う方針であり、deprecated を残すコストのほうが高い。
 
+### プロファイル型の所属モジュール
+
+統合後のプロファイル型（`H264Profile` 等）は `src/encode.rs` に残す。`src/codec_info.rs` の `EncodingProfiles` は `H264Profile` 等を `use crate::encode::H264Profile` で参照する。`encode` モジュールと `codec_info` モジュール間の新たな依存が発生するが、現状でも `codec_info.rs` は `sys` 経由で VPL 実装に依存しており、実質的な結合度の増加は限定的。
+
+### `DecoderConfig` の `#[non_exhaustive]` 削除
+
+shiguredo-rust 規約は「`#[non_exhaustive]` を使わないこと」と定めている。`DecoderConfig` (`src/decode.rs:37`) に付与されている `#[non_exhaustive]` を本リファクタのタイミングで削除する。フィールド型変更と同時に規約違反も解消する。
+
 ## 完了条件
 
 以下すべてを満たす。
@@ -99,7 +107,7 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 1. `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` を crate 全体で再利用する。
 2. `EncodingProfiles::H264(Vec<H264Profile>)` などに置き換わる。
 3. `codec_profile()` と `query_encoding_profiles()` が共通の写像を使う（`impl H264Profile { fn to_mfx_profile(self) -> u32 ... fn from_mfx_profile(id: u32) -> Option<Self> ... }` などのメソッド化）。
-4. `DecoderCodec` を削除し、`DecoderConfig::codec: VideoCodecType` に変更する。
+4. `DecoderCodec` を削除し、`DecoderConfig::codec: VideoCodecType` に変更する。あわせて `DecoderConfig` の `#[non_exhaustive]` を削除する（shiguredo-rust 規約違反の解消）。
 5. `src/lib.rs` の `pub use` を新型に合わせて更新する。
 6. `tests/test_roundtrip.rs` を新型に追随させる。
 7. `README.md` / `SKILL.md` の型名参照を更新する。
