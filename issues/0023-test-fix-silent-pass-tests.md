@@ -2,10 +2,9 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-silent-pass-tests
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -102,14 +101,19 @@ fn test_list_adapters_sorted_and_deduped() {
 
 以下いずれか。
 
-#### 案 A: `tests/test_vpl.rs` に移動 + `#[cfg(intel_vpl)]`（推奨）
+#### 案 A: `#[cfg(intel_vpl)]` を付与し 5 シナリオに分割（推奨）
 
-- `src/vpl.rs:440-538` の `#[cfg(test)] mod tests` から `frame_surface_gpu_required` を切り出し、`tests/test_vpl.rs` を新設して移動する
-- `#[cfg(intel_vpl)]` を付けて、`INTEL_VPL=1` のときのみコンパイル / 実行される
-- 5 個の検証シナリオを個別の `#[test]` 関数に分割する（各シナリオ独立）
-- silent early-return は削除し、実機テストなので前提が満たされないなら `panic!("...")` で明示失敗させる（あるいは `#[cfg(intel_vpl)]` 適用済みなので前提は必ず満たされる）
+- `frame_surface_gpu_required` は `src/vpl.rs` 内に留める（`VplLibrary` / `FrameSurface` / `Session` は `pub(crate)` であり `tests/` からはアクセス不能）。
+- `#[cfg(intel_vpl)]` を付けて、`INTEL_VPL=1` のときのみコンパイル/実行されるようにする。
+- 5 個の検証シナリオを個別の `#[test]` 関数に分割する（各シナリオ独立）。
+- silent early-return は全て削除し、前提が満たされないなら `expect("reason")` で明示失敗させる。各テストは `cargo test -- --test-threads=1` の制約下で動作するよう、共通セットアップヘルパーを使う。
 
-`frame_surface_new_rejects_null` は GPU 非依存なので `src/vpl.rs` に残す。
+分割後のテスト関数:
+1. `frame_surface_map_write_unmap_drop_succeeds` — 正常系
+2. `frame_surface_double_map_write_fails` — 二重 map_write
+3. `frame_surface_double_map_read_fails` — 二重 map_read
+4. `frame_surface_double_unmap_fails` — 二重 unmap
+5. `frame_surface_unmapped_unmap_fails` — unmapped での unmap
 
 #### 案 B: 現状維持 + assert 追加
 
@@ -139,23 +143,20 @@ silent return を全て assert に置き換える。
 
 以下すべてを満たす。
 
-1. `src/vpl.rs::frame_surface_gpu_required` を `tests/test_vpl.rs` に移動し、`#[cfg(intel_vpl)]` を付ける。
-2. 移動時に 5 シナリオを個別の `#[test]` に分割する。
-3. silent early-return を全て削除し、失敗時は `panic!` する（`#[cfg(intel_vpl)]` により前提が満たされる）。
-4. `tests/test_adapter.rs::test_list_adapters_sorted_and_deduped` を `#[cfg(intel_vpl)]` に移動するか、空 Vec で失敗する assert を追加する。
-5. `ci` ジョブ (`cargo test --lib`) で `frame_surface_gpu_required` が対象外になることを確認する（issue 0022 と併せて）。
-6. `test-intel-vpl` ジョブ（実機、`INTEL_VPL=1`）でこれらのテストが実行されることを確認する。
-7. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する。
+1. `src/vpl.rs::frame_surface_gpu_required` に `#[cfg(intel_vpl)]` を付与し、5 シナリオを個別の `#[test]` 関数に分割する（共通セットアップヘルパーを使用）。
+2. silent early-return を全て削除し、失敗時は `expect("reason")` で原因を残す（`panic!` ではなく）。
+3. `tests/test_adapter.rs::test_list_adapters_sorted_and_deduped` に `assert!(!adapters.is_empty(), "Intel HW アダプタが列挙されない")` を追加し、空 Vec での自動パスを防止する。
+4. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する。
+5. 実装後に `test-intel-vpl` ジョブ（`INTEL_VPL=1`）で全テストが pass することを確認する。
 
 ## 影響範囲
 
-- `src/vpl.rs`（`frame_surface_gpu_required` 削除）
-- `tests/test_vpl.rs`（新規、シナリオ 5 個の分割テスト）
-- `tests/test_adapter.rs`（`test_list_adapters_sorted_and_deduped` の cfg 変更）
-- `.github/workflows/ci.yml`（issue 0022 と統合）
+- `src/vpl.rs`（`frame_surface_gpu_required` の cfg 追加 + シナリオ分割）
+- `tests/test_adapter.rs`（`test_list_adapters_sorted_and_deduped` に空チェック assert 追加）
 - `CHANGES.md`
+
+注: `tests/test_vpl.rs` は作成不要。`VplLibrary` / `FrameSurface` / `Session` は `pub(crate)` のため `tests/` からアクセスできない。
 
 ## 参考
 
-- `/review-code` の致命的指摘 F16
 - 関連 issue: 0022（ci ジョブが cargo test 未実行）、0021（PBT/Fuzz と workspace 構成）
