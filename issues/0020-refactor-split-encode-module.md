@@ -2,10 +2,9 @@
 
 - Priority: Medium
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/refactor-split-encode-module
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -69,18 +68,17 @@ Medium。以下による。
 - `src/encode/handler.rs` — `EncodeHandler` / `FnEncodeHandler` / `EncodedFrame` / `EncoderStats` / `PictureType`
 - `src/encode/worker.rs` — `PendingFrame` / `SyncData` / `SyncedBitstream` / `PendingFrameStore` / `WorkerCommand` / `run_sync_worker` / `sync_and_*` 系
 - `src/encode/encoder.rs` — `Encoder<H>` 本体
-- `src/encode/mfx_param.rs` — `codec_id` / `codec_profile` / `align_up` / `EncoderConfig` → `mfxVideoParam` 変換ヘルパー
+- `src/encode/mfx_param.rs` — `codec_id` / `codec_profile` / `align_up` / `picture_type_from_frame_type` / エラーヘルパー関数群（`mismatched_timestamp_error` / `finish_pending_error` / `canceled_error`）/ `EncoderConfig` → 初期 `mfxVideoParam` 変換ヘルパー
 
 ### `Encoder::new` の関数分割
 
 `Encoder::new` 内部を以下に分割:
 
 - `EncoderConfig::to_mfx_frame_info(&self) -> Result<sys::mfxFrameInfo, Error>` — 寸法検証 + mfxFrameInfo 組立
-- `EncoderConfig::to_mfx_video_param(&self, frame_info: sys::mfxFrameInfo) -> sys::mfxVideoParam` — mfxVideoParam 組立
-- `EncoderConfig::build_ext_buffers(&self) -> ExtBuffers` — 拡張バッファ組立（issue 0011 の対応時に自然に切り出される）
-- `Encoder::new` — 上記を組み立てて Init → Worker spawn
+- `EncoderConfig::to_mfx_video_param(&self, frame_info: sys::mfxFrameInfo) -> Result<sys::mfxVideoParam, Error>` — 初期 mfxVideoParam 組立（`Init` 前のパラメータ）
+- `EncoderConfig::build_ext_buffers(&self) -> ExtBuffers` — 拡張バッファ組立。`ExtBuffers` はローカル変数として使用し、`Init` 後は即破棄する（`Encoder` のフィールドとして保持しない）。
 
-unsafe block も適切なサイズに分割し、SAFETY コメントを個別に付ける。
+`Encoder::new` はこれらを組み立てて `Init` → `GetVideoParam`（実効パラメータ取得）→ Worker spawn を行うグルーコードになる。分割後の行数は自然に 50-80 行程度になる。
 
 ### 公開 API の維持
 
@@ -91,7 +89,7 @@ unsafe block も適切なサイズに分割し、SAFETY コメントを個別に
 以下すべてを満たす。
 
 1. `src/encode.rs` (単一ファイル) を `src/encode/mod.rs` + 上記 5 サブモジュールに分割する。
-2. `Encoder::new` を 100 行以下に整理する（内部を config.rs / mfx_param.rs のヘルパーに委譲）。
+2. `Encoder::new` をグルーコード化し、`config.rs` / `mfx_param.rs` のヘルパーに委譲する。
 3. `Encoder::new` 内の unsafe block を最小単位に分割し、それぞれに SAFETY コメントを付ける。
 4. `src/lib.rs` の `pub use` を更新して既存 API パス（`shiguredo_vpl::Encoder` など）を維持する。
 5. 既存のラウンドトリップテスト全てが pass する。
@@ -111,5 +109,4 @@ unsafe block も適切なサイズに分割し、SAFETY コメントを個別に
 
 ## 参考
 
-- `/review-code` の致命的指摘 F13
 - SKILL.md L383「破壊的変更を積極的に行う」（内部モジュール分割で公開 API パスは維持する）
