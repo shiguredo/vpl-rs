@@ -2,10 +2,9 @@
 
 - Priority: Medium
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
-- Branch: feature/fix-readme-input-format-mismatch
-- Polished: {YYYY-MM-DD}
+- Branch: feature/doc-fix-readme-input-format-mismatch
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -94,5 +93,4 @@ Nv12 / Yuy2 / Bgra の 3 種のみ。
 
 ## 参考
 
-- `/review-code` の致命的指摘 F10
 - 関連 issue: 0016（`docs/INTEL_VPL.md` にも同じ齟齬あり）
