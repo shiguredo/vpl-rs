@@ -4,11 +4,11 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/fix-frame-surface-drop-silent-errors
-- Polished: 2026-07-01
+- Polished: 2026-07-02
 
 ## 目的
 
-`FrameSurface::Drop` が `mfxFrameSurfaceInterface::Unmap` / `Release` の失敗を完全に silent に潰しているため、VPL 内部の参照カウンタが壊れる、または map 状態のまま release して二重 free / use-after-free / GPU リソースリークが発生した場合に、原因追跡ができない。少なくとも観測可能にして、致命的な状態遷移を早期に検出できるようにする。
+`FrameSurface::Drop` が `mfxFrameSurfaceInterface::Unmap` / `Release` の失敗を完全に silent に潰しているため、VPL 内部の参照カウンタが壊れる、または map 状態のまま release して二重 free / use-after-free / GPU リソースリークが発生した場合に、原因追跡ができない。Drop 内のエラーを観測可能にし、致命的な状態遷移を早期に検出できるようにする。
 
 ## 優先度根拠
 
@@ -16,7 +16,7 @@ High。以下による。
 
 - **リソース破損の隠蔽**: `Release` が失敗した瞬間に VPL 内部の参照カウンタが不整合になる可能性があり、後段で二重 free や use-after-free が起きても Rust 側から見ると「なぜかクラッシュした」以上の情報が得られない。
 - **VPL 特有のリソース管理**: `mfxFrameSurfaceInterface::Release` は VPL のサーフェスプールの参照カウントを操作する API。ここが壊れると、以降のフレーム取得（`MFXMemory_GetSurfaceForEncode`）でプール枯渇や UB を招く。
-- **開発時の検出手段が皆無**: 現在 `debug_assert!` や `eprintln!` すらないため、開発 / CI でも失敗が起きていることが分からない。
+- **過去の設計判断を上回る必要性**: closed issue 0006（unified surface wrapper）および 0007（Session RAII cleanup）では「Drop 内パニック回避のためにエラーを `let _ =` で破棄する」という設計判断がなされた。しかし本 issue はこの判断を覆し、観測性を優先する。`eprintln!` による stderr 出力はパニックせず、Drop 内での安全性を損なわないため、0006/0007 の「パニック回避」という制約は満たしつつ観測性を向上できる。
 
 ## 現状
 
@@ -41,70 +41,82 @@ impl Drop for FrameSurface {
 }
 ```
 
-`let _ = ...` で戻り値を明示的に捨てている。エラーが発生してもログすら出ない。
+### 他の Drop 経路のエラー黙殺
+
+同じパターンが以下にも存在する:
+
+- `src/vpl.rs:433-438` `Session::Drop`: `let _ = self.lib.mfx_close(self.session);`（`mfx_unload` は戻り値が `()` のため対象外）
+- `src/encode.rs:1266-1269` `Encoder::Drop`: `let _ = self.session.lib().mfx_video_encode_close(...);`
+- `src/decode.rs:488-491` `Decoder::Drop`: `let _ = self.session.lib().mfx_video_decode_close(...);`
+
+### Drop 外のエラー黙殺
+
+- `src/decode.rs:593-611` `sync_and_drain`: `let _ = lib.mfx_video_core_sync_operation(...);` および `let _ = frame_surface.map_read();`
+
+### 呼び出し元での安全対策
+
+- `Encoder::encode` (`src/encode.rs:1103-1120`) は `frame_surface.map_write()?` → データコピー → `frame_surface.unmap()?` を明示的に呼び、成功時は `mapped = false` にしてから Drop に任せる。
+- `Decoder::sync_and_callback` (`src/decode.rs:554-587`) は `frame_surface.map_read()?` → データ読み取り → `frame_surface` を Drop に任せる。
+
+正常系では問題は顕在化していないが、異常系（GPU ハング後の cleanup 等）で検知手段がない。
 
 ### 想定される失敗シナリオ
 
 - `Unmap` が失敗した状態のまま `Release` が呼ばれる → VPL 内部でどうなるかは実装依存
-- `Release` の内部参照カウンタが 0 未満になろうとするケース（複数箇所から Release が呼ばれた実装バグ）
-- サーフェスの内部状態が想定外（例: すでに Release 済みの handle を再度 Release する）
-
-### Session / Drop 経路との比較
-
-`src/vpl.rs:433-438` の `Session::Drop` も `let _ = self.lib.mfx_close(self.session);` で silent。同じ問題を持つが、Session は Encoder / Decoder のライフタイム末尾で 1 回だけ Drop されるため頻度は低い。FrameSurface は 1 フレームごとに Drop されるので、失敗の影響が広範囲。
-
-### 呼び出し元での安全対策
-
-- `Encoder::encode` (`src/encode.rs:1103-1120`) は `frame_surface.map_write()?` → データコピー → `frame_surface.unmap()?` を明示的に呼び、成功時は `mapped = false` にしてから Drop に任せる（Release のみ実行される）。
-- `Decoder::sync_and_callback` (`src/decode.rs:554-587`) は `frame_surface.map_read()?` → データ読み取り → `frame_surface` を Drop に任せる（Unmap + Release が実行される）。
-
-正常系はテストで pass しているので、当面の実運用で問題にはなっていない可能性がある。しかし異常系（例: GPU ハング後の cleanup）で問題が起きても検知できない。
+- `Release` の内部参照カウンタが 0 未満になろうとするケース
+- すでに Release 済みの handle を再度 Release する
 
 ## 設計方針
 
-### 案 A: eprintln! でログ出力（推奨）
+**eprintln! で失敗を stderr に出力する。**
 
-Drop で失敗したら `eprintln!("[vpl-rs] mfxFrameSurfaceInterface::Release failed: status={}", status)` を出す。
+Drop 内で panic しない制約（Rust 標準の非推奨事項、0006/0007 の判断根拠）を守りつつ、エラー情報を失わないために `eprintln!` を用いる。本 crate は `[dependencies]` が空であり、`log` crate や `tracing` の導入は別 issue で検討する（`shiguredo-rust` スキルは `tracing` の使用を推奨しているが、依存ゼロ方針とのトレードオフ判断が必要なため）。
 
-- 長所: 実装コスト最小。テストや実運用で発生したら stderr で観測できる。
-- 短所: `log` crate を使っていないため、アプリ側でログルーティングを制御できない。ただし本 crate は `[dependencies]` が空で、外部ログ crate を導入する方針かどうかは別 issue とする。
+### 出力フォーマット
 
-### 案 B（不採用）: debug_assert! で開発時検出
+全箇所で統一したフォーマットを使用する:
 
-`debug_assert!` は Drop 内で panic すると二重パニック（別の panic の unwind 中に Drop が走った場合）により即座に process abort するリスクがある。Rust の標準ドキュメントでも Drop 内での panic は強く非推奨。このため不採用とする。
+```
+[vpl-rs] <関数名> failed: status=<ステータス値>
+```
 
-### 案 C（不採用）: FrameSurface に `debug_check` の外部 API を追加
+具体例:
 
-既存 API の変更が必要で実装コストに見合わない。
+- `[vpl-rs] mfxFrameSurfaceInterface::Unmap failed: status=-1`
+- `[vpl-rs] mfxFrameSurfaceInterface::Release failed: status=-1`
+- `[vpl-rs] MFXClose failed: status=-1`
+- `[vpl-rs] MFXVideoENCODE_Close failed: status=-1`
+- `[vpl-rs] MFXVideoDECODE_Close failed: status=-1`
+- `[vpl-rs] MFXVideoCORE_SyncOperation failed: status=-1`（sync_and_drain 内）
 
-推奨は **案 A** 単独。将来的に `log` crate を導入するなら `log::warn!` に切り替える。
+### Unmap 失敗後も Release を続行する
 
-### 併せて対応: Session::Drop も同じ扱い
+`Unmap` が失敗しても `Release` を続行するのは意図的な設計である。Unmap 失敗の原因が VPL 内部の一時的なエラーである可能性があるため、Release をスキップするとサーフェスリークが確定的に発生する。続行してエラーを観測可能にすることで、失敗の発生を検知しつつ、可能な限りリソースを解放する。
 
-`src/vpl.rs:433-438` の `Session::Drop` の `MFXClose` 失敗も同じパターンで観測可能にする。
+### sync_and_drain のエラー黙殺対応
 
-### 併せて対応: Encoder::Drop / Decoder::Drop も同じ扱い
+`src/decode.rs:603-610` の `sync_and_drain` 内の SyncOperation と Map のエラー黙殺も本 issue で対応する。同期関数内の `let _ =` であり Drop ではないが、同じ問題パターンであるため。
 
-`src/encode.rs:1266-1269` の `mfx_video_encode_close` 失敗、`src/decode.rs:488-491` の `mfx_video_decode_close` 失敗も同じ扱い。
+### Encoder::Drop / Decoder::Drop でエラー後も続行することの妥当性
+
+`mfx_video_encode_close` / `mfx_video_decode_close` 失敗後も `Session::Drop` で `MFXClose` + `MFXUnload` が走る。VPL の仕様上、Close 失敗後の MFXClose 呼び出しが安全かは明示されていないが、現行コードの挙動を変更するわけではなく、観測性を追加するだけであるため本 issue ではこの順序を維持する。
 
 ## 完了条件
 
 以下すべてを満たす。
 
-1. `FrameSurface::Drop` の `Unmap` / `Release` 失敗が `eprintln!` で観測可能になる。
-2. `Session::Drop` / `Encoder::Drop` / `Decoder::Drop` も `eprintln!` で同様に観測可能にする。
-3. `Encoder::stop_worker` / `Decoder::stop_worker` 内の `let _ = worker_tx.send(Stop)` および `let _ = handle.join()` のエラー黙殺も `eprintln!` で観測可能にする。
-4. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する（バグ修正ではなく観測性改善）。
+1. `FrameSurface::Drop` の `Unmap` / `Release` 失敗を `eprintln!` で観測可能にする。フォーマットは `[vpl-rs] mfxFrameSurfaceInterface::Unmap failed: status={}` など。
+2. `Session::Drop` の `MFXClose` 失敗を同様に `eprintln!` で観測可能にする。
+3. `Encoder::Drop` の `mfx_video_encode_close` 失敗を同様に `eprintln!` で観測可能にする。
+4. `Decoder::Drop` の `mfx_video_decode_close` 失敗を同様に `eprintln!` で観測可能にする。
+5. `sync_and_drain`（`src/decode.rs:603-610`）の `SyncOperation` / `map_read` 失敗を同様に `eprintln!` で観測可能にする。
+6. `CHANGES.md` の `## develop` に `[FIX]` として「Drop / drain 経路での VPL API エラー黙殺を eprintln! 出力に変更」を追記する（バグ修正）。
 
 注: 異常系 Drop テスト（Release 失敗を強制するテスト）は、`AGENTS.md` の「モック禁止」下では実装不能のため実施しない。正常系（Drop が panic しないこと）は既存テストで担保されている。
 
 ## 影響範囲
 
-- `src/vpl.rs`（`FrameSurface::Drop` / `Session::Drop`）
-- `src/encode.rs`（`Encoder::Drop`）
-- `src/decode.rs`（`Decoder::Drop`）
+- `src/vpl.rs`（`FrameSurface::Drop`: Unmap / Release の `let _ =` → `eprintln!`、`Session::Drop`: MFXClose の `let _ =` → `eprintln!`）
+- `src/encode.rs`（`Encoder::Drop`: mfx_video_encode_close の `let _ =` → `eprintln!`）
+- `src/decode.rs`（`Decoder::Drop`: mfx_video_decode_close の `let _ =` → `eprintln!`、`sync_and_drain`: SyncOperation / map_read の `let _ =` → `eprintln!`）
 - `CHANGES.md`
-
-## 参考
-
-- 将来的な `log` crate 導入の是非は別 issue で議論
