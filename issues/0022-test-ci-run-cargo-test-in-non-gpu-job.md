@@ -2,10 +2,9 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-ci-run-cargo-test-in-non-gpu-job
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -124,13 +123,15 @@ Linux ホストで GPU なしでもコンパイル・実行できるテスト:
 
 以下すべてを満たす（段階 1）。
 
-1. `.github/workflows/ci.yml` の `ci` ジョブに `cargo test --lib` ステップを追加する。
-2. `cargo test --lib` が Ubuntu 22.04 / 24.04 の両方で pass する。
-3. `--workspace` オプションを削除する（単一クレート構成のため冗長）。
-4. `.github/workflows/ci.yml` の `slack_notify` の `needs` に変更なし（`ci` ジョブに含まれるため）。
-5. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する。
+前提: issue 0023（silent pass テスト修正）が完了していること。`frame_surface_gpu_required` に `#[cfg(intel_vpl)]` が付与済みであること。
 
-段階 2 の完了条件は issue 0023 とセットで扱う。
+1. `.github/workflows/ci.yml` の `ci` ジョブに `cargo test --lib` ステップを追加する（`cargo clippy` の後が適切）。
+2. `cargo test --lib` が Ubuntu 22.04 / 24.04 の両方で pass する。
+3. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する。
+
+注: `--workspace` オプションの削除は issue 0021（workspace 化）の進捗に依存するため本 issue のスコープ外とする。
+
+段階 2 の完了条件（`cargo test` 全体の CI 組み込み）は issue 0023 の完了後に別途検討する。
 
 ## 影響範囲
 
@@ -144,6 +145,5 @@ Linux ホストで GPU なしでもコンパイル・実行できるテスト:
 
 ## 参考
 
-- `/review-code` の致命的指摘 F15
 - CLAUDE.md「Don't live with broken windows」「If it hurts, do it more often」
 - 関連 issue: 0023（silent pass テスト）、0021（PBT/Fuzz と workspace 構成）
