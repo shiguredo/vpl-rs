@@ -2,10 +2,9 @@
 
 - Priority: Medium
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/refactor-unify-codec-and-profile-types
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -84,27 +83,14 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 
 ### コーデック識別型統合
 
-`VideoCodecType` を crate 全体で共有する識別子として位置付ける。
+`VideoCodecType` を crate 全体で共有する識別子として位置付ける。`VideoCodecType::to_codec_id()` は `#[cfg(target_os = "linux")]` でゲートされているため、`DecoderConfig::codec: VideoCodecType` に変更する際にこのゲートを外すか、非 Linux 向けの `to_codec_id()` を追加する必要がある。
 
-- `DecoderCodec` を削除し、`DecoderConfig::codec: VideoCodecType` にする
-- `CodecConfig` は `EncoderCodecConfig`（あるいは `CodecEncodeConfig`）に改名し、「コーデック識別 + エンコード固有設定」という位置付けを明示
-
-または、`CodecConfig` はそのまま残して `CodecConfig` の中身を `VideoCodecType` と `H264EncoderConfig` などに分解する案もある（例: `pub struct CodecConfig { pub codec: VideoCodecType, pub h264: Option<H264EncoderConfig>, ... }`）。
-
-推奨は前者（`CodecConfig` を `EncoderCodecConfig` に改名）。「エンコード時のコーデック設定」であることが名前で分かる。
+- `DecoderCodec` を削除し、`DecoderConfig::codec: VideoCodecType` にする。
+- `CodecConfig` はそのままの名前を維持する（`encode` モジュールに属しており文脈からエンコード用であることは自明。改名しても test_roundtrip.rs の数十箇所の修正コストに見合わない）。
 
 ### 段階的移行
 
-破壊的変更のため、以下の 2 段階で進める案:
-
-1. 統合後の型を追加し、`#[deprecated]` で旧型を残す（1 マイナー版）
-2. 次のマイナー版で旧型を削除
-
-または一括で置き換える案（SKILL.md L383 の方針に従い、こちらのほうが自然）:
-
-- 次のリリース（2026.4.0 想定）で `[CHANGE]` として一括置き換え
-
-推奨は **一括置き換え**。vpl-rs は破壊的変更を積極的に行う方針であり、`#[deprecated]` を残すコストのほうが高い。
+次のリリースで `[CHANGE]` として一括置き換え（`#[deprecated]` は残さない）。vpl-rs は破壊的変更を積極的に行う方針であり、deprecated を残すコストのほうが高い。
 
 ## 完了条件
 
@@ -114,11 +100,10 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 2. `EncodingProfiles::H264(Vec<H264Profile>)` などに置き換わる。
 3. `codec_profile()` と `query_encoding_profiles()` が共通の写像を使う（`impl H264Profile { fn to_mfx_profile(self) -> u32 ... fn from_mfx_profile(id: u32) -> Option<Self> ... }` などのメソッド化）。
 4. `DecoderCodec` を削除し、`DecoderConfig::codec: VideoCodecType` に変更する。
-5. `CodecConfig` を必要に応じて改名する（推奨: `EncoderCodecConfig`）。
-6. `src/lib.rs` の `pub use` を新型に合わせて更新する。
-7. `tests/test_roundtrip.rs` を新型に追随させる。
-8. `README.md` / `SKILL.md` の型名参照を更新する。
-9. `CHANGES.md` の `## develop` に `[CHANGE]` として破壊的変更を明記する。
+5. `src/lib.rs` の `pub use` を新型に合わせて更新する。
+6. `tests/test_roundtrip.rs` を新型に追随させる。
+7. `README.md` / `SKILL.md` の型名参照を更新する。
+8. `CHANGES.md` の `## develop` に `[CHANGE]` として破壊的変更を明記する。
 
 ## 影響範囲
 
@@ -134,6 +119,5 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 
 ## 参考
 
-- `/review-code` の致命的指摘 F11
 - SKILL.md L383「良い設計のためには破壊的変更を積極的に行う」
 - 過去の破壊的変更例: 2026.3.0 の Encoder/Decoder ハンドラー方式化（CHANGES.md L27-49）
