@@ -2,10 +2,9 @@
 
 - Priority: Medium
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
-- Branch: feature/refactor-remove-outdated-intel-vpl-md
-- Polished: {YYYY-MM-DD}
+- Branch: feature/doc-remove-outdated-intel-vpl-md
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -83,6 +82,5 @@ include = ["/build.rs", "/src/**", "LICENSE", "README.md"]
 
 ## 参考
 
-- `/review-code` の致命的指摘 F9 と削除候補（大）の 1 件目
 - 代替: `skills/shiguredo-vpl/SKILL.md`
 - CHANGES.md `## 2026.3.0` のリファクタ内容
