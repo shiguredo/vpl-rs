@@ -4,7 +4,7 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/fix-non-linux-cfg-guard-inconsistency
-- Polished: 2026-07-01
+- Polished: 2026-07-02
 
 ## 目的
 
@@ -86,7 +86,7 @@ compile_error!("shiguredo_vpl requires Linux x86_64. Non-Linux targets are not s
 ### `list_adapters` の非 Linux 実装をどうするか
 
 - **案 A 採用**: `list_adapters` の非 Linux 実装も削除する（crate 全体が拒否されるので不要）。
-- 現状の空 `Vec` を返す実装は、`docs.rs` のドキュメント生成に必要な最小限の実装として残してもよい（`DOCS_RS=1` を利用する場合）。ただし `docs.rs` は Linux で回すため実質不要。
+- `codec_info.rs` の非 gated 型定義（`VideoCodecType`, `CodecInfo` 等）は `sys` 型に依存しない純粋データ型であり、`compile_error!` 導入後はモジュールごと到達不能になるため影響なし。cfg 追記は不要。
 
 `docs.rs` 対応は `build.rs:57-60` の `if std::env::var("DOCS_RS").is_ok()` で処理しており、bindings.rs は生成されるので、案 A 採用時も docs.rs ビルドは通る（Linux 上で）。
 
@@ -101,9 +101,8 @@ compile_error!("shiguredo_vpl requires Linux x86_64. Non-Linux targets are not s
 
 ## 影響範囲
 
-- `src/lib.rs`（`compile_error!` 追加、モジュール宣言）
+- `src/lib.rs`（`compile_error!` 追加）
 - `src/adapter.rs`（非 Linux 版 `list_adapters` 削除）
-- `README.md`（Linux 専用の強調）
 - `CHANGES.md`
 
 ## 参考
