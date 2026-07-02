@@ -4,7 +4,7 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/fix-silent-pass-tests
-- Polished: 2026-07-01
+- Polished: 2026-07-02
 
 ## 目的
 
@@ -106,7 +106,7 @@ fn test_list_adapters_sorted_and_deduped() {
 - `frame_surface_gpu_required` は `src/vpl.rs` 内に留める（`VplLibrary` / `FrameSurface` / `Session` は `pub(crate)` であり `tests/` からはアクセス不能）。
 - `#[cfg(intel_vpl)]` を付けて、`INTEL_VPL=1` のときのみコンパイル/実行されるようにする。
 - 5 個の検証シナリオを個別の `#[test]` 関数に分割する（各シナリオ独立）。
-- silent early-return は全て削除し、前提が満たされないなら `expect("reason")` で明示失敗させる。各テストは `cargo test -- --test-threads=1` の制約下で動作するよう、共通セットアップヘルパーを使う。
+- silent early-return を全て削除し、前提が満たされないなら `assert!` で明示失敗させる。各テストは `cargo test -- --test-threads=1` の制約下で動作するよう、共通セットアップヘルパーを使う。
 
 分割後のテスト関数:
 1. `frame_surface_map_write_unmap_drop_succeeds` — 正常系
@@ -144,7 +144,7 @@ silent return を全て assert に置き換える。
 以下すべてを満たす。
 
 1. `src/vpl.rs::frame_surface_gpu_required` に `#[cfg(intel_vpl)]` を付与し、5 シナリオを個別の `#[test]` 関数に分割する（共通セットアップヘルパーを使用）。
-2. silent early-return を全て削除し、失敗時は `expect("reason")` で原因を残す（`panic!` ではなく）。
+2. silent early-return を全て削除し、失敗時は `assert!(!adapters.is_empty(), "reason")` など `assert!` で原因を残す。
 3. `tests/test_adapter.rs::test_list_adapters_sorted_and_deduped` に `assert!(!adapters.is_empty(), "Intel HW アダプタが列挙されない")` を追加し、空 Vec での自動パスを防止する。
 4. `CHANGES.md` の `## develop` に `[UPDATE]` として追記する。
 5. 実装後に `test-intel-vpl` ジョブ（`INTEL_VPL=1`）で全テストが pass することを確認する。
