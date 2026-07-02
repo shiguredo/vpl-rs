@@ -2,10 +2,9 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-decoder-device-busy-infinite-retry
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
@@ -47,7 +46,7 @@ if status == sys::mfxStatus_MFX_WRN_DEVICE_BUSY {
 }
 ```
 
-`finish()` の drain ループも同じく上限なし。`Decoder::finish` は「コールバックが呼び出され終わるまでブロックする」契約（`src/decode.rs:405-407`）なので、BUSY が返り続けると `finish` 呼び出しが永久にブロックし、Drop から抜けることもできない。
+`finish()` の drain ループも同じく上限なし。`Decoder::finish` は「コールバックが呼び出され終わるまでブロックする」契約 (`src/decode.rs:405-407`) なので、BUSY が返り続けると `finish` 呼び出しが永久にブロックし、Drop から抜けることもできない。
 
 ### MORE_SURFACE の CPU 100% スピン
 
@@ -83,7 +82,7 @@ Err(Error::new_custom(
 ))
 ```
 
-Decoder は同じ設計を採用すべき。
+Decoder は同じ設計を採用すべき。なお Encoder 側の `encode_frame_async` は `MORE_SURFACE` を含む全ステータスを `status != MFX_ERR_NONE` で一括エラーにしており、Decoder の MORE_SURFACE 即エラー化と方針が一致する。
 
 ### SKILL.md の記述との齟齬
 
@@ -91,31 +90,32 @@ Decoder は同じ設計を採用すべき。
 
 ## 設計方針
 
-- Encoder 側と共通の定数を使う。`DEVICE_BUSY_MAX_RETRIES` は `src/vpl.rs` などに公開して encode / decode 双方から参照する、あるいは `decode.rs` で同じ値の定数を宣言する（DRY を取るなら前者）。
-- Decoder 側の 2 箇所（`decode_bitstream` / `finish`）に上限リトライを導入する。
-- 上限超過時は `Error::new_custom("MFXVideoDECODE_DecodeFrameAsync", "device busy after max retries")` を返す。
-- `MORE_SURFACE` にも同じ扱いで上限を掛ける。または「`surface_work=NULL` では `MORE_SURFACE` は発生しない」を仕様として明記し、発生時は即エラーで返す（防御的コードは削除）。
-- 将来の改善として、Encoder / Decoder 双方で指数バックオフに切り替える案は別 issue に切り出す（本 issue は「無限ループを止める」のみに絞る）。
+- **DEVICE_BUSY**: 以下 2 箇所に Encoder と同じ上限リトライ (`30 回`) を導入する。定数は `decode.rs` 内で `const DEVICE_BUSY_MAX_RETRIES: u32 = 30;` を宣言する。Encoder 側の同名定数と値は一致するが、結合度を下げるために意図的に複製する。
+  - `decode_bitstream` の DEVICE_BUSY 分岐
+  - `finish` の drain ループの DEVICE_BUSY 分岐
+- **MORE_SURFACE**: `surface_work=NULL`（VPL 内部割り当て）では本来返らないとされているが、libvpl 仕様では AV1 の `FilmGrain != 0` 時に返る可能性が明記されている。ただし `surface_work=NULL` 時の挙動は確認できていない。上限付きリトライにすると「発生しないはずのコードパス」に複雑さを持ち込むため、`continue` を除去し**発生時は即エラー (`Error::from_mfx`) で返す**。
+  - もし実運用で AV1 FilmGrain によって `MORE_SURFACE` が発生するケースが確認された場合は、後続 issue で上限付きリトライに切り替える。この場合、SKILL.md の「MORE_SURFACE は即エラー」記述も併せて更新する。
+- **`finish` の drain ループ**: 現在 `MORE_SURFACE` の明示的チェックがなく `status < 0` で暗黙に捕捉されている（挙動は `Error::from_mfx` でエラー）。`decode_bitstream` との可読性の一貫性を保つため、`finish` にも `if status == sys::mfxStatus_MFX_ERR_MORE_SURFACE` の明示的分岐を追加する。挙動自体は変更されない。
+- 上限超過時は `Error::new_custom("MFXVideoDECODE_DecodeFrameAsync", "device busy after max retries")` を返す（Encoder 側のメッセージ形式に合わせる）。
+
+### 修正後のエラー復帰に関する注意
+
+`Decoder::decode` は `QueueFrame` を Worker に送信した後で `decode_bitstream` を実行する。本修正により `decode_bitstream` が上限超過で `Err` を返した場合、送信済みの `QueueFrame` が Worker の `pending_values` に残留する。Drop 時は `Stop` で `MFX_ERR_ABORTED` として通知されるが、エラー後も Decoder を再利用する場合、FIFO 順序が破綻する可能性がある。この制限は修正前から存在する設計上の限界であり、本修正では対応しない。
 
 ## 完了条件
 
 以下すべてを満たす。
 
-1. `src/decode.rs` の `decode_bitstream` / `finish` で `MFX_WRN_DEVICE_BUSY` のリトライに上限が導入され、上限超過時は明示的な `Error` を返す。
-2. `MFX_ERR_MORE_SURFACE` の扱いを決め（即エラーまたは上限付きリトライ）、無条件 `continue` を無くす。
-3. リトライ上限の定数は Encoder / Decoder で同じ値を使う（共有または個別宣言でも値は同じ）。
-4. Decoder の Drop 経路が、上限超過エラーで抜けたあと問題なく Worker を join できることを確認する。
-5. リトライ上限に到達したときに `Err` が返ることを検証する単体テストを追加する（`run_sync_worker` の周辺またはモック不要のシナリオで検証可能なもの）。
-6. `CHANGES.md` の `## develop` に `[FIX]` として追記する。
+1. `src/decode.rs` の `decode_bitstream` / `finish` で `MFX_WRN_DEVICE_BUSY` のリトライに上限 (30 回) が導入され、上限超過時は `Error::new_custom(...)` を返す。
+2. `src/decode.rs` の `decode_bitstream` で `MFX_ERR_MORE_SURFACE` の `continue` を除去し、既存の `status < 0` 分岐経由で `Error::from_mfx` により即エラーを返す。
+3. `src/decode.rs` の `finish` の drain ループに `MFX_ERR_MORE_SURFACE` の明示的分岐を追加し、`Error::from_mfx` で即エラーを返す。
+4. `src/decode.rs` に `const DEVICE_BUSY_MAX_RETRIES: u32 = 30;` を宣言する。Encoder 側の同名定数と常に同じ値を維持すること（値変更時は両方を同時に更新する）。
+5. `finish` が上限超過エラーで抜けた後、`Decoder` を Drop した際に `stop_worker` が Worker スレッドを正常に join できること（Worker の `Stop` ハンドラが未消費 `pending_values` を `MFX_ERR_ABORTED` として通知し、スレッドが正常終了する）。
+6. `skills/shiguredo-vpl/SKILL.md:226` の DEVICE_BUSY / MORE_SURFACE の説明に Decoder 側の挙動を追記する（「DEVICE_BUSY は Encoder / Decoder ともに最大 30 回リトライ」「MORE_SURFACE は Encoder / Decoder ともに即エラー」と明記）。
+7. `CHANGES.md` の `## develop` に `[FIX]` として本修正を追記する。
 
 ## 影響範囲
 
-- `src/decode.rs`（`decode_bitstream` / `finish` の 2 箇所のループ）
-- 定数を共有する場合は `src/vpl.rs` または `src/encode.rs` の `DEVICE_BUSY_MAX_RETRIES` 参照
+- `src/decode.rs`（`decode_bitstream`: DEVICE_BUSY リトライ上限追加、MORE_SURFACE 即エラー化。`finish`: DEVICE_BUSY リトライ上限追加、MORE_SURFACE 明示的分岐追加。`DEVICE_BUSY_MAX_RETRIES` 定数宣言）
+- `skills/shiguredo-vpl/SKILL.md`（L226 の DEVICE_BUSY / MORE_SURFACE 説明に Decoder 側の挙動を追記）
 - `CHANGES.md`
-
-## 参考
-
-- `/review-code` の致命的指摘 F1
-- Encoder 側の実装: `src/encode.rs:549, 1174-1198`
-- `SKILL.md:226` の DEVICE_BUSY 説明
