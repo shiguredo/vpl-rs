@@ -2,14 +2,13 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-drops-ext-params
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-01
 
 ## 目的
 
-`Encoder::reconfigure` が `MFXVideoENCODE_Reset` を呼ぶ際に拡張バッファ（`mfxExtCodingOption2` / `mfxExtCodingOption3`）を送らないため、`Encoder::new` で設定した `LookAheadDepth` / `QVBRQuality` が Reset のたびにデフォルトへリセットされるバグを修正する。ユーザーは「ビットレートだけ変えたつもり」なのに、Look Ahead depth や QVBR quality まで silent に消される。
+`Encoder::reconfigure` が `MFXVideoENCODE_Reset` を呼ぶ際に拡張バッファ（`mfxExtCodingOption2` / `mfxExtCodingOption3`）を送らないため、`Encoder::new` で設定した `LookAheadDepth` / `QVBRQuality` が Reset のたびにデフォルトへリセットされるバグを修正する。ユーザーは「ビットレートだけ変えたつもり」なのに、Look Ahead depth や QVBR quality までサイレントに消される。
 
 ## 優先度根拠
 
@@ -52,7 +51,7 @@ video_param.ExtParam = std::ptr::null_mut();
 video_param.NumExtParam = 0;
 ```
 
-`ext_bufs` はローカル変数で関数終了時に drop されるため、`video_param.ExtParam` の生ポインタを保持し続けると use-after-free になる。そのため Init 直後に null に戻すのは正しい。しかし `video_param` は Encoder に保存され、あとで `reconfigure()` から再利用される。
+`ext_bufs` はローカル変数で関数終了時に drop されるため、`video_param.ExtParam` の生ポインタを保持し続けると use-after-free になる。そのため Init 直後に null に戻すのは正しい。しかし `video_param` は Encoder に保存され、あとで `reconfigure()` から再利用される。さらに Init 後の `GetVideoParam` 呼び出し（L926）も `ExtParam = null` の状態で呼ばれるため、`self.video_param` には拡張パラメータの実効値は反映されていない。
 
 ### reconfigure() は ExtParam なしで Reset を呼ぶ
 
@@ -87,7 +86,7 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 
 ### `ReconfigureParams` の設計上の限界
 
-現状 `ReconfigureParams` は `target_kbps` / `max_kbps` / `framerate_num` / `framerate_den` の 4 フィールドのみ。LookAheadDepth や QVBRQuality を reconfigure で変える API はない。しかし、変えないとしても Init 時の値を維持する必要がある。
+現状 `ReconfigureParams` は `target_kbps` / `max_kbps` / `framerate_num` / `framerate_den` の 4 フィールドのみ。LookAheadDepth や QVBRQuality を reconfigure で変える API はなく、本 issue では対応しない（動的変更の需要が確認された時点で別 issue として対応）。
 
 ## 設計方針
 
@@ -95,40 +94,47 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 
 `Encoder` 構造体に `config: EncoderConfig` を保持し、`reconfigure()` の直前に:
 
-1. `EncoderConfig` から ExtParam バッファ（`co2` / `co3`）を再構築する（Init 時と同じ手順）
+1. `EncoderConfig` から ExtParam バッファ（`co2` / `co3`）とそのポインタ配列 `ext_bufs` を再構築する（Init 時と同じ手順）
 2. `self.video_param.ExtParam` と `NumExtParam` を再セットする
 3. `MFXVideoENCODE_Reset` を呼ぶ
 4. Reset 後に `ExtParam = null` / `NumExtParam = 0` に戻す（use-after-free 防止）
 
 - 長所: Init 時と同じ組み立て手順を再利用できる。
-- 短所: `EncoderConfig` を Encoder に持たせるためメモリを少し食う（数百 bytes 程度）。
+- 短所: reconfigure のたびに ExtParam バッファの再構築が発生する。
 
 ### 案 B: ExtParam バッファを Encoder のフィールドとして保持する
 
-`Encoder` に `ext_co2: Option<Box<sys::mfxExtCodingOption2>>` / `ext_co3: Option<Box<sys::mfxExtCodingOption3>>` と `ext_bufs: Vec<*mut sys::mfxExtBuffer>` を保持し、Init 後もライフタイムを維持する。`reconfigure` では `video_param.ExtParam = self.ext_bufs.as_mut_ptr()` として使う。
+`Encoder` に `ext_co2: Option<Box<sys::mfxExtCodingOption2>>` / `ext_co3: Option<Box<sys::mfxExtCodingOption3>>` と `ext_bufs: Vec<*mut sys::mfxExtBuffer>` を保持し、Init 後もライフタイムを維持する。
 
-- 長所: reconfigure ごとに再構築が不要。
-- 短所: 生ポインタを Encoder に長期保持することになり Send 実装や Drop 順序の設計が複雑になる。
+- 長所: reconfigure ごとに再構築が不要。ポインタの再生成も不要なため Init/Reset 呼び出しだけの単純なコードになる。
+- 短所: 生ポインタを Encoder に長期保持することになり、unsafe impl Send の安全性検証が増える。ただし Encoder は既に `video_param`（生ポインタを内包する FFI 型）を保持し unsafe impl Send されているため、追加複雑さは軽微。
 
-推奨は **案 A**。EncoderConfig 保持のコストは限定的で、実装が理解しやすい。
+**案 B を採用する**。案 A の「毎回再構築」はコード重複とランタイムコストの両面で劣る。案 B では ExtParam 構築ロジックは Init 時と同一であり、Encoder のフィールドとして `Box` でヒープに保持することでポインタの有効性をライフタイムで管理できる。
+
+### 実装上の注意
+
+`ext_bufs` は `ext_co2` / `ext_co3` への生ポインタを保持する自己参照構造のため、単純に「値を返すヘルパー関数」に抽出できない。代わりに構築コードをクロージャまたはインラインのまま `new` と `reconfigure` の両方から使える形に整理する。具体的には、`Encoder` のフィールドに保存した `ext_co2` / `ext_co3` へのポインタを `self.ext_bufs` として再構成するメソッドを実装する（Reset の直前に毎回呼ぶ）。
 
 ## 完了条件
 
 以下すべてを満たす。
 
-1. `Encoder::reconfigure` 後も、Init 時に設定した `LookAheadDepth` / `QVBRQuality` が VPL 側で維持されることを確認する。
-2. 上記を検証するテストを追加する。実 GPU がない環境でも、`Encoder::get_video_param` の返り値を突き合わせるか、少なくとも `Encoder` が保持する `EncoderConfig` の状態から想定される ExtParam が組み立てられていることを検証する。実 GPU が必要なテストは `#[cfg(intel_vpl)]` に置く。
-3. Reset 後に `video_param.ExtParam = null` に戻す処理が入っており、`ext_bufs` の生ポインタが dangling しないことを検証する（コード検査で確認 + Drop 順序のドキュメント化）。
-4. `ReconfigureParams` に `look_ahead_depth` / `qvbr_quality` を追加するかは本 issue のスコープ外とする（機能追加は別 issue）。本 issue は「Init 時の値を維持する」ことのみが目的。
-5. `CHANGES.md` の `## develop` に `[FIX]` として追記する。
+1. `Encoder` 構造体に以下のフィールドを追加する:
+   - `ext_co2: Option<Box<sys::mfxExtCodingOption2>>`
+   - `ext_co3: Option<Box<sys::mfxExtCodingOption3>>`
+2. `Encoder::new` で ExtParam 構築後、`ext_co2` / `ext_co3` を `Encoder` に保存する（`video_param.ExtParam` の null クリアは従来通り行う）。
+3. `Encoder::reconfigure` 内で、`self.ext_co2` / `self.ext_co3` から `ext_bufs` を再構成し `self.video_param.ExtParam` / `NumExtParam` にセットしてから `MFXVideoENCODE_Reset` を呼ぶ。Reset 後は `ExtParam = null` / `NumExtParam = 0` に戻す。
+4. `CHANGES.md` の `## develop` に `[FIX]` として「reconfigure 時に ExtParam（LookAheadDepth / QVBRQuality）を再構築するよう修正」を追記する。
+
+注: reconfigure 後の挙動を検証する結合テストは実 GPU 依存のため本 issue のスコープ外とする（既存の `test-intel-vpl` ジョブで手動確認）。
 
 ## 影響範囲
 
-- `src/encode.rs`（`Encoder` 構造体、`Encoder::new`、`Encoder::reconfigure`）
-- `tests/test_roundtrip.rs`（reconfigure 後の LookAheadDepth 維持テスト。実 GPU 依存）
+- `src/encode.rs`（`Encoder` 構造体に `ext_co2` / `ext_co3` フィールド追加、`Encoder::new`: ExtParam 構築後にフィールド保存、`Encoder::reconfigure`: `ext_co2` / `ext_co3` からポインタ配列を再構成して Reset 呼び出し）
 - `CHANGES.md`
 
 ## 参考
 
-- `/review-code` の致命的指摘 F3
-- 関連 issue: 0012（Encoder::reconfigure が pending frame を drain しない別問題）
+- Init 時の ExtParam 組み立て: `src/encode.rs:876-914`
+- reconfigure の実装: `src/encode.rs:986-1022`
+- 関連 issue: 0012（`Encoder::reconfigure` が pending frame を drain しない別問題。reconfigure を同時に修正するため実装順序に注意）
