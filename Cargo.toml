@@ -2,7 +2,7 @@
 name = "shiguredo_vpl"
 version = "2026.4.0-canary.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.93"
 description = "Rust bindings for Intel oneVPL (Video Processing Library)"
 readme = "README.md"
 homepage = "https://github.com/shiguredo/vpl-rs"

@@ -11,6 +11,8 @@
 
 ## develop
 
+- [CHANGE] MSRV (rust-version) を 1.88 から 1.93 に上げる
+  - @voluntas
 - [UPDATE] libvpl を 2.16.0 から 2.17.0 に更新する
   - @voluntas
 
