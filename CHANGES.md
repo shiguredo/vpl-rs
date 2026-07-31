@@ -16,6 +16,11 @@
 - [UPDATE] libvpl を 2.16.0 から 2.17.0 に更新する
   - @voluntas
 
+### misc
+
+- [ADD] CI に ubuntu-26.04 を追加する
+  - @voluntas
+
 ## 2026.3.0
 
 **リリース日**: 2026-06-23
