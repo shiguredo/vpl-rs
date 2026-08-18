@@ -8,7 +8,7 @@ use shiguredo_vpl::{
     AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec,
     DecoderConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler,
     FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
-    PictureType, RateControlMode, frame_type, list_adapters,
+    PictureType, RateControlMode, Vp9EncoderConfig, Vp9Profile, frame_type, list_adapters,
 };
 
 /// テスト用アダプタを返す
@@ -155,17 +155,37 @@ fn psnr_y(original: &[u8], decoded_y: &[u8], pitch: usize, width: usize, height:
     10.0 * (255.0_f64 * 255.0 / mse).log10()
 }
 
-/// エンコードしてフレーム一覧とフレームごとのビットストリームを返すヘルパー
-fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
+/// エンコード結果をコールバックで受信するエンコーダと受信用チャネルのペア
+type EncoderAndReceiver = (
+    Encoder<FnEncodeHandler<usize>>,
+    mpsc::Receiver<Result<EncodedFrame<usize>, Error>>,
+);
+
+/// エンコード結果をコールバックで受信するエンコーダと受信用チャネルを生成するヘルパー
+fn create_encoder(config: EncoderConfig) -> EncoderAndReceiver {
     let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
-    let mut encoder = Encoder::new(
+    let encoder = Encoder::new(
         config,
         FnEncodeHandler::new(move |result| {
-            tx.send(result)
-                .expect("failed to send encoded frame callback result");
+            tx.send(result).expect("エンコード結果の送信に失敗した");
         }),
     )
-    .expect("failed to create encoder");
+    .expect("エンコーダの生成に失敗した");
+    (encoder, rx)
+}
+
+/// エンコードしてフレーム一覧とフレームごとのビットストリームを返すヘルパー
+fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
+    let (encoder, rx) = create_encoder(config);
+    encode_with_encoder(encoder, rx, frames)
+}
+
+/// 生成済みエンコーダでフレームをエンコードして結果を回収するヘルパー
+fn encode_with_encoder(
+    mut encoder: Encoder<FnEncodeHandler<usize>>,
+    rx: mpsc::Receiver<Result<EncodedFrame<usize>, Error>>,
+    frames: &[Vec<u8>],
+) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
     };
@@ -173,17 +193,17 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
     for (index, frame) in frames.iter().enumerate() {
         encoder
             .encode(frame, index, &options)
-            .expect("failed to encode");
+            .expect("エンコードに失敗した");
     }
-    encoder.finish().expect("failed to finish");
+    encoder.finish().expect("finish に失敗した");
 
     let mut encoded_frames = Vec::new();
     let mut bitstreams: Vec<Vec<u8>> = Vec::new();
     for _ in 0..frames.len() {
         let result = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("timed out waiting for encoded frame callback");
-        let encoded = result.expect("failed to encode");
+            .expect("エンコード結果の受信がタイムアウトした");
+        let encoded = result.expect("エンコードに失敗した");
         bitstreams.push(encoded.data().to_vec());
         encoded_frames.push(encoded);
     }
@@ -193,14 +213,14 @@ fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>
         let user_data = *frame.user_data();
         assert!(
             user_data < frames.len(),
-            "encoded user_data {user_data} is out of range"
+            "エンコード結果の user_data {user_data} が範囲外"
         );
         seen[user_data] += 1;
     }
     for (index, count) in seen.iter().enumerate() {
         assert_eq!(
             *count, 1,
-            "callback user_data {index} was expected once but appeared {count} times"
+            "コールバックの user_data {index} は 1 回だけ呼ばれること (実際は {count} 回)"
         );
     }
 
@@ -932,5 +952,182 @@ fn test_roundtrip_h264_bgra_alignment_mismatch() {
         10,
         318,
         238,
+    );
+}
+
+// --- VP9 ---
+
+/// IVF ファイルヘッダー (DKIF, 32 byte) とフレームヘッダー (12 byte) を除去する
+///
+/// sora-rust-sdk の `vp9_payload_from_vpl` と同じ per-frame 除去ロジックを再現する。
+/// ヘッダーが不足する入力は関数内の assert で検出される。
+fn strip_vp9_ivf_headers(data: &[u8]) -> Vec<u8> {
+    let after_file_header = if data.starts_with(b"DKIF") {
+        assert!(
+            data.len() >= 32,
+            "IVF ファイルヘッダー (32 byte) 未満の入力: {} byte",
+            data.len()
+        );
+        &data[32..]
+    } else {
+        data
+    };
+    assert!(
+        after_file_header.len() >= 12,
+        "IVF フレームヘッダー (12 byte) 未満の入力: {} byte",
+        after_file_header.len()
+    );
+    after_file_header[12..].to_vec()
+}
+
+/// VP9 のラウンドトリップテストを実行するヘルパー
+///
+/// `write_ivf_headers` の値で encode → decode を実行し、getter の戻り値・
+/// 出力の IVF ヘッダー有無・デコード後の PSNR を検証する。
+/// IVF 付きの場合は sora-rust-sdk の payload 処理と同様にヘッダーを除去してからデコードする。
+fn roundtrip_vp9(write_ivf_headers: bool) {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::Vp9(Vp9EncoderConfig {
+            profile: Some(Vp9Profile::Profile0),
+            write_ivf_headers,
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    // getter 検証・coded_size 取得・エンコードに同じエンコーダを使い回す
+    let (encoder, rx) = create_encoder(config.clone());
+
+    // getter が設定した値 (write_ivf_headers) をそのまま返すことを検証する
+    assert_eq!(
+        encoder.write_ivf_headers(),
+        write_ivf_headers,
+        "write_ivf_headers の getter は設定した値を返すこと"
+    );
+
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let (coded_width, coded_height) = encoder.coded_size();
+    let colorbar = generate_colorbar_nv12(width, height, coded_width, coded_height);
+    let colorbar_for_psnr = generate_colorbar_nv12(width, height, width, height);
+    let input_frames: Vec<Vec<u8>> = (0..10).map(|_| colorbar.clone()).collect();
+
+    let (encoded_frames, bitstreams) = encode_with_encoder(encoder, rx, &input_frames);
+
+    // IVF ヘッダーの有無を検証する
+    for (i, frame) in encoded_frames.iter().enumerate() {
+        if write_ivf_headers {
+            if i == 0 {
+                // 先頭フレームには 32 byte のファイルヘッダー (DKIF) と 12 byte のフレームヘッダーが付く
+                assert!(
+                    frame.data().starts_with(b"DKIF"),
+                    "IVF 付きの先頭フレームは DKIF で始まること"
+                );
+                assert!(
+                    frame.data().len() >= 44,
+                    "先頭フレームは 32 + 12 byte のヘッダー以上が必要 (実際は {} byte)",
+                    frame.data().len()
+                );
+            } else {
+                // 2 フレーム目以降は 12 byte のフレームヘッダーのみで、ファイルヘッダー (DKIF) は付かないこと
+                assert!(
+                    !frame.data().starts_with(b"DKIF"),
+                    "IVF 付きのフレーム {i} が DKIF で始まってはいけない"
+                );
+            }
+        } else {
+            // raw VP9 なのでどのフレームも DKIF で始まらないこと
+            assert!(
+                !frame.data().starts_with(b"DKIF"),
+                "raw VP9 のフレーム {i} が DKIF で始まってはいけない"
+            );
+        }
+    }
+
+    // デコードする (IVF 付きはヘッダーを除去してから)
+    let decoded_frames = if write_ivf_headers {
+        let stripped: Vec<Vec<u8>> = bitstreams
+            .iter()
+            .map(|bs| strip_vp9_ivf_headers(bs))
+            .collect();
+        decode(DecoderCodec::Vp9, &stripped)
+    } else {
+        decode(DecoderCodec::Vp9, &bitstreams)
+    };
+    assert_eq!(
+        decoded_frames.len(),
+        input_frames.len(),
+        "デコードされたフレーム数が入力と一致すること"
+    );
+
+    // デコード結果の width/height と PSNR を検証する
+    for (i, decoded) in decoded_frames.iter().enumerate() {
+        assert_eq!(
+            decoded.width, width,
+            "デコード結果のフレーム {i} の width が入力と一致すること"
+        );
+        assert_eq!(
+            decoded.height, height,
+            "デコード結果のフレーム {i} の height が入力と一致すること"
+        );
+        let psnr = psnr_y(
+            &colorbar_for_psnr,
+            &decoded.y_data,
+            decoded.pitch,
+            width,
+            height,
+        );
+        assert!(
+            psnr >= 25.0,
+            "フレーム {i}: PSNR {psnr:.1} dB が 25.0 dB 未満"
+        );
+    }
+}
+
+/// VP9 raw (write_ivf_headers=false) のラウンドトリップ
+#[test]
+fn test_roundtrip_vp9_write_ivf_headers_false() {
+    roundtrip_vp9(false);
+}
+
+/// VP9 IVF 付き (write_ivf_headers=true) のラウンドトリップ
+#[test]
+fn test_roundtrip_vp9_write_ivf_headers_true() {
+    roundtrip_vp9(true);
+}
+
+/// 非 VP9 コーデックの write_ivf_headers getter が常に false を返すことを検証する
+///
+/// getter の false は `CodecConfig` の単一の非 VP9 分岐で決まるため、代表として H264 のみ検証する。
+/// HEVC / AV1 の初期化自体は既存の roundtrip テストで検証済み。
+#[test]
+fn test_write_ivf_headers_getter_false_for_non_vp9() {
+    let config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    let encoder: Encoder<FnEncodeHandler<()>> = Encoder::new(
+        config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )
+    .expect("エンコーダの生成に失敗した");
+    assert!(
+        !encoder.write_ivf_headers(),
+        "非 VP9 コーデックの getter は false を返すこと"
     );
 }
