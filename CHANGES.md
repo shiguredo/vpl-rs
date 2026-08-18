@@ -18,7 +18,7 @@
   - 初期化時に `mfxExtVP9Param::WriteIVFHeaders` の実効値を読み戻し、要求値と一致しない場合はエラーを返す
   - `Vp9EncoderConfig` を構造体リテラルで構築する既存コードは `write_ivf_headers` の明示指定が必須になりコンパイル不能になる
   - Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、従来の IVF 付き出力を維持するには `write_ivf_headers: true` を指定する
-  - @voluntas
+  - @melpon
 - [UPDATE] libvpl を 2.16.0 から 2.17.0 に更新する
   - @voluntas
 
