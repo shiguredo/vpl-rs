@@ -13,6 +13,12 @@
 
 - [CHANGE] MSRV (rust-version) を 1.88 から 1.93 に上げる
   - @voluntas
+- [CHANGE] `Vp9EncoderConfig` に `write_ivf_headers` を追加する
+  - `Encoder` が oneVPL へ要求した値を返す `Encoder::write_ivf_headers` getter を追加する
+  - 初期化時に `mfxExtVP9Param::WriteIVFHeaders` の実効値を読み戻し、要求値と一致しない場合はエラーを返す
+  - `Vp9EncoderConfig` を構造体リテラルで構築する既存コードは `write_ivf_headers` の明示指定が必須になりコンパイル不能になる
+  - Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、従来の IVF 付き出力を維持するには `write_ivf_headers: true` を指定する
+  - @melpon
 - [UPDATE] libvpl を 2.16.0 から 2.17.0 に更新する
   - @voluntas
 
