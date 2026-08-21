@@ -156,8 +156,8 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
      4. 引き当て成功: 既存の `read_decoded_surface(&frame_surface, user_data)` を呼び、`DecodedFrame` を構築して `handler.on_decoded(Ok(frame))`
      5. 引き当て失敗: エラー通知は行わず、そのまま `Ok(())` を返す（`Sync` アームでの分岐は不要。Map 済みの `frame_surface` は Drop 時に `Unmap + Release` が自動実行されるため、解放のみが自動で行われる）
    - `sync_and_callback` の `Err` はデータ破損系（`SyncOperation` 失敗・`map_read` 失敗・`read_decoded_surface` の検証エラー）のみとする。**引き当て失敗は `Err` にしない**（ドレインの空フレームや異常出力が原因の正常な破棄として扱う）。
-   - ただし 0010 適用後、stopping 検知による中断（`MFX_ERR_ABORTED`）は `SyncOperation` 失敗の一種として `Err` が返るが、**この中断時は handler へのエラー通知を行わない**（エントリも消費しない）。中断時の残留エントリは `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねることで、同一 user_data の二重通知（0010 完了条件の「1 回のみ通知」）を防ぐ。
-   - 引き当て失敗の破棄は `sync_and_callback` 内部で完結するため、`Sync` アームからの `sync_and_drain` 呼び出しは不要になり、**`sync_and_drain` は呼び出し元が消滅するため削除する**（0010 / 0014 が `sync_and_drain` を変更対象にしているが、0008 はそれらより後に適用されるため、削除は 0008 の変更に含める）。
+   - `SyncOperation` 失敗（デバイスエラー等）時は `Err` を返し、Worker の `Sync` アームが `handler.on_decoded(Err(...))` で通知する。このとき対応する `pending_map` エントリは消費できない（`SyncOperation` 完了前に出力 timestamp が確定せず、どのエントリか特定できないため）。残留エントリは `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねる。デバイスエラー時は同一 user_data が 2 回通知（Sync エラー + Drop 時の ABORTED）され得るが、これは TimeStamp 方式の制約であり許容する（0010 の Encoder 側「Sync エラー時に `take_by_frame_seq` で pending を消費してから `Err` を返す」方針は、Decoder 側には適用できない）。
+   - 引き当て失敗の破棄は `sync_and_callback` 内部で完結するため、`Sync` アームからの `sync_and_drain` 呼び出しは不要になり、**`sync_and_drain` は呼び出し元が消滅するため削除する**（0010 は `sync_and_drain` を変更せず、0014 は変更対象外としている。削除は 0008 の変更に含める）。
 
 7. **`run_sync_worker` のマッチアームを書き換える**
    - `QueueFrame`: `pending_map` に登録
@@ -256,6 +256,6 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 ## 依存 issue
 
 - **issue 0013** (`0013-bug-encoder-frame-seq-zero-timestamp-collision`): Encoder 側の `frame_count` 初期値を 1 に変更する修正。本 issue の `frame_count` 初期値も 1 と整合させる。
-- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): `sync_and_drain` および `sync_and_callback` 内の `MFX_INFINITE` を修正する。本 issue で `sync_and_callback` のシグネチャを変更するため、0010 を先に適用し、その差分の上に 0008 の変更を重ねること。Sync 失敗時の残留エントリの扱いは、0010 の Encoder 側「stopping 検知時は pending を消費してから `Err` を返す」方針とは異なり、Decoder 側には適用できない（Decoder は SyncOperation 完了前に timestamp が確定しないため、どのエントリを消費すべきか特定できない）。Decoder 側は stopping 検知による中断（`MFX_ERR_ABORTED`）時に handler へのエラー通知とエントリ消費を行わず、残留エントリは `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねる方式とする（項目 6 参照）。
+- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): Encoder 側の二重通知修正（`SyncData` への `frame_seq` 追加、Sync エラー時の `take_by_frame_seq` による pending 消費）とデバイスエラー伝搬の検証を行う。`sync_and_drain` / `sync_and_callback` の `MFX_INFINITE` は変更しない（0010 の調査により、有限タイムアウト化はエラー表面化に寄与しないため廃案）。本 issue で `sync_and_callback` のシグネチャを変更するため、0010 を先に適用し、その差分の上に 0008 の変更を重ねること。Sync 失敗時の残留エントリの扱いは、0010 の Encoder 側「Sync エラー時に pending を消費してから `Err` を返す」方針とは異なり、Decoder 側には適用できない（Decoder は SyncOperation 完了前に timestamp が確定しないため、どのエントリを消費すべきか特定できない）。Decoder 側は Sync 失敗時に `Err` を通知し、残留エントリは `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねる方式とする（項目 6 参照）。
 - **issue 0009** (`0009-bug-decoder-device-busy-infinite-retry`): `decode_bitstream` / `finish` の DEVICE_BUSY 無限再試行を上限付きにする修正。`decode_bitstream` がエラーを返した場合、送信済み `QueueFrame` の `frame_seq` はインクリメントされないため、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる。0009 を先に適用するか、エラー後の `frame_count` の扱いを 0009 の実装と整合させること。
-- **issue 0014** (`0014-bug-frame-surface-drop-silently-swallows-errors`): `sync_and_drain` 内の `FrameSurface::Drop` のエラー処理を変更する。0010 と同様に 0008 より先に適用してから本 issue の変更を重ねること。
+- **issue 0014** (`0014-bug-frame-surface-drop-silently-swallows-errors`): `FrameSurface::Drop` のエラー処理を変更する。`sync_and_drain` は変更対象外（0008 の削除に委ねる）。0014 を 0008 より先に適用してから本 issue の変更を重ねること。
