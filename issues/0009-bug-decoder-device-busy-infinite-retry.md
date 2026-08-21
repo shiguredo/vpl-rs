@@ -17,7 +17,7 @@ High。以下による。
 - **プロセスハング**: GPU が異常状態になると `Decoder::decode` を呼んだスレッドがブロックしたままとなり、上位から検知できない。パニックも Error も返らない。
 - **Encoder との実装非対称**: 同一ライブラリ内で Encoder は上限リトライ、Decoder は無限リトライ。同じ設計原則を採用しない理由がない。
 - **`MORE_SURFACE` の CPU 100% スピン**: `sleep` すら入っていないため、`MORE_SURFACE` が返り続けると CPU 100% でスピンする。
-- **本番運用でのシャットダウン阻害**: `Decoder::finish` は「コールバックが呼び出され終わるまでブロックする」契約のため、無限ループ内から抜けられず、シャットダウン処理に到達できない。なお Drop 時のデッドロック（Worker が `SyncOperation` の `MFX_INFINITE` で無限待機中に join できない問題）は依存 issue 0010 の管轄であり、本 issue では対応しない。
+- **本番運用でのシャットダウン阻害**: `Decoder::finish` は「コールバックが呼び出され終わるまでブロックする」契約のため、無限ループ内から抜けられず、シャットダウン処理に到達できない。なお真の GPU ハング（ドライバがタスク結果をエラーにせず SyncOperation が制御を返さない）時の Drop デッドロックは仕様上達成不能であり、0010 の調査でライブラリ側では解決できないことが確定している（0010 の「スコープ外の明記」参照）。本 issue でも対応しない。DEVICE_BUSY / MORE_SURFACE はデバイスが混雑している状態でありハングとは区別されるため、この状態では Worker の SyncOperation は完了（またはエラー）し、Drop の join は返る。
 
 ## 現状
 
@@ -128,7 +128,7 @@ MORE_SURFACE のリトライ化は libvpl 仕様（`mfxVideoParam.mfx` 内のデ
 2. `src/decode.rs` の `decode_bitstream` の `MFX_ERR_MORE_SURFACE` の `continue`（sleep なしスピン）を除去し、DEVICE_BUSY と同じ上限付きリトライに置き換える。
 3. `src/decode.rs` の `finish` の drain ループに `MFX_ERR_MORE_SURFACE` の明示的な上限付きリトライを追加し、`decode_bitstream` と一貫したステータス処理にする。
 4. `src/decode.rs` に `const DEVICE_BUSY_MAX_RETRIES: u32 = 30;` を宣言する。Encoder 側の同名定数と同じ値であること（値変更時は両方の意図を確認して同時に更新する）。この定数は DEVICE_BUSY と MORE_SURFACE の両方のリトライ上限に使用するため、宣言時にその旨をコメントで明記する。
-5. `finish` が上限超過エラーで抜けた後、`Decoder` を Drop した際に `stop_worker` が Worker スレッドを正常に join できること。**この検証は依存 issue 0010 適用後を前提とする**（0010 が Worker の `SyncOperation` を有限タイムアウト化するため。0010 未適用では GPU 異常時に Worker が `MFX_INFINITE` でブロックしたまま join が返らない）。検証方法はコードレビューで Drop 経路が返る構造であることを確認する（実機では DEVICE_BUSY を強制できないため）。
+5. `finish` が上限超過エラーで抜けた後、`Decoder` を Drop した際に `stop_worker` が Worker スレッドを正常に join できること。DEVICE_BUSY / MORE_SURFACE はデバイスが混雑しているだけでタスクは実行可能な状態であり、上限超過エラー後の Drop では Worker が残りの Sync を完了（またはエラー）させた後に `Stop` を受けて終了するため、join は正常に返る。真の GPU ハング（SyncOperation が制御を返さない）時の join ブロックは仕様上達成不能であり検証対象外（0010 の「スコープ外の明記」参照）。検証方法はコードレビューで Drop 経路が返る構造であることを確認する（実機では DEVICE_BUSY を強制できないため）。
 6. `skills/shiguredo-vpl/SKILL.md` のエンコーダ節の DEVICE_BUSY / MORE_SURFACE の説明に Decoder 側の挙動を追記する。**Encoder は MORE_SURFACE を即エラーにしている実態があるため**、「DEVICE_BUSY は Encoder / Decoder ともに最大 30 回リトライ」「MORE_SURFACE は Decoder のみ最大 30 回リトライ（Encoder は即エラー）」「上限超過時はエラー」と実態に合わせて明記する。
 7. リトライ処理のコードコメントに根拠資料（libvpl の `mfxstructures.h` の `mfxInfoMFX.FilmGrain` 説明）と将来変更可能性（`surface_work=NULL` での発生有無は未確認）を明記する。
 8. `CHANGES.md` の `## develop` に `[FIX]` として本修正を追記する。
@@ -141,5 +141,5 @@ MORE_SURFACE のリトライ化は libvpl 仕様（`mfxVideoParam.mfx` 内のデ
 
 ## 依存 issue
 
-- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): Worker の `SyncOperation` の `MFX_INFINITE` を有限タイムアウトに修正する issue。本 issue の完了条件 5（Drop 時の join 保証）は 0010 適用後を前提とする。0010 を先に適用すること。
+- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): 調査により、`MFXVideoCORE_SyncOperation` はタスク結果を `wait` 値に関係なく返すため有限タイムアウト化はエラー表面化に寄与せず、`MFX_INFINITE` は維持される（廃案）。また真の GPU ハングでの Drop デッドロックは仕様上達成不能であることが確定した。本 issue の完了条件 5 は 0010 への依存を外し、「DEVICE_BUSY / MORE_SURFACE 状態（真のハングではない）での join 保証」に限定する。
 - **issue 0008** (`0008-bug-decoder-b-frame-user-data-mismatch`): Decoder の user_data 対応付けを FIFO から HashMap + TimeStamp 方式に変更する issue。**適用順序は本 issue (0009) を先に適用する**（0008 は本 issue のエラー経路を前提として「エラー後の `frame_count` の扱い」を 0008 の設計に組み込んでいる。0008 の設計では `decode_bitstream` がエラーを返した場合 `frame_count` がインクリメントされず、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる）。本 issue のエラー復帰に関する注意（QueueFrame 残留）は 0008 の HashMap 方式導入後は残留エントリの扱いが変わるため、0008 の実装と整合を取ること。
