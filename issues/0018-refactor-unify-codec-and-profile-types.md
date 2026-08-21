@@ -103,7 +103,7 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 
 統合後のプロファイル型（`H264Profile` 等）は `src/encode.rs` に残す。プロファイル型は `EncoderConfig` のプロファイル指定（`H264EncoderConfig.profile: Option<H264Profile>` 等）で使用され、エンコード設定の一部であるため encode モジュールが自然な所属である。`src/codec_info.rs` の `EncodingProfiles` は `use crate::encode::H264Profile` で参照する（依存方向: codec_info → encode → sys）。
 
-なお、依存 issue 0020（encode.rs のサブモジュール分割）適用後は、プロファイル型は分割後の `src/encode/config.rs` に置かれることになる。**適用順序は本 issue (0018) を先に適用し、その差分の上に 0020 の変更を重ねる**（0020 側も「0018 と同時進行するとコンフリクトしやすい」と明記している）。
+なお、依存 issue 0020（encode.rs のサブモジュール分割）適用後は、プロファイル型は分割後の `src/encode/config.rs` に置かれることになる。**適用順序は本 issue (0018) を先に適用し、その差分の上に 0020 の変更を重ねる**（0020 側も「0018 を先に適用し、その差分の上に本 issue の変更を重ねる」と明記している）。
 
 ### コーデック ID 写像の二重実装（本 issue の対象外）
 

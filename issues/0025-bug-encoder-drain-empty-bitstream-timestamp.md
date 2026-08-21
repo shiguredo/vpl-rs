@@ -15,7 +15,7 @@
 
 `src/encode.rs` の `create_bitstream()` は `Box::new(unsafe { std::mem::zeroed() })` で初期化するため、`mfxBitstream.TimeStamp` は常に `0` になる。`finish()` のドレインループでもこの `create_bitstream()` を使って空フレームをエンコードし、生成されたビットストリームを `WorkerCommand::Sync(SyncData)` として worker に送る。
 
-一方、encoder の pending 引き当ては `frame_seq`（`encode()` 呼び出しごとに 1 ずつ増える値）を `mfxFrameSurface1.Data.TimeStamp` に載せ、出力ビットストリームの `TimeStamp` と完全一致で引き当てる方式である。issue 0013 適用後は `frame_count` が 1 スタートになるため、`frame_seq` が 1 以上の値になり、ドレイン空フレームの `TimeStamp = 0` はどの pending にも引き当てられず「no pending frame for bitstream timestamp 0」の `Err` 通知になる可能性がある。
+一方、encoder の pending 引き当ては `frame_seq`（`encode()` 呼び出しごとに 1 ずつ増える値）を `mfxFrameSurface1.Data.TimeStamp` に載せ、出力ビットストリームの `TimeStamp` と完全一致で引き当てる方式である。`frame_count` は 0 スタートのまま（issue 0013 は closed で「`frame_count` 1 スタート化」は不採用）であるため、`frame_seq = 0` の pending（1 フレーム目）が未消費で残っている場合、ドレイン空フレームの `TimeStamp = 0` がそれを誤消費し、実フレーム 0 の出力が後から「no pending frame for bitstream timestamp 0」の `Err` 通知になる可能性がある。また、`frame_seq = 0` の pending が残っていない場合は、ドレイン空フレームの `TimeStamp = 0` がどの pending にも引き当てられず、同様に「no pending frame for bitstream timestamp 0」の `Err` 通知になり得る（0008 のテストヘルパーではこの `Err` をドレイン期の空フレームに限って許容する。0008 のテストヘルパー設計参照）。
 
 ## 設計方針
 
@@ -41,5 +41,5 @@
 
 ## 参考
 
-- 関連 issue: 0008（Decoder の user_data 対応付け修正。本 issue を「エンコーダ側の既存の課題」として切り出した）、0013（Encoder の frame_seq / TimeStamp 衝突修正。`frame_count` を 1 スタートにする）
-- 前提: issue 0008、0013 が完了していること
+- 関連 issue: 0008（Decoder の user_data 対応付け修正。本 issue を「エンコーダ側の既存の課題」として切り出した。0008 のテストヘルパーでは本 issue の対応前の回避策として、ドレイン期の空フレームに限って「no pending frame for bitstream timestamp 0」の `Err` を許容する）、0013（Encoder の frame_seq / TimeStamp 衝突修正。**closed で「`frame_count` 1 スタート化」は不採用のため、本 issue の前提は 0013 に依存しない**）
+- 前提: issue 0008 が完了していること（0013 は closed で不採用のため前提としない）
