@@ -3,7 +3,7 @@
 - Priority: High
 - Created: 2026-08-02
 - Model: DeepSeek V4 Flash
-- Polished: 2026-08-21
+- Polished: {YYYY-MM-DD}
 
 ## 目的
 
