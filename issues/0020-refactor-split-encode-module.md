@@ -119,7 +119,7 @@ Medium。以下による。
 適用順序は次のとおり（各 issue の適用順序記述と整合させる）:
 
 - **issue 0011**（reconfigure が ExtParam を送らない）: `Encoder::new` の ExtParam 構築部を変更し、`build_ext_buffers` ヘルパーを切り出す。**0011 を先に適用する**（0011 の Box フィールド保持設計に合わせて本 issue の設計を調整済み）。
-- **issue 0010**（Drop デッドロック）: `run_sync_worker`（`stopping` 引数追加）、`SyncData`（`frame_seq` 追加）、`sync_and_collect` / `sync_and_build_frame`（シグネチャ変更）、`Encoder` 構造体（`stopping` 追加）を変更する。**0010 を先に適用する**（分割は 0010 適用後の構造を前提とする）。
+- **issue 0010**（デバイスエラー伝搬と Drop 経路の検証）: `SyncData`（`frame_seq` 追加）、`sync_and_collect` / `sync_and_build_frame`（シグネチャ変更）を変更する。`stopping` 引数・`Encoder` 構造体の `stopping` フィールド・有限タイムアウト化は廃案。**0010 を先に適用する**（分割は 0010 適用後の構造を前提とする）。
 - **issue 0012**（reconfigure が pending frame を drain しない）: `WorkerCommand::DrainPending` 追加、`run_sync_worker` のアーム追加、`reconfigure_canceled_error` 新設を変更する。**0012 を先に適用する**（0012 側も「0020 は本 issue 適用後に調整する」と明記）。
 - **issue 0013**（frame_seq=0 衝突）: `Encoder::new` の `frame_count` 初期化 1 行を変更する。**0013 を先に適用する**。
 - **issue 0014**（Drop 経路のエラー観測）: `Encoder::Drop` を変更する。0014 の変更は本 issue の分割と独立に適用可能。
