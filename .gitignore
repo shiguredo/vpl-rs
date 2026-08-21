@@ -1,6 +1,9 @@
 target/
 *.mp4
 
+# 一次資料としてクローンした外部リポジトリ
+refs/
+
 # Agents
 .claude/
 .codex/
