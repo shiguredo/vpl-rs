@@ -224,6 +224,7 @@ pub trait EncodeHandler: Send + 'static {
 - VPL の遅延 (LookAhead / B フレーム並び替え) のため、`encode` 1 回が即 1 回の `on_encoded` 呼び出しに対応するわけではない。 `encode` を複数回呼んでから `on_encoded` がまとめて呼ばれることもある。
 - `encode` のたびに渡した `user_data` は worker 内の `PendingFrameStore` に `frame_seq` で登録され、 出力 bitstream の `TimeStamp` と完全一致で引き当てられる (B フレーム並び替えがあっても元の入力に正しく戻る)。 1 ID が二度使われると重複エラーになる。
 - `MFX_ERR_MORE_DATA` と `MFX_WRN_DEVICE_BUSY` は内部で吸収される。 `DEVICE_BUSY` は 1ms スリープで最大 30 回までリトライ (旧 10 回から拡張)。 30 回を超えると致命的エラー。
+- `MFX_ERR_MORE_SURFACE` は **Decoder 側のみ** 1ms スリープで最大 30 回リトライし、上限超過時はエラーになる (内部割り当て `surface_work=NULL` では通常発生しないが、AV1 の `FilmGrain != 0` 等のサーフェス不足で返り得る)。 **Encoder 側は `MFX_ERR_MORE_SURFACE` をリトライせず即エラー** として扱う。
 
 ### `Encoder::encode` / `finish` のセマンティクス
 
