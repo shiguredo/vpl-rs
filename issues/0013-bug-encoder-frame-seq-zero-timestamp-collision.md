@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-08-21
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-frame-seq-zero-timestamp-collision
 - Polished: 2026-08-02
@@ -86,6 +87,23 @@ High。以下による。
 ## 依存 issue
 
 - **issue 0008** (`0008-bug-decoder-b-frame-user-data-mismatch`): 0008 は本 issue を依存先として「Decoder 側の `frame_count` 初期値も 1 と整合させる」と記載している。また 0008 は「0013 適用後（`frame_count` が 1 スタート）はエンコーダのドレイン空フレーム（`TimeStamp = 0`）が pending に引き当てられず「no pending frame for bitstream timestamp 0」の `Err` 通知になる可能性がある」をテストヘルパーでの許容として計画している（「ドレイン空フレームとの相互作用」参照）。
+
+## 解決方法
+
+本 issue の前提である「VPL の一部ドライバ実装では TimeStamp = 0 を「未設定」として扱い、`bitstream.TimeStamp` に `MFX_TIMESTAMP_UNKNOWN` や別の値を書き戻す挙動が報告されている」は、一次資料で裏付けられないため closed にする。
+
+調査結果は以下のとおり。
+
+- Intel 公式ドキュメントは「`MFX_TIMESTAMP_UNKNOWN` の値がタイムスタンプなしを示す」と規定しており、TimeStamp = 0 を未設定として扱う記述は存在しない。0 は有効なタイムスタンプ値。
+- Intel の oneVPL GPU ランタイム (`vpl-gpu-rt`) の実装では、encode は入力 surface の `Data.TimeStamp` をそのまま `bitstream.TimeStamp` に書き戻す（pass-through）。`MFX_TIMESTAMP_UNKNOWN` は `DecodeTimeStamp` 計算の分岐にのみ使用される。
+  - H.264: `mfx_h264_encode_hw.cpp` の `task.m_bs->TimeStamp = task.m_timeStamp;`
+  - HEVC: `hevcehw_base_legacy.cpp` の `bs.TimeStamp = task.pSurfIn->Data.TimeStamp;`
+  - VP9: `mfx_vp9_encode_hw.cpp` の `task.m_pBitsteam->TimeStamp = task.m_timeStamp;`
+- 本 issue の「報告されている」は出典（GitHub issue・Intel フォーラム・ドキュメント）を明示しておらず、`/review-code` の指摘 F6 由来だがその指摘にも出典はない。
+
+よって本 issue が根拠とする挙動は仮説の域を出ず、`frame_count: 1` スタート化による予防的修正は実施しない。
+
+なお、`DataFlag` 起因の検討（`MFX_FRAMEDATA_ORIGINAL_TIMESTAMP` の設定など）は本 issue の「DataFlag の検討（本 issue の対象範囲外）」で述べたとおりタイムスタンプ設計の見直しと合わせて別途検討対象とする。
 
 ## 参考
 
