@@ -56,9 +56,9 @@ impl Drop for FrameSurface {
 
 **`sync_and_drain` は本 issue では対応しない**。理由は次のとおり:
 
-- 依存 issue 0010 が `sync_and_drain` の SyncOperation を有限タイムアウトのループ構造に書き換え、さらに依存 issue 0008 が `sync_and_drain` 自体を削除する（0008 の設計では引き当て失敗の破棄が `sync_and_callback` 内部で完結し、`Sync` アームからの呼び出しが不要になるため）。本 issue で stderr 出力に対応しても 0008 適用で消滅する。
+- 依存 issue 0008 が `sync_and_drain` 自体を削除する（0008 の設計では引き当て失敗の破棄が `sync_and_callback` 内部で完結し、`Sync` アームからの呼び出しが不要になるため。0010 は `sync_and_drain` を変更しない。0010 の調査で有限タイムアウト化は廃案）。本 issue で stderr 出力に対応しても 0008 適用で消滅する。
 - 0008 適用後の破棄経路では `FrameSurface::Drop`（本 issue の対象）が `Unmap` / `Release` 失敗を出力するため、観測性は確保される。
-- なお、0008 の「依存 issue」セクションには本 issue が `sync_and_drain` を変更対象としていた旨の記述が残っている（0010 側の記述は「`sync_and_drain` 内の `FrameSurface::Drop` のエラー処理を変更する」であり、`FrameSurface::Drop` が対象のため陳腐化していない）。本 issue の実装着手時に、0008 側の記述を「`sync_and_drain` は 0014 の対象外（0008 で削除）」に更新する。
+- なお、0008 の「依存 issue」セクションの本 issue の記述（「`sync_and_drain` 内の `FrameSurface::Drop` のエラー処理を変更する」）は、実際の変更対象が `FrameSurface::Drop` であり `sync_and_drain` ではないため、実装着手時に「`sync_and_drain` は 0014 の対象外（0008 で削除）」に更新する（0010 側の記述も「`sync_and_drain` のエラー無視は `FrameSurface::Drop` のエラー出力を扱う 0014、および `sync_and_drain` を削除する 0008 で対応する」であり、`FrameSurface::Drop` が対象のため陳腐化していない）。
 
 ### 呼び出し元での安全対策
 
@@ -143,6 +143,6 @@ let _ = writeln!(
 
 ## 依存 issue
 
-- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): `sync_and_drain` の SyncOperation を有限タイムアウトのループ構造に書き換える。**適用順序は 0010 を先に適用し、その差分の上に本 issue の変更を重ねる**。
-- **issue 0008** (`0008-bug-decoder-b-frame-user-data-mismatch`): `sync_and_drain` を削除する（引き当て失敗の破棄が `sync_and_callback` 内部で完結するため）。本 issue は `sync_and_drain` を対象外とし、0008 の削除に委ねる（「Drop 外のエラー黙殺（本 issue の対象外）」参照）。**適用順序は本 issue を 0008 より先に適用する**（0008 側も「0010 と同様に 0008 より先に適用してから本 issue の変更を重ねること」と明記している）。0008 適用後の破棄経路では本 issue の `FrameSurface::Drop` 対応が観測性を確保する。
+- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): `sync_and_drain` は変更しない（0010 の調査で有限タイムアウト化は廃案）。0010 の変更は Encoder 側（`SyncData.frame_seq`、Sync エラー時の pending 消費）と `tests/test_roundtrip.rs`（Drop 経路の GPU テスト）のみ。本 issue の変更対象（`src/vpl.rs` の `FrameSurface::Drop` 等）とは `src/encode.rs` / `CHANGES.md` で重なるため、**適用順序は 0010 を先に適用し、その差分の上に本 issue の変更を重ねる**。
+- **issue 0008** (`0008-bug-decoder-b-frame-user-data-mismatch`): `sync_and_drain` を削除する（引き当て失敗の破棄が `sync_and_callback` 内部で完結するため）。本 issue は `sync_and_drain` を対象外とし、0008 の削除に委ねる（「Drop 外のエラー黙殺（本 issue の対象外）」参照）。**適用順序は本 issue を 0008 より先に適用する**（0008 側も「0014 を 0008 より先に適用してから本 issue の変更を重ねること」と明記している）。0008 適用後の破棄経路では本 issue の `FrameSurface::Drop` 対応が観測性を確保する。
 - **issue 0023** (`0023-test-fix-silent-pass-tests`): `frame_surface_gpu_required` の silent early-return を修正する。完了条件 8 の既存テスト担保は 0023 適用後を前提とする。
