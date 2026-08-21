@@ -4,11 +4,13 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-does-not-drain-pending
-- Polished: 2026-08-02
+- Polished: 2026-08-21
 
 ## 目的
 
 `Encoder::reconfigure` が呼ぶ `MFXVideoENCODE_Reset` は、パラメータ差分により VPL 内部の未出力フレームを破棄する場合がある（新シーケンス開始時）。しかし現在の実装は worker の `pending_store` を drain せず、Reset 後に pending が残留して `finish()` で「pending frames remained」エラーが顕在化する。ユーザーは reconfigure との因果関係が分からないままエラーに遭遇する。
+
+なお、本 issue の前提「Reset が VPL 内部の未出力フレームを破棄する」は一次資料からの推論であり実機未確認である（「設計判断の根拠」参照）。実機での確認は完了条件 4 のテストで間接的に観測する（前提の真偽を pass/fail で確定する構造ではなく、観測結果に応じて完了条件の検証条件を調整する）。
 
 ## 優先度根拠
 
@@ -62,7 +64,7 @@ fn finish_pending_error(frame_seq: u64, pending_count: usize) -> Error {
 
 ### frame_seq 衝突のリスク
 
-frame_seq は Encoder のライフタイムを通じて単調増加する（`self.frame_count.checked_add(1)`）ので、Reset 後に新規入力しても既存の frame_seq とは衝突しない。u64 のためラップアラウンドは発生しない。
+frame_seq は Encoder のライフタイムを通じて単調増加する（`self.frame_count.checked_add(1)`）ので、Reset 後に新規入力しても既存の frame_seq とは衝突しない。`checked_add(1)` がオーバーフロー時に `Err` を返すためラップアラウンドは発生しない。
 
 ## 設計方針
 
@@ -131,7 +133,7 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 
 ### Reset の挙動（シーケンス継続と新シーケンス開始）
 
-VPL の `MFXVideoENCODE_Reset` の挙動はパラメータ差分に依存する。一次資料（libvpl 2.17 の `VPL_prg_encoding.rst` の Configuration Change 節）は以下を規定している:
+VPL の `MFXVideoENCODE_Reset` の挙動はパラメータ差分に依存する。一次資料（`refs/oneVPL/doc/spec/source/programming_guide/VPL_prg_encoding.rst`（v2.17）の Configuration Change 節）は以下を規定している:
 
 - 「パラメータ変更前後の差分によって、エンコーダは現在のシーケンスを継続するか、新しいシーケンスを開始する。新シーケンスを開始する場合、内部状態を完全にリセットし、IDR フレームで新しいシーケンスを開始する」
 - 「アプリケーションは `mfxExtEncoderResetOption` 構造体を `mfxVideoParam` に付加することで、Reset 後に新しいシーケンスを開始するかどうかを制御できる」
@@ -144,15 +146,15 @@ VPL の `MFXVideoENCODE_Reset` の挙動はパラメータ差分に依存する�
 
 ### 設計判断の根拠
 
-**案 A（finish() のドレインで回収してから Reset）を採用しない理由**:
+**案 A（正規手順 / `finish()` のドレインで回収してから Reset）を採用しない理由**:
 
-VPL プログラミングガイド（一次資料: libvpl 2.17 のビルド成果物 `target/debug/build/shiguredo_vpl-*/out/libvpl/doc/spec/source/programming_guide/VPL_prg_encoding.rst` の Configuration Change 節）は設定変更の正規手順として「NULL 入力で `EncodeFrameAsync` を呼び cached frames をすべて回収（`MFX_ERR_MORE_DATA` まで）→ `MFXVideoENCODE_Reset` → 成功すれば encode を継続」を規定しており、フレームをロスなく回収できる。本 issue が drain（破棄 + エラー通知）方式を選ぶ理由は次のとおり:
+正規手順とは、VPL プログラミングガイド（一次資料: `refs/oneVPL/doc/spec/source/programming_guide/VPL_prg_encoding.rst` の Configuration Change 節）が規定する設定変更手順「NULL 入力で `EncodeFrameAsync` を呼び cached frames をすべて回収（`MFX_ERR_MORE_DATA` まで）→ `MFXVideoENCODE_Reset` → 成功すれば encode を継続」であり、フレームをロスなく回収できる。本 issue が drain（破棄 + エラー通知）方式を選ぶ理由は、この回収手順（および `finish()` のドレイン）では reconfigure が長時間ブロックし、しかも失敗時に Encoder が回復不能になるためである:
 
-- 正規手順（全フレーム回収）はすべての pending の Sync 完了 + コールバック完了を待つため、reconfigure が長時間ブロックする（数百 ms〜数秒）。動的パラメータ変更として不相応な待機時間になる
-- `finish()` が Err を返した場合、EOS が部分的に送られた状態となり、Encoder が回復不能になる
-- `finish()` の成功後に Reset が失敗した場合も Encoder が動作不能になる（EOS 済み、Reset 失敗）が、このケースへの対処がない
+- **正規手順（全フレーム回収）**: すべての pending の Sync 完了 + コールバック完了を待つため、reconfigure が長時間ブロックする（推定数百 ms〜数秒。回収対象はルックアヘッド深さ分のフレームであり、正確な値は実機依存）。動的パラメータ変更として不相応な待機時間になる
+- **`finish()` のドレイン経由**: `finish()` が Err を返した場合、EOS が部分的に送られた状態となり、Encoder が回復不能になる
+- **`finish()` のドレイン経由（続き）**: `finish()` の成功後に Reset が失敗した場合も Encoder が動作不能になる（EOS 済み、Reset 失敗）が、このケースへの対処がない
 
-つまり **フレームロスは「VPL 仕様で不可避」ではなく、本方式（破棄 + エラー通知）の設計上の選択である**。Reset 自体が VPL 内部のフレームを破棄するのは新シーケンス開始時のみ（一次資料: 上記 `VPL_prg_encoding.rst`。パラメータ差分によってはシーケンス継続となる）であり、本方式は Reset の挙動を pending_store の状態と整合させる。シーケンス継続時の挙動は「Reset の挙動（シーケンス継続と新シーケンス開始）」の節を参照。
+つまり **フレームロスは「VPL 仕様で不可避」ではなく、本方式（破棄 + エラー通知）の設計上の選択である**。Reset 自体が VPL 内部のフレームを破棄するのは新シーケンス開始時のみと考えられる（一次資料 `VPL_prg_encoding.rst` は新シーケンス開始時に「completely resets internal state and begins a new sequence with the IDR frame」と規定するが、「未出力フレームの破棄」自体は明記しておらず、完全リセットからの推論である。実機確認は完了条件 4）。パラメータ差分によってはシーケンス継続となるため、シーケンス継続時の挙動は「Reset の挙動（シーケンス継続と新シーケンス開始）」の節を参照。
 
 **本方式の特徴**:
 
@@ -164,15 +166,17 @@ VPL プログラミングガイド（一次資料: libvpl 2.17 のビルド成�
 
 ### 二重通知の可能性
 
-先行する `Sync` アームで `sync_and_collect` が `Err` を返した場合（bitstream 範囲検証エラー等）、0010 の適用後は `sync_and_build_frame` が `take_by_frame_seq` で pending を消費してから `Err` を返すため、残留エントリは発生せず `DrainPending` での再通知はない。`DrainPending` で通知されるのは Reset により VPL 内部で破棄されたフレームの pending のみ（各 1 回通知）。0010 適用前の実装では Sync エラー時の残留エントリが `DrainPending` で再通知される二重通知があったが、0010 を先に適用することで解消される。
+先行する `Sync` アームで `sync_and_collect` が `Err` を返した場合（bitstream 範囲検証エラー等）、0010 の最終方針では「`SyncData` への `frame_seq` 追加と Sync エラー時の `take_by_frame_seq` による pending 消費は行わない」（0010 の設計方針 2）ため、`sync_and_build_frame` はそのまま `Err` を返し、対応する pending frame は消費されず残留する。この残留エントリは `DrainPending`（または `Stop`）で再通知され得る。すなわち **Sync エラー時は同一フレームが 2 回通知される二重通知が発生し得るが、これは 0010 の許容方針（非同期モデルの制約として二重通知を許容）に従い、本 issue でも許容する**（0010 の設計方針 2、および 0010 の「依存 issue」セクションの 0012 の項目参照）。`DrainPending` で通知されるのは Reset により VPL 内部で破棄されたフレームの pending と、Sync エラー時に消費されず残留した pending である（0010 の許容方針のため、二重通知を防ぐための追加対応は行わない）。
 
 ### reconfigure の doc 更新
 
-以下の内容を reconfigure の doc に追記する:
+以下の内容を reconfigure の doc に追記する（完了条件 3 に対応）:
 
 - `MFXVideoENCODE_Reset` が VPL 内部の未出力フレームを破棄すること
 - 破棄されたフレームがある場合、エラー（`MFX_ERR_ABORTED`）が通知される。**どのフレームが破棄されたか（user_data）は通知されない**（`on_encoded(Err(...))` は user_data を運ばないため）
 - frame_seq は reconfigure 後も継続しリセットされないこと
+- reconfigure が先行フレームの Sync 完了までブロックすること（「ブロッキング挙動」の節）
+- シーケンス継続時でも pending が残っていればエラー通知されること（「Reset の挙動」の節）
 
 ## 完了条件
 
@@ -183,25 +187,27 @@ VPL プログラミングガイド（一次資料: libvpl 2.17 のビルド成�
 3. reconfigure の doc に、Reset の副作用（VPL 内部フレーム破棄、エラー通知、frame_seq 継続。user_data は通知されないこと）、reconfigure が先行フレームの Sync 完了までブロックすること、シーケンス継続時でも pending が残っていればエラー通知されることを明記する。
 4. reconfigure の前後で encode したフレームを検証するテストを `tests/test_roundtrip.rs` に追加する。テストは encode → reconfigure → encode → finish のシーケンスで検証し、以下を確認する:
    - Ok 通知で返る user_data の集合が **reconfigure 後に encode したフレームの user_data をすべて含む**（重複なし）。reconfigure 前に encode したフレームの user_data は、Sync 完了済みなら Ok 集合に含まれ、drain されたなら含まれない（Err 通知は user_data を運ばないため「0 回通知」となる。「全 user_data がちょうど 1 回通知される」は検証できない命題であり、検証対象は Ok 通知の user_data 集合 + 通知総数に限定する）
-   - 通知総数が encode 総数（reconfigure 前後の合計）と一致する
+   - 通知総数が encode 総数（reconfigure 前後の合計）以上であること（Sync エラー時は二重通知が発生し得るため、0010 の許容方針により総数は encode 総数と一致するとは限らない。一致するのは「二重通知が発生しない」場合のみであり、**「一致すること」を無条件 assert にしない**。「以上」を下限として検証する）。シーケンス継続時に遅延出力（`mismatched_timestamp_error`）が発生した場合はさらに通知が増えるため、この検証は「少なくとも encode 総数分の通知がある」ことの確認に留める
+   - `finish()` が `Ok` を返すこと（drain 未実装かつ reconfigure 時点で pending が存在する場合、残留 pending は `finish()` の `WaitIdle` で `finish_pending_error` 通知 + `Err` になるため、`finish()` の Ok assert により drain 漏れを確実に検出できる）
    - reconfigure 後に encode したフレームはすべて正常通知（Ok）
-   - エラー通知が発生した場合のみ、その内容（`function() == "Encoder::reconfigure"`、`status_code() == MFX_ERR_ABORTED`）を検証する（エラー通知数が 0 でも pass する条件付き検証。エラー通知数 0 のケースを pass させることで「drain 未実装でも pass する」silent pass 構造を残すため、エラー発生時にのみ内容を検証する）
-   - **0011 からの依頼として、reconfigure 後も LookAheadDepth / QVBRQuality が保持されることの検証を含める**（実機確認は 0011 の完了条件 6、テストは本 issue の reconfigure テストに含める。検証に公開 API の拡張（`Encoder::get_video_param()` に `ExtParam` を渡す手段）が必要になる場合は、add カテゴリの別 issue として対応する）
-   - 注: エラー通知数はタイミング依存のため、`gop_ref_dist = Some(3)` 等の MORE_DATA が発生する設定で pending 残存を作り出すこと。またシーケンス継続時の遅延出力（`mismatched_timestamp_error`）が発生するかもこのテストで観測し、「Reset の挙動」の節に従って対処する。
+   - エラー通知が発生した場合のみ、その内容を検証する。**検証対象は reconfigure-canceled エラー（`function() == "Encoder::reconfigure"`、`status_code() == MFX_ERR_ABORTED`）に限定し**、それ以外のエラー種別（Sync エラー時の残留通知、シーケンス継続時の `mismatched_timestamp_error`（`"Encoder::sync_worker"` コンテキスト・非 ABORTED））は観測対象として区別する（エラー通知数が 0 でも pass する条件付き検証。エラー通知数 0 のケースを pass させることで「drain 未実装でも pass する」silent pass 構造を残すため、エラー発生時にのみ内容を検証する）
+   - **0011 からの依頼として、reconfigure 後も LookAheadDepth / QVBRQuality が保持されることの検証を含める**（実機確認は 0011 の完了条件 6、テストは本 issue の reconfigure テストに含める。検証に公開 API の拡張（`Encoder::get_video_param()` に `ExtParam` を渡す手段）が必要になる場合は、**issue 0027（`0027-add-get-video-param-ext-param`）が対応する**。0027 は本 issue のテストでの利用方法に合わせて設計を確定するとしているため、0012 と 0027 を相互に参照して実装する）
+   - 注: エラー通知数はタイミング依存のため、`gop_ref_dist = Some(3)` 等の MORE_DATA が発生する設定で pending 残存を作り出すこと。またシーケンス継続時の遅延出力（`mismatched_timestamp_error`）が発生するかもこのテストで観測し、「Reset の挙動」の節に従って対処する。観測結果として遅延出力が確認された場合は、本完了条件の検証条件を「遅延出力分の通知を許容する形」に調整する（本 issue の設計方針の「シーケンス継続時」の節に従う）。
 5. `run_sync_worker` の `DrainPending` アームの単体テストを `src/encode.rs` 内の `#[cfg(test)]` モジュールに追加する（既存の `worker_wait_idle_returns_error_when_pending_remains` と同型の GPU 不要テスト）。エラー関数のコンテキストが `"Encoder::reconfigure"` であること（`error.function() == "Encoder::reconfigure"`）も assert する（`canceled_error()` の「Encoder::drop」コンテキスト混入の回帰を防ぐため。`status_code()` だけでは `MFX_ERR_ABORTED` が同一のため検出できない）。
-6. `skills/shiguredo-vpl/SKILL.md` の「動的再構成 (reconfigure)」節に、Reset の副作用（VPL 内部フレーム破棄、エラー通知、frame_seq 継続）を追記する。
+6. `skills/shiguredo-vpl/SKILL.md` の「動的再構成 (reconfigure)」節に、Reset の副作用（VPL 内部フレーム破棄、エラー通知、frame_seq 継続）を追記する。**0010 が closed で残余として残した「デバイスエラー時に同一フレームが 2 回通知され得る（二重通知を許容）」の明文化（0010 の完了条件 2）は、本 issue では扱わない（スコープ外）**。0010 の残余は、0010 の解決方法のとおり「必要になった場合は別 issue として切り出す」方針に従う。
 7. `CHANGES.md` の `## develop` に `[FIX]` として追記する。
 
 ## 影響範囲
 
 - `src/encode.rs`（`WorkerCommand` enum に `DrainPending` 追加、`run_sync_worker` の `DrainPending` アーム追加、`Encoder::reconfigure` に `DrainPending` 送信追加、reconfigure 用のエラー関数新設、reconfigure の doc 更新、`#[cfg(test)]` モジュールに単体テスト追加）
-- `tests/test_roundtrip.rs`（reconfigure 前後の user_data 検証テスト追加、実 GPU 依存）
+- `tests/test_roundtrip.rs`（reconfigure 前後の user_data 検証テスト追加、実 GPU 依存。LookAheadDepth / QVBRQuality 保持の検証には issue 0027 の公開 API 拡張を利用する）
 - `skills/shiguredo-vpl/SKILL.md`（動的再構成節に Reset の副作用を追記）
 - `CHANGES.md`
 
 ## 参考
 
 - 関連 issue: 0011（reconfigure が ExtParam を送らない別問題。**適用順序は 0011 を先に適用し、その差分の上に本 issue の変更を重ねる**。0011 の完了条件 6 からの検証依頼（LookAheadDepth / QVBRQuality 保持）を完了条件 4 に反映済み）
-- 関連 issue: 0010（`SyncData` への `frame_seq` 追加と Sync エラー時の `take_by_frame_seq` による pending 消費。`stopping` 引数・Sync アームの `MFX_ERR_ABORTED` 通知抑制分岐・500 ms タイムアウトは廃案。本 issue の `DrainPending` アームと 0010 の Sync アーム変更は干渉しないよう、0010 適用後に本 issue を重ねる）
+- 関連 issue: 0010（デバイスエラー伝搬の検証と二重通知の扱いの確定。`SyncData` への `frame_seq` 追加・Sync エラー時の `take_by_frame_seq` による pending 消費・`stopping` フラグ・500 ms タイムアウトはすべて廃案。二重通知（Sync エラー通知 + Drop 時の `MFX_ERR_ABORTED`）は非同期モデルの制約として許容する方針。0010 はプロダクションコード変更なしで closed 済みのため、本 issue は 0010 の調査結果・方針を参照するのみで適用差分はない）
 - 関連 issue: 0020（encode.rs のサブモジュール分割。`WorkerCommand` / `run_sync_worker` を移動するため、0020 は本 issue 適用後に調整する）
+- 関連 issue: 0027（`Encoder::get_video_param()` に `ExtParam` を渡す手段の追加。本 issue の reconfigure テストでの LookAheadDepth / QVBRQuality 保持検証に利用する。0027 は本 issue のテスト実装での利用方法に合わせて設計を確定するため、相互に参照して実装する）
 - `finish_pending_error` / `mismatched_timestamp_error` / `canceled_error` は `src/encode.rs` の worker 関連のエラー関数
