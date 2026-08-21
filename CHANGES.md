@@ -21,6 +21,10 @@
   - @melpon
 - [UPDATE] libvpl を 2.16.0 から 2.17.0 に更新する
   - @voluntas
+- [FIX] Decoder の DEVICE_BUSY / MORE_SURFACE リトライに上限を設ける
+  - Encoder と同様に 1ms スリープで最大 30 回リトライし、上限超過時はエラーを返す
+  - `finish` のドレインループの `FrameSurface::new` 呼び出し順序を `decode_bitstream` と統一する
+  - @melpon
 
 ### misc
 

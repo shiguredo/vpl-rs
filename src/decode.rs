@@ -5,6 +5,9 @@ use std::thread;
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
 
+/// デバイスビジー時の最大リトライ回数
+const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
+
 /// デコーダ用コーデック識別子
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderCodec {
@@ -230,6 +233,61 @@ pub struct Decoder<H: DecodeHandler> {
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
+/// DecodeFrameAsync を DEVICE_BUSY / MORE_SURFACE の上限付きリトライ付きで実行する
+///
+/// 最終ステータスが、MFX_ERR_MORE_DATA（入力不足 / ドレイン完了）または
+/// 正の警告（MFX_WRN_VIDEO_PARAM_CHANGED / MFX_WRN_ALLOC_TIMEOUT_EXPIRED 等）の場合は Ok を返す。
+/// MFX_ERR_MORE_DATA 以外の負値のエラーとリトライ上限超過の場合は Err を返す。
+fn call_decode_frame_async_with_retry(
+    session: &Session,
+    bs: *mut sys::mfxBitstream,
+    out_surface: &mut *mut sys::mfxFrameSurface1,
+    syncp: &mut sys::mfxSyncPoint,
+) -> Result<i32, Error> {
+    let mut last_status = sys::mfxStatus_MFX_ERR_NONE;
+    for _ in 0..DEVICE_BUSY_MAX_RETRIES {
+        // surface_work=NULL で VPL 内部割り当てを使用する
+        last_status = session.lib().mfx_video_decode_frame_async(
+            session.as_ptr(),
+            bs,
+            std::ptr::null_mut(),
+            out_surface,
+            syncp,
+        );
+        if last_status == sys::mfxStatus_MFX_WRN_DEVICE_BUSY
+            || last_status == sys::mfxStatus_MFX_ERR_MORE_SURFACE
+        {
+            // デバイスが混雑 / 出力サーフェス不足。1ms 待って再試行する
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+        if last_status == sys::mfxStatus_MFX_ERR_MORE_DATA {
+            return Ok(last_status);
+        }
+        if last_status < 0 {
+            return Err(Error::from_mfx(
+                last_status,
+                "MFXVideoDECODE_DecodeFrameAsync",
+            ));
+        }
+        return Ok(last_status);
+    }
+    // リトライ上限超過。最後に返ったステータスでエラーメッセージを分岐する
+    // リトライループは DEVICE_BUSY / MORE_SURFACE 以外のステータスですぐに return しているので、
+    // 上限超過時の last_status は必ず DEVICE_BUSY か MORE_SURFACE のどちらかになる。
+    if last_status == sys::mfxStatus_MFX_ERR_MORE_SURFACE {
+        Err(Error::new_custom(
+            "MFXVideoDECODE_DecodeFrameAsync",
+            "more surface after max retries",
+        ))
+    } else {
+        Err(Error::new_custom(
+            "MFXVideoDECODE_DecodeFrameAsync",
+            "device busy after max retries",
+        ))
+    }
+}
+
 impl<H: DecodeHandler> Decoder<H> {
     /// デコーダを作成する
     ///
@@ -353,34 +411,18 @@ impl<H: DecodeHandler> Decoder<H> {
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
-            // surface_work=NULL で VPL 内部割り当てを使用する
-            let status = self.session.lib().mfx_video_decode_frame_async(
-                self.session.as_ptr(),
+            let status = call_decode_frame_async_with_retry(
+                &self.session,
                 bs,
-                std::ptr::null_mut(),
                 &mut out_surface,
                 &mut syncp,
-            );
+            )?;
 
             // MORE_DATA: データ不足。VPL 内部に蓄積済み。呼び出し元に戻る
             if status == sys::mfxStatus_MFX_ERR_MORE_DATA {
                 return Ok(());
             }
-            // MORE_SURFACE: 内部割り当てでは通常発生しないが、安全のため再試行
-            if status == sys::mfxStatus_MFX_ERR_MORE_SURFACE {
-                continue;
-            }
-            // DEVICE_BUSY: デバイスが混雑している。1ms 待って再試行
-            if status == sys::mfxStatus_MFX_WRN_DEVICE_BUSY {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            if status < 0 {
-                return Err(Error::from_mfx(status, "MFXVideoDECODE_DecodeFrameAsync"));
-            }
-
-            // MFX_ERR_NONE または MFX_WRN_*（DEVICE_BUSY 以外）。
-            // syncp が非 null ならデコード済みフレームが存在する
+            // デコード済みフレームが存在する場合は Worker に送信する
             if !syncp.is_null() {
                 let frame_surface = FrameSurface::new(self.session.lib(), out_surface)?;
                 self.send_worker_command(
@@ -416,38 +458,30 @@ impl<H: DecodeHandler> Decoder<H> {
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
             // null bitstream で残留フレームを排出する
-            let status = self.session.lib().mfx_video_decode_frame_async(
-                self.session.as_ptr(),
-                std::ptr::null_mut(),
+            let status = call_decode_frame_async_with_retry(
+                &self.session,
                 std::ptr::null_mut(),
                 &mut out_surface,
                 &mut syncp,
-            );
+            )?;
 
             // MORE_DATA: すべての残留フレームを排出済み
             if status == sys::mfxStatus_MFX_ERR_MORE_DATA {
                 break;
             }
-            if status == sys::mfxStatus_MFX_WRN_DEVICE_BUSY {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            if status < 0 {
-                return Err(Error::from_mfx(status, "MFXVideoDECODE_DecodeFrameAsync"));
-            }
-            let frame_surface = FrameSurface::new(self.session.lib(), out_surface)?;
-            if syncp.is_null() {
-                continue;
-            }
-            self.send_worker_command(
-                "Decoder::finish",
-                WorkerCommand::Sync {
-                    sync_data: DecodeSyncData {
-                        syncp,
-                        frame_surface,
+            // デコード済みフレームが存在する場合は Worker に送信する
+            if !syncp.is_null() {
+                let frame_surface = FrameSurface::new(self.session.lib(), out_surface)?;
+                self.send_worker_command(
+                    "Decoder::finish",
+                    WorkerCommand::Sync {
+                        sync_data: DecodeSyncData {
+                            syncp,
+                            frame_surface,
+                        },
                     },
-                },
-            )?;
+                )?;
+            }
         }
 
         // ここまでに送ったコマンドが Worker 側で全て処理されるまで待つ
