@@ -149,3 +149,11 @@ let _ = writeln!(
 - **issue 0023** (`0023-test-fix-silent-pass-tests`): `frame_surface_gpu_required` の silent early-return を修正する。完了条件 8 の既存テスト担保は 0023 適用後を前提とするため、**適用順序は 0023 を先に適用する**（0023 側も本 issue を前提として相互参照している）。
 - **issue 0019** (`0019-refactor-extract-vpl-loader-builder`): `src/vpl.rs` に `LoaderBuilder` を導入し `create_session` を書き換える。本 issue の変更箇所（`FrameSurface::Drop` / `Session::Drop` / ヘルパー追加）とは関数が重ならず競合なし（0019 側も「競合なし」と明記）。
 - **issue 0020** (`0020-refactor-split-encode-module`): `Encoder::Drop` を `src/encode/encoder.rs` へ移動する。本 issue の `Encoder::Drop` 変更は 0020 の分割に独立に適用可能（0020 側も「独立に適用可能」と明記）。
+
+## pending の理由
+
+本 issue は、Drop 経路で失敗した VPL API のエラーをどの手段で出力するかがログライブラリの導入方針に依存するため、ログライブラリを導入するまで保留する。
+
+- 本 issue の設計方針は、ログライブラリを導入せず `writeln!(std::io::stderr(), "[vpl-rs] {}", error)` の stderr 直書きを選択している（Drop 内で panic しない制約のため）。
+- 一方、本リポジトリの `Cargo.toml` は `[dependencies]` が空であり、ログライブラリ（tracing 等）が未導入である。ログ基盤を導入する場合、stderr 直書きではなく導入したログ基盤に合わせた実装（例: tracing の error! マクロ）に置き換えるべきであり、出力手段を二重に持たせない方がよい。
+- したがって、ログライブラリの導入方針が決まるまで本 issue は実装しない。ログライブラリを導入した際に、本 issue の設計を導入したログ基盤に合わせて更新してから実装する。
