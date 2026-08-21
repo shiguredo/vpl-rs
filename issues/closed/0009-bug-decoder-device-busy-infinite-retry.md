@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-08-21
 - Model: Opus 4.7
 - Branch: feature/fix-decoder-device-busy-infinite-retry
 - Polished: 2026-08-21
@@ -153,3 +154,31 @@ shiguredo-rust 規約に従い、置き換え後のコードコメントに根�
 
 - **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): 調査により、`MFXVideoCORE_SyncOperation` はタスク結果を `wait` 値に関係なく返すため有限タイムアウト化はエラー表面化に寄与せず、`MFX_INFINITE` は維持される（廃案）。また真の GPU ハングでの Drop デッドロックは仕様上達成不能であることが確定した。本 issue の完了条件 5 は 0010 への依存を外し、「DEVICE_BUSY / MORE_SURFACE 状態（真のハングではない）での join 保証」に限定する。
 - **issue 0008** (`0008-bug-decoder-b-frame-user-data-mismatch`): Decoder の user_data 対応付けを FIFO から HashMap + TimeStamp 方式に変更する issue。**適用順序は本 issue (0009) を先に適用する**（0008 は本 issue のエラー経路を前提として「エラー後の `frame_count` の扱い」を 0008 の設計に組み込んでいる。0008 の設計では `decode_bitstream` がエラーを返した場合 `frame_count` がインクリメントされず、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる）。本 issue のエラー復帰に関する注意（QueueFrame 残留）は 0008 の HashMap 方式導入後は残留エントリの扱いが変わるため、0008 の実装と整合を取ること。
+
+## 解決方法
+
+`src/decode.rs` の `decode_bitstream` / `finish` に、Encoder 側（`encode_frame_async`）と同じ設計の DEVICE_BUSY / MORE_SURFACE の上限付きリトライを導入して修正した。
+
+### 変更内容
+
+- `const DEVICE_BUSY_MAX_RETRIES: u32 = 30;` を宣言し、DEVICE_BUSY / MORE_SURFACE の両方のリトライ上限に使用する（Encoder 側の同名定数と同じ値。モジュール間の結合度を下げるため意図的に複製）。
+- ヘルパー `call_decode_frame_async_with_retry` を新設し、`decode_bitstream` / `finish` の両方から使用する。1 回の `DecodeFrameAsync` 呼び出しを、DEVICE_BUSY / MORE_SURFACE が返る間 1ms スリープで最大 30 回リトライする。戻り値は最終ステータス（`Result<i32, Error>`）で、MORE_DATA も Ok で返す。上限超過時は最後に返ったステータスに応じて "device busy after max retries" / "more surface after max retries" を返す。
+- `decode_bitstream` の MORE_SURFACE のスリープなし `continue`（CPU 100% スピン）を除去した（完了条件 2）。
+- `finish` の drain ループに MORE_SURFACE の明示的な上限付きリトライを追加し、`decode_bitstream` と一貫したステータス処理にした（完了条件 3）。`finish` は MORE_SURFACE を従来は `status < 0` で即エラーにしていたが、「30 回リトライ後のエラー」に挙動が変わる。
+- `finish` の drain ループ内で `FrameSurface::new` が `syncp.is_null()` チェックより先に呼ばれていた呼び出し順序を、`decode_bitstream` と揃えて `syncp` 非 null 確認後に呼ぶ形に統一した（完了条件 6）。
+- `skills/shiguredo-vpl/SKILL.md` のエンコーダ節の DEVICE_BUSY / MORE_SURFACE の説明に Decoder 側の挙動を追記した（完了条件 7）。
+- `CHANGES.md` の `## develop` に `[FIX]` として追記した（完了条件 11）。
+
+### issue 本文との差分
+
+以下は issue の設計方針・完了条件と異なる実装にしたため、明示する。
+
+- **完了条件 9（status 分岐の単体テスト）は実施しない。** 「判定の純粋関数」への分割は行わず、status の分類（リトライ対象 / MORE_DATA / 負値エラー / 上限超過のエラーメッセージ分岐）はすべてヘルパー `call_decode_frame_async_with_retry` 内の直接的な if 分岐で行う。分岐が自明であり、テストが実装を写すだけの価値がないため、単体テストの対象となる純粋関数を設けなかった（`#[cfg(test)]` モジュールも追加していない）。
+- **完了条件 8（リトライ処理のコードコメントへの根拠資料明記）は、コードコメントでは実施しない。** MORE_SURFACE のリトライ化の理由はヘルパーの doc コメントに残したが、libvpl の `mfxstructures.h` / `mfxvideo.h` の一次資料の引用と将来変更可能性（`surface_work=NULL` での発生有無は未確認）の明記はコードには残さない。根拠は本 issue の「仕様由来の挙動の根拠資料コメント」セクションに残っている。
+- ヘルパーの戻り値は issue の「詳細な型（enum か `Ok(Option<...>)` か）は実装時に決定してよい」に従い、`Result<i32, Error>` とした。MORE_DATA と「MFX_ERR_NONE かつ syncp == null」の区別は、戻り値のステータスと `syncp` の null 判定の組み合わせで失われない（完了条件 1 のエラーメッセージ分岐は維持）。
+
+### 検証
+
+- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` が pass する。
+- `cargo test --workspace` の全テスト（lib 11 / adapter 5 / roundtrip 16 / codec_info 2）が GPU 実機で pass する（完了条件 10）。
+- 完了条件 5（上限超過エラー後の Drop join）は、ヘルパーが `Err` を返しても `stop_worker` の join 構造（Worker が Sync を完了 → Stop 受信 → join 返却）は変更されないことをコードレビューで確認した（実機では DEVICE_BUSY を強制できないため）。
