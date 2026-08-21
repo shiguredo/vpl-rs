@@ -6,10 +6,6 @@ use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
 
 /// デバイスビジー時の最大リトライ回数
-///
-/// DEVICE_BUSY と MORE_SURFACE の両方のリトライ上限に使用する。
-/// Encoder 側（src/encode.rs）の同名定数と同じ値だが、モジュール間の結合度を下げるため
-/// 意図的に複製している。値変更時は両方の意図を確認して同時に更新すること。
 const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 
 /// デコーダ用コーデック識別子
