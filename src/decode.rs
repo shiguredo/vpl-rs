@@ -235,10 +235,9 @@ unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
 /// DecodeFrameAsync を DEVICE_BUSY / MORE_SURFACE の上限付きリトライ付きで実行する
 ///
-/// 戻り値は最終ステータスで、MFX_ERR_MORE_DATA（入力不足 / ドレイン完了）も Ok で返す。
-/// 負値エラーとリトライ上限超過のみ Err にする。
-/// 正の警告（MFX_WRN_VIDEO_PARAM_CHANGED / MFX_WRN_ALLOC_TIMEOUT_EXPIRED 等）はリトライ対象外で、
-/// 呼び出し元の syncp 非 null チェックへ流す。
+/// 最終ステータスが、MFX_ERR_MORE_DATA（入力不足 / ドレイン完了）または
+/// 正の警告（MFX_WRN_VIDEO_PARAM_CHANGED / MFX_WRN_ALLOC_TIMEOUT_EXPIRED 等）の場合は Ok を返す。
+/// MFX_ERR_MORE_DATA 以外の負値のエラーとリトライ上限超過の場合は Err を返す。
 fn call_decode_frame_async_with_retry(
     session: &Session,
     bs: *mut sys::mfxBitstream,
@@ -247,6 +246,7 @@ fn call_decode_frame_async_with_retry(
 ) -> Result<i32, Error> {
     let mut last_status = sys::mfxStatus_MFX_ERR_NONE;
     for _ in 0..DEVICE_BUSY_MAX_RETRIES {
+        // surface_work=NULL で VPL 内部割り当てを使用する
         last_status = session.lib().mfx_video_decode_frame_async(
             session.as_ptr(),
             bs,
@@ -411,7 +411,6 @@ impl<H: DecodeHandler> Decoder<H> {
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
             let mut out_surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
 
-            // surface_work=NULL で VPL 内部割り当てを使用する
             let status = call_decode_frame_async_with_retry(
                 &self.session,
                 bs,
