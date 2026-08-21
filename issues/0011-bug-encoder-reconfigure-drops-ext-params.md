@@ -104,7 +104,7 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 ### 適用順序（他 issue との関係）
 
 - **issue 0012** (`0012-bug-encoder-reconfigure-does-not-drain-pending`): reconfigure が pending frame を drain しない問題。本 issue (0011) と 0012 は同一の `Encoder::reconfigure` を修正するため、**0011 を先に適用し、その差分の上に 0012 の変更を重ねる**。0012 側は 0011 の ExtParam セット処理を前提とした設計になっている。また 0012 の reconfigure 処理（パラメータ適用 → DrainPending → Reset）で早期リターン経路が挟まるため、「`video_param.ExtParam` のクリアを関数の最後で行う」ことを 0012 の実装でも維持する（0011 の完了条件 3 の不変条件を 0012 のエラー経路でも破らないこと）。
-- **issue 0020** (`0020-refactor-split-encode-module`): encode.rs のサブモジュール分割。0020 は「ExtBuffers はローカル変数として使用し、Init 後は即破棄する（Encoder のフィールドとして保持しない）」と設計しているが、これは本 issue (0011) の「Box フィールド保持」と衝突する。**0020 は本 issue 適用後の設計（Box フィールド保持 + `build_ext_buffers` ヘルパー）に合わせて調整する**。0020 の `build_ext_buffers` 切り出しは本 issue のヘルパー関数と共通化できる。
+- **issue 0020** (`0020-refactor-split-encode-module`): encode.rs のサブモジュール分割。0020 は本 issue (0011) の「Box フィールド保持 + `build_ext_buffers` ヘルパー」設計に合わせて調整済みである（0020 の設計方針・完了条件 2 参照。「ExtBuffers はローカル変数として使用し、Init 後は即破棄する」という旧設計は 0020 側で採用していない）。0020 の `build_ext_buffers` 切り出しは本 issue のヘルパー関数と共通化できる。
 
 ## 完了条件
 
