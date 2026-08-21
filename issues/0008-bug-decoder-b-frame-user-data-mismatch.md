@@ -5,7 +5,7 @@
 - Completed: {YYYY-MM-DD}
 - Model: Opus 4.7
 - Branch: feature/fix-decoder-b-frame-user-data-mismatch
-- Polished: 2026-08-02
+- Polished: 2026-08-21
 
 ## 目的
 
@@ -17,7 +17,7 @@ High。以下の理由による。
 
 - **サイレントなデータ破損**: エラーは発生せず、user_data だけが誤って紐付くか消失する。呼び出し側は「何かがずれている」と気付きにくい。
 - **公開 API の契約違反**: `skills/shiguredo-vpl/SKILL.md` は「`user_data` は FIFO キュー (`VecDeque`) で `decode()` 呼び出し順に対応付く。ビットストリームがフレーム境界をまたいでも順序は保たれる」と明記しているが、B フレームによる表示順並び替えでこの契約が破綻する。
-- **利用側への影響**: Sora など Decoder を利用するダウンストリームで、user_data に「対応する入力フレームの ID」を載せて追跡している全ユースケースが壊れる。
+- **利用側への影響**: `user_data` に「対応する入力フレームの ID」を載せて出力フレームを追跡している利用者では、B フレーム有りのビットストリームで誤対応付けにより追跡が破綻する。
 
 ## 現状
 
@@ -46,7 +46,7 @@ while let Ok(command) = worker_rx.recv() {
 
 ### VPL 側の出力順の仕様
 
-`src/decode.rs` の `initialize` は `mfxVideoParam.mfx.DecodedOrder` を設定していない。VPL のデフォルト動作は AVC / HEVC で **display order で出力する**（`DecodedOrder` 未設定時のデフォルト。一次資料の引用はリポジトリ内に存在しないため、完了条件 1 の実機確認で確認する）。したがって Decoder は自動的に並び替えられた順で `Sync` を返してくる。
+`src/decode.rs` の `initialize` は `mfxVideoParam.mfx.DecodedOrder` を設定していない。VPL のデフォルト動作は AVC / HEVC で **display order で出力する**（`DecodedOrder` 未設定時のデフォルト。一次資料 `refs/oneVPL/api/vpl/mfxstructures.h` の `mfxInfoMFX::DecodedOrder` 説明は「For AVC and HEVC, used to instruct the decoder to return output frames in the decoded order.」であり、未設定（0）なら指示なし = decode order ではない出力となる。また同説明の続き「When enabled, correctness of `mfxFrameData::TimeStamp` and `FrameOrder` for output surface is not guaranteed, the application should ignore them.」は、DecodedOrder 有効時の出力 `surface.Data.TimeStamp` の破壊的影響を述べるものであり、未設定（本 design）ならこの影響を受けないことを示す。実機での確認は完了条件 1）。したがって Decoder は自動的に並び替えられた順で `Sync` を返してくる。
 
 ### 実例
 
@@ -92,6 +92,8 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 本設計は VPL が `mfxBitstream.TimeStamp` を出力 `mfxFrameSurface1.Data.TimeStamp` に伝搬することを前提とする。Encoder 側の伝搬（`surface.Data.TimeStamp` → `bitstream.TimeStamp`）は方向が逆であり、動作実績があるからといって Decoder 側も成立する保証はない。実装着手前に必ず実機で伝搬を確認する。
 
+なお、`refs/oneVPL-intel-gpu` のデコーダ実装には `bs.TimeStamp` → `surface.Data.TimeStamp` の伝搬経路が全 4 コーデックで実装されている。入力側は `_studio/mfx_lib/shared/src/mfx_common_decode_int.cpp` の `MFXMediaDataAdapter::Load` が `SetTime(GetUmcTimeStamp(pBitstream->TimeStamp))` で `bs.TimeStamp` を UMC フレームへ取り込み、出力側は各コーデックのデコード処理が `surface_out->Data.TimeStamp` に書き戻す（H.264: `_studio/mfx_lib/decode/h264/src/mfx_h264_dec_decode.cpp`、H.265: `_studio/mfx_lib/decode/h265/src/mfx_h265_dec_decode.cpp`、VP9: `_studio/mfx_lib/decode/vp9/src/mfx_vp9_dec_decode_hw.cpp` の `(*surface_out)->Data.TimeStamp = bs->TimeStamp != MFX_TIMESTAMP_UNKNOWN ? bs->TimeStamp : ...`、AV1: `_studio/mfx_lib/decode/av1/src/mfx_av1_dec_decode.cpp`）。仕様文言上の保証ではないため実機確認は必須だが、確認の効率化に使える。
+
 確認方法: `bs.TimeStamp` に既知値を設定して `DecodeFrameAsync` を呼び、**SyncOperation 完了後**に出力 `out_surface.Data.TimeStamp` の値を確認する（非同期デコードでは Sync 完了前の値は確定していないため、必ず Sync 後に読む）。B フレーム表示順出力で遅延出力されるフレームと `finish()` のドレイン期に出力されるフレームについても、TimeStamp が対応する入力フレームの `frame_seq` と一致することを確認する。
 
 伝搬が確認できなければ、代替として `frame_seq` を `bs.Reserved[1]` などの予約フィールドに載せる方式を検討し、issue を再起票する。
@@ -100,7 +102,12 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 現在の `decode_bitstream()` はループ内で複数回 `Sync` を送り得るが、`QueueFrame` は `decode()` 呼び出し 1 回につき 1 つしか送られない。また `skills/shiguredo-vpl/SKILL.md` が保証する「ビットストリームがフレーム境界をまたいでも順序は保たれる」は、1 フレームが複数回の `decode()` 呼び出しに分割されて供給されるケースを含む。
 
-複数 Sync の 2 つ目以降がどの `frame_seq` を持つかは実機確認まで確定しない。リスク A の確認手順で「出力フレームの TimeStamp が対応する入力フレームの `frame_seq` と一致する」ことを確認できれば、2 つ目以降の Sync も正しく引き当てられる。
+複数 Sync の 2 つ目以降がどの `frame_seq` を持つかは実機確認まで確定しない。リスク A の確認手順で「出力フレームの TimeStamp が対応する入力フレームの `frame_seq` と一致する」ことを確認できれば、2 つ目以降の Sync も正しく引き当てられる。なお、この「正しく引き当てられる」が成立する前提は「1 回の `decode()` 呼び出し = 1 出力フレーム」である。1 回の `decode()` で複数フレームが出力された場合、`bs.TimeStamp` は呼び出しごとに 1 回しか設定されないため、複数出力が同一 `frame_seq` を共有し得る（この場合 2 つ目以降は引き当て失敗で drain 扱いとなる。現行 FIFO 方式でも同様に 1 呼び出し 1 `QueueFrame` のため、回帰ではない）。
+
+なお、出力 TimeStamp の決定メカニズムはコーデックにより異なり、「同一 `frame_seq` の共有」の起こりやすさも変わる（いずれも実機確認で確定する）:
+- **VP9**: 入力 `bs->TimeStamp` を直接コピーするため（`mfx_vp9_dec_decode_hw.cpp` の `(*surface_out)->Data.TimeStamp = bs->TimeStamp != MFX_TIMESTAMP_UNKNOWN ? bs->TimeStamp : ...`）、1 呼び出しで複数フレーム出力すると同一値の共有が起こり得る。
+- **H.264 / H.265 / AV1**: 入力 `bs->TimeStamp` を各フレームの時刻（`m_dFrameTime` / `FrameTime`）に保存し、そのフレーム自身の時刻を出力に書き戻すため（H.264: `mfx_h264_dec_decode.cpp`、H.265: `mfx_h265_dec_decode.cpp`、AV1: `mfx_av1_dec_decode.cpp`）、同一入力から複数フレームが出力される場合も各フレームの時刻がそのまま伝搬する。
+- また TimeStamp は H.264 / H.265 / AV1 で VPL 内部の u64 → double → u64 の往復変換（90kHz の単位換算、`GetUmcTimeStamp` / `GetMfxTimeStamp`）を経るため、「完全一致」が変換の丸め精度に依存する点にも注意する（この範囲はリスク A の実機確認で検証する。VP9 は変換を経ず直接コピー）。
 
 分割入力では `bs.TimeStamp` が呼び出しごとに上書きされるため、出力フレームの TimeStamp がどの呼び出しの `frame_seq` になるか（先頭 / 途中 / 最後は VPL 実装依存）によって引き当てられる user_data が変わる。FIFO 方式では常に「フレームの先頭呼び出しの user_data」が付いた。分割入力時の対応付けは保証しないため、`skills/shiguredo-vpl/SKILL.md` の「フレーム境界をまたいでも順序は保たれる」の記述を、分割入力時の user_data 対応付けが保証されない旨に更新する。
 
@@ -108,7 +115,7 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 **リスク C: VP9 / AV1 での TimeStamp 伝搬未確認によるリグレッション**
 
-本修正は全コーデックに `HashMap` + `TimeStamp` 一致方式を適用する。現在の FIFO 方式は B フレームを持たない VP9 / AV1 で正しく動作しているが、`bs.TimeStamp` → `surface.Data.TimeStamp` 伝搬が VP9 / AV1 で成立しない場合、全 user_data の引き当てが空振りになり、ハンドラにはエラーのみが通知される。
+本修正は全コーデックに `HashMap` + `TimeStamp` 一致方式を適用する。現在の FIFO 方式は B フレームを持たない VP9 / AV1 で正しく動作しているが、`bs.TimeStamp` → `surface.Data.TimeStamp` 伝搬が VP9 / AV1 で成立しない場合、全 user_data の引き当てが空振りになり、`on_decoded(Ok(...))` は通知されず、`pending_map` が残留して `finish()` の `WaitIdle` 残留チェック（項目 11）でエラー通知され、`finish()` が `Err` を返す。
 
 対処: リスク A の伝搬確認を H.264 / H.265 に加えて VP9（可能なら AV1）でも実施する。伝搬が確認できないコーデックでは HashMap 方式を無効化して FIFO 方式を維持する分岐を実装する（分岐の配線は、`run_sync_worker` へコーデック情報を渡す形を実装時に検討する）。
 
@@ -118,7 +125,7 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 1. **`Decoder` 構造体に `frame_count: u64` を追加する**
    - Encoder と同様に連番を管理する。
-   - 初期値は 1 とする（依存 issue 0013 の Encoder 側の初期値 1 と整合させる）。
+   - 初期値は 0 とする（Encoder の `frame_count` 初期値 0 と対称にする。0013 は closed で「`frame_count` 1 スタート化」は不採用のため、本 issue の初期値は 0013 に依存せず決定する）。
 
 2. **`decode()` 内で `bs.TimeStamp` に `frame_seq` を設定する**
    - 現在の `decode()` では `bs` を `zeroed()` で初期化し `TimeStamp = 0` のままである。
@@ -156,7 +163,7 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
      4. 引き当て成功: 既存の `read_decoded_surface(&frame_surface, user_data)` を呼び、`DecodedFrame` を構築して `handler.on_decoded(Ok(frame))`
      5. 引き当て失敗: エラー通知は行わず、そのまま `Ok(())` を返す（`Sync` アームでの分岐は不要。Map 済みの `frame_surface` は Drop 時に `Unmap + Release` が自動実行されるため、解放のみが自動で行われる）
    - `sync_and_callback` の `Err` はデータ破損系（`SyncOperation` 失敗・`map_read` 失敗・`read_decoded_surface` の検証エラー）のみとする。**引き当て失敗は `Err` にしない**（ドレインの空フレームや異常出力が原因の正常な破棄として扱う）。
-   - `SyncOperation` 失敗（デバイスエラー等）時は `Err` を返し、Worker の `Sync` アームが `handler.on_decoded(Err(...))` で通知する。このとき対応する `pending_map` エントリは消費できない（`SyncOperation` 完了前に出力 timestamp が確定せず、どのエントリか特定できないため）。残留エントリは `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねる。デバイスエラー時は同一 user_data が 2 回通知（Sync エラー + Drop 時の ABORTED）され得るが、これは TimeStamp 方式の制約であり許容する（0010 の Encoder 側「Sync エラー時に `take_by_frame_seq` で pending を消費してから `Err` を返す」方針は、Decoder 側には適用できない）。
+   - `SyncOperation` 失敗（デバイスエラー等）時は `Err` を返し、Worker の `Sync` アームが `handler.on_decoded(Err(...))` で通知する。このとき対応する `pending_map` エントリは消費できない（`SyncOperation` 完了前に出力 timestamp が確定せず、どのエントリか特定できないため）。残留エントリは `WaitIdle` アームの残留チェック（項目 11）で通知され、`finish()` が `Err` を返す。`finish()` を呼ばずに `Drop` した場合は `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねる。デバイスエラー時は同一 user_data が 2 回通知（Sync エラー + 残留処理）され得るが、これは TimeStamp 方式の制約であり許容する（0010 の Encoder 側も二重通知を許容する方針に変更された。0010 の設計方針 2 参照）。
    - 引き当て失敗の破棄は `sync_and_callback` 内部で完結するため、`Sync` アームからの `sync_and_drain` 呼び出しは不要になり、**`sync_and_drain` は呼び出し元が消滅するため削除する**（0010 は `sync_and_drain` を変更せず、0014 は変更対象外としている。削除は 0008 の変更に含める）。
 
 7. **`run_sync_worker` のマッチアームを書き換える**
@@ -186,8 +193,9 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 11. **`WaitIdle` アームで `pending_map` の残留チェックを追加する**
     - Encoder 側の `run_sync_worker` の `WaitIdle` アームを移植する。
     - 残留エントリがある場合は、全エントリを drain して各エントリに「`decode pending frame seq={frame_seq}`」を含むエラーメッセージでハンドラに通知し、`reply_tx` にエラーを返す。
-   - このエラーメッセージはテスト可能であること。
-   - B フレーム表示順出力では `finish()` のドレインで末尾フレームが出力されるため、1 フレーム = 1 `decode()` 呼び出しの通常利用では残留は発生しない。残留が発生するのは「入力フレームが出力されない」異常系（Sync 失敗の連続等）と、フレーム境界をまたぐ分割入力（リスク B 参照。分割入力では複数の `frame_seq` のうち出力に消費されないものが残留する）。
+    - このエラーメッセージはテスト可能であること。
+    - 残留の処理担当の整理: 通常フロー（`finish()` を呼ぶ）では、Sync 失敗時に消費されなかった `pending_map` エントリはここ（`WaitIdle`）で drain され、`finish()` が `Err` を返す。`finish()` を呼ばずに `Drop` した場合のみ `Stop` アーム（項目 10）が一括 `MFX_ERR_ABORTED` で通知する（項目 6 参照）。「Stop に委ねる」は `finish()` を呼ばない Drop 経路の話であり、通常フローでは `WaitIdle` が先に処理するため、項目 6 と矛盾しない。
+    - B フレーム表示順出力では `finish()` のドレインで末尾フレームが出力されるため、1 フレーム = 1 `decode()` 呼び出しの通常利用では残留は発生しない。残留が発生するのは「入力フレームが出力されない」異常系（Sync 失敗の連続等）と、フレーム境界をまたぐ分割入力（リスク B 参照。分割入力では複数の `frame_seq` のうち出力に消費されないものが残留する）。
 
 12. **`use std::collections::HashMap;` を import に追加する**
     - `VecDeque` は `decode.rs` 内で `pending_values` のみで使用されていたため削除し、`HashMap` に置き換える。
@@ -202,14 +210,14 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 3. **B フレーム有効時の統合テストを追加する**
    - `gop_ref_dist = Some(3)` (2 B フレーム) で N >= 15 フレームのラウンドトリップ。
-   - H.264 は profile に Main 以上を指定する（Baseline プロファイルは B フレームを符号化しないため）。H.265 は Main を指定する。`gop_pic_size` も指定して GOP 構造を確定させる。
+   - H.264 は profile に Main 以上を指定する（Baseline プロファイルは B スライスを符号化しないという H.264 規格の制約による。一次資料（`refs/`）で直接確認できないため、テスト項目の「B ピクチャが含まれることを確認する」で裏付ける）。H.265 は Main を指定する。`gop_pic_size` も指定して GOP 構造を確定させる。
    - Encoder で入力フレームごとに `user_data = frame_index` (0..N-1) を渡し、Encoder 出力の `EncodedFrame::user_data()` を Decoder 入力の `user_data` に転送する。
    - Encoder 出力のうちドレイン期の空データフレーム（`data()` が空、`DataLength == 0`）は Decoder に渡さず除外する（空フレームを `decode()` に渡すと `QueueFrame` が 1 つ消費されるだけでフレームが出力されず、`pending_map` に残留して `finish()` の残留チェックでエラーになるため）。
-   - なお、エンコーダのドレイン空フレームは `TimeStamp = 0` のまま生成されるため（`create_bitstream()` が `zeroed()` で初期化する）、0013 適用後（`frame_count` が 1 スタート）は pending に引き当てられず「no pending frame for bitstream timestamp 0」の `Err` 通知になる可能性がある。テストヘルパーではこの `Err` をドレイン期の空フレームに限って許容する（エンコーダ側の既存の課題であり、対応は別 issue として切り出すことを終了報告で提案する）。
+   - なお、エンコーダのドレイン空フレームは `TimeStamp = 0` のまま生成されるため（`create_bitstream()` が `zeroed()` で初期化する）、ドレイン空フレームは `frame_seq = 0` の pending が残っていればそれを誤消費し（この場合エラーは実フレーム 0 の出力時に顕在化）、残っていなければ「no pending frame for bitstream timestamp 0」の `Err` 通知になる（エンコーダ側の既存の課題であり、issue 0025 で対応する。0013 は closed で `frame_count` 1 スタート化は不採用のため、この前提は 0013 に依存しない）。テストヘルパーではこの `Err` をドレイン期の空フレームに限って許容する（issue 0025 の完了条件 2 参照）。
    - Decoder の全コールバック出力を収集し、以下を検証する:
      1. `DecodedFrame::user_data()` の集合が `{0..N-1}` と一致（過不足なし）
      2. 各値がちょうど 1 回出現（重複なし）
-     3. `user_data == i` の出力フレームの Y プレーンが入力フレーム i の内容と一致する（対応付けの正しさの直接検証）。非可逆圧縮のため完全一致はしないので、既存の `psnr_y` ヘルパーで PSNR を計算し、入力フレーム i との PSNR が閾値（既存テストと同じ 25.0 dB を目安）以上であること、かつ入力フレーム j (j ≠ i) との PSNR より十分高いことを確認する。閾値の妥当性（誤対応フレームとの PSNR 差が十分あること）は実装時に確認する
+     3. `user_data == i` の出力フレームの Y プレーンが入力フレーム i の内容と一致する（対応付けの正しさの直接検証）。非可逆圧縮のため完全一致はしないので、既存の `psnr_y` ヘルパーで PSNR を計算し、入力フレーム i との PSNR が閾値（既存テストと同じ 25.0 dB を目安）以上であること、かつ入力フレーム j (j ≠ i) との PSNR より十分高いことを確認する。**注意**: 既存の `generate_dummy_nv12` は `(x + y + frame_index * 7) % 256` で画素値を生成するため、隣接フレーム間の PSNR は mod-256 のラップアラウンドにより約 15.8 dB となる（全画素の差が 7 と仮定した約 31 dB ではない。数値は 320x240 での計算値であり、解像度が異なると変わり得る）。したがって誤対応フレームとの PSNR は 25.0 dB を下回り、単独閾値でも誤対応は検出可能だが、「正しいフレームとの PSNR が誤対応フレームとの PSNR より十分高い」ことを主判定にする（対応付けの正しさを直接検証するため）。
    - 検証 3 が回帰検出能力を持つこと（修正前の FIFO 方式では失敗すること）を、新テストヘルパーと修正前の `decode.rs` のロジックの組合せで実装時に確認する。
    - Encoder 出力に B ピクチャが含まれることを確認する（`EncodedFrame::picture_type()` が `PictureType::B` のフレームが 1 つ以上あること。B フレームが実際に生成されたことの検証）。
 
@@ -255,7 +263,7 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 ## 依存 issue
 
-- **issue 0013** (`0013-bug-encoder-frame-seq-zero-timestamp-collision`): Encoder 側の `frame_count` 初期値を 1 に変更する修正。本 issue の `frame_count` 初期値も 1 と整合させる。
-- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): Encoder 側の二重通知修正（`SyncData` への `frame_seq` 追加、Sync エラー時の `take_by_frame_seq` による pending 消費）とデバイスエラー伝搬の検証を行う。`sync_and_drain` / `sync_and_callback` の `MFX_INFINITE` は変更しない（0010 の調査により、有限タイムアウト化はエラー表面化に寄与しないため廃案）。本 issue で `sync_and_callback` のシグネチャを変更するため、0010 を先に適用し、その差分の上に 0008 の変更を重ねること。Sync 失敗時の残留エントリの扱いは、0010 の Encoder 側「Sync エラー時に pending を消費してから `Err` を返す」方針とは異なり、Decoder 側には適用できない（Decoder は SyncOperation 完了前に timestamp が確定しないため、どのエントリを消費すべきか特定できない）。Decoder 側は Sync 失敗時に `Err` を通知し、残留エントリは `Stop` アームの一括 `MFX_ERR_ABORTED` 通知に委ねる方式とする（項目 6 参照）。
+- **issue 0013** (`0013-bug-encoder-frame-seq-zero-timestamp-collision`): 当初は「Encoder 側の `frame_count` 初期値を 1 に変更する修正」として本 issue の初期値を 1 と整合させる前提だったが、**0013 は closed で `frame_count` 1 スタート化は不採用**（`src/encode.rs` の `Encoder::new` は `frame_count: 0` のまま）。本 issue の `frame_count` 初期値は 0 とし、0013 に依存しない（変更概要 1 参照）。
+- **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): デバイスエラー伝搬の検証と二重通知の扱いの確定を行う。0010 は「`SyncData` への `frame_seq` 追加と Sync エラー時の `take_by_frame_seq` による pending 消費」を**廃案**にし、Encoder 側も二重通知を許容する方針に確定した（0010 の設計方針 2）。本 issue の Decoder 側方針（Sync 失敗時は pending を消費せず二重通知を許容）は 0010 の最終方針と同じであり、対比の必要はなくなった。`sync_and_drain` / `sync_and_callback` の `MFX_INFINITE` は変更しない（有限タイムアウト化は廃案）。適用順序は 0010 → 0008（0010 はプロダクションコード変更なしで closed 済みのため、実質の依存は情報参照のみ）。
 - **issue 0009** (`0009-bug-decoder-device-busy-infinite-retry`): `decode_bitstream` / `finish` の DEVICE_BUSY 無限再試行を上限付きにする修正。`decode_bitstream` がエラーを返した場合、送信済み `QueueFrame` の `frame_seq` はインクリメントされないため、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる。0009 を先に適用するか、エラー後の `frame_count` の扱いを 0009 の実装と整合させること。
 - **issue 0014** (`0014-bug-frame-surface-drop-silently-swallows-errors`): `FrameSurface::Drop` のエラー処理を変更する。`sync_and_drain` は変更対象外（0008 の削除に委ねる）。0014 を 0008 より先に適用してから本 issue の変更を重ねること。
