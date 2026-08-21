@@ -4,7 +4,7 @@
 - Created: 2026-07-01
 - Model: Opus 4.7
 - Branch: feature/fix-device-error-propagation
-- Polished: 2026-08-21
+- Polished: 2026-08-02
 
 ## 目的
 
