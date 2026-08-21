@@ -127,7 +127,7 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 
 本方式の `reconfigure` は `rx.recv()` で worker の drain 完了を待つ。worker は mpsc を FIFO で処理するため、`DrainPending` は先行する全 `QueueFrame` / `Sync` コマンドの処理後に到達する。つまり **reconfigure は「reconfigure 前に encode され syncp が発行されたフレームの Sync 完了と、drain 対象コールバックの完了」までブロックする**。`finish()` と異なる点は「EOS ドレインループ（null surface での全フレーム回収）」と「残留チェック（WaitIdle）」を行わないことである。
 
-なお、依存 issue 0010 適用後は SyncOperation が 500 ms タイムアウト + 再試行ループになるため、GPU 遅延時はこのブロックが長くなる可能性がある（0010 の変更による影響）。
+なお、0010 は SyncOperation を有限タイムアウト化しない（廃案）ため、このブロックの待機時間は 0010 の影響を受けない。
 
 ### Reset の挙動（シーケンス継続と新シーケンス開始）
 
@@ -164,7 +164,7 @@ VPL プログラミングガイド（一次資料: libvpl 2.17 のビルド成�
 
 ### 二重通知の可能性
 
-先行する `Sync` アームで `sync_and_collect` が `Err` を返した場合（bitstream 範囲検証エラー等）、pending は `take_by_frame_seq` されず残留する。この残留エントリは `DrainPending` で再度エラー通知され、同一フレームが 2 回通知される。これは依存 issue 0010 が「既存の潜在バグの顕在化」として扱ったのと同じパターンであり、本 issue では仕様として許容する（頻度はまれで、テストを書く際の前提とする）。
+先行する `Sync` アームで `sync_and_collect` が `Err` を返した場合（bitstream 範囲検証エラー等）、0010 の適用後は `sync_and_build_frame` が `take_by_frame_seq` で pending を消費してから `Err` を返すため、残留エントリは発生せず `DrainPending` での再通知はない。`DrainPending` で通知されるのは Reset により VPL 内部で破棄されたフレームの pending のみ（各 1 回通知）。0010 適用前の実装では Sync エラー時の残留エントリが `DrainPending` で再通知される二重通知があったが、0010 を先に適用することで解消される。
 
 ### reconfigure の doc 更新
 
@@ -202,6 +202,6 @@ VPL プログラミングガイド（一次資料: libvpl 2.17 のビルド成�
 ## 参考
 
 - 関連 issue: 0011（reconfigure が ExtParam を送らない別問題。**適用順序は 0011 を先に適用し、その差分の上に本 issue の変更を重ねる**。0011 の完了条件 6 からの検証依頼（LookAheadDepth / QVBRQuality 保持）を完了条件 4 に反映済み）
-- 関連 issue: 0010（`run_sync_worker` の `stopping` 引数追加・Sync アームの `MFX_ERR_ABORTED` 通知抑制分岐・`SyncData` への `frame_seq` 追加。本 issue の `DrainPending` アームと 0010 の Sync アーム変更は干渉しないよう、0010 適用後に本 issue を重ねる。0010 適用後は本 issue の reconfigure ブロックが SyncOperation の 500 ms タイムアウトの影響を受ける）
+- 関連 issue: 0010（`SyncData` への `frame_seq` 追加と Sync エラー時の `take_by_frame_seq` による pending 消費。`stopping` 引数・Sync アームの `MFX_ERR_ABORTED` 通知抑制分岐・500 ms タイムアウトは廃案。本 issue の `DrainPending` アームと 0010 の Sync アーム変更は干渉しないよう、0010 適用後に本 issue を重ねる）
 - 関連 issue: 0020（encode.rs のサブモジュール分割。`WorkerCommand` / `run_sync_worker` を移動するため、0020 は本 issue 適用後に調整する）
 - `finish_pending_error` / `mismatched_timestamp_error` / `canceled_error` は `src/encode.rs` の worker 関連のエラー関数
