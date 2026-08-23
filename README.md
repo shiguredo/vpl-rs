@@ -28,7 +28,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - Intel VPL によるハードウェアデコード (H.264 / H.265 / VP9 / AV1)
 - libvpl を static link してビルド (CMake で自動ビルド)
 - ビルド時に GitHub から libvpl ヘッダーを自動取得
-- エンコード入力フォーマット選択 (NV12 / I420 / YV12 / BGRA / P010)
+- エンコード入力フォーマット選択 (NV12 / YUY2 / BGRA)
 - デコード出力は NV12 フォーマット
 - フレーム単位のエンコードオプション (IDR フレーム強制)
 - CBR / VBR / CQP / ICQ / QVBR / LA / AVBR / VCM / LA_ICQ / LA_HRD レート制御モード
@@ -179,6 +179,10 @@ while let Ok(result) = rx.try_recv() {
 | H.265     | `CodecConfig::Hevc(HevcEncoderConfig)` |
 | VP9       | `CodecConfig::Vp9(Vp9EncoderConfig)` |
 | AV1       | `CodecConfig::Av1(Av1EncoderConfig)` |
+
+VP9 の場合、`Vp9EncoderConfig::write_ivf_headers` で出力形式を選択します。
+`true` で IVF ヘッダー付き、`false` で raw VP9 を出力します。
+Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従来の IVF 付き出力を維持するには `true` を指定してください。
 
 ### デコード
 

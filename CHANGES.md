@@ -11,6 +11,10 @@
 
 ## develop
 
+## 2026.4.0
+
+**リリース日**: 2026-08-23
+
 - [CHANGE] MSRV (rust-version) を 1.88 から 1.93 に上げる
   - @voluntas
 - [CHANGE] `Vp9EncoderConfig` に `write_ivf_headers` を追加する
