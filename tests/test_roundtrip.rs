@@ -366,14 +366,6 @@ fn roundtrip_colorbar(
 /// `gop_ref_dist >= 2`（B フレーム有り）のエンコーダ設定で N フレームをエンコードし、
 /// エンコーダ出力の `EncodedFrame::user_data()` をデコーダ入力の user_data に転送してから
 /// デコードする。デコード結果のフレーム一覧を返す。
-///
-/// エンコーダ出力のうち、ドレイン期の空データフレーム（`data()` が空）はデコーダに渡さず
-/// 除外する。空フレームを `decode()` に渡すと QueueFrame が 1 つ消費されるだけでフレームが
-/// 出力されず、pending に残留して `finish()` の残留チェックでエラーになるためである。
-///
-/// また、ドレイン空フレームは `TimeStamp = 0` のまま生成されるため、エンコーダ側の pending
-/// 引き当てに失敗して `Err` 通知になることがある（エンコーダ側の既知の課題）。この `Err` は
-/// ドレイン期の空フレームに限って許容し、それ以外のエラーは実エラーとして失敗させる。
 fn roundtrip_b_frames(
     encoder_config: EncoderConfig,
     decoder_codec: DecoderCodec,
@@ -396,35 +388,16 @@ fn roundtrip_b_frames(
     }
     encoder.finish().expect("finish に失敗した");
 
-    // エンコード結果を収集する。実フレームが num_frames 個そろうまでループし、
-    // ドレイン期の空フレームと、その TimeStamp = 0 による引き当て失敗 Err は除外・許容する。
+    // エンコード結果を収集する。実フレームが num_frames 個そろうまでループする。
     // チャネルの送信側はエンコーダ Drop まで生き残るため、while let Ok でチャネル終端を
     // 待つと全メッセージ受信後に必ず 10 秒タイムアウト待ちになる。実フレーム数で束縛する。
     let mut encoded_frames: Vec<EncodedFrame<usize>> = Vec::new();
     while encoded_frames.len() < num_frames {
-        let result = rx
+        let encoded = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("エンコード結果の受信がタイムアウトした");
-        match result {
-            Ok(encoded) => {
-                if encoded.data().is_empty() {
-                    // ドレイン期の空フレームはデコーダに渡さない
-                    continue;
-                }
-                encoded_frames.push(encoded);
-            }
-            Err(error) => {
-                // ドレイン空フレームは TimeStamp = 0 のまま生成されるため、エンコーダ側の
-                // pending 引き当てに失敗して「no pending frame for bitstream timestamp 0」の
-                // Err 通知になることがある（エンコーダ側の既知の課題で、対応により不要になる想定）。
-                // このドレイン空フレーム起因の Err のみ許容し、それ以外は実エラーとして失敗させる。
-                let is_drain_empty_frame_error = error.function() == "Encoder::sync_worker"
-                    && error.status_message().is_some_and(|m| {
-                        m.starts_with("no pending frame for bitstream timestamp 0")
-                    });
-                assert!(is_drain_empty_frame_error, "エンコードに失敗した: {error}");
-            }
-        }
+            .expect("エンコード結果の受信がタイムアウトした")
+            .expect("エンコードに失敗した");
+        encoded_frames.push(encoded);
     }
 
     // B ピクチャが実際に生成されていることを確認する
@@ -467,8 +440,6 @@ fn roundtrip_b_frames(
     decoder.finish().expect("finish に失敗した");
 
     // デコード結果を収集する。実フレームが num_frames 個そろうまでループする。
-    // エンコード側と同様に、チャネルの送信側はデコーダ Drop まで生き残るため、
-    // while let Ok でチャネル終端を待つと 10 秒タイムアウト待ちになる。実フレーム数で束縛する。
     let mut decoded_frames = Vec::new();
     while decoded_frames.len() < num_frames {
         let result = rx
