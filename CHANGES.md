@@ -11,6 +11,10 @@
 
 ## develop
 
+- [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
+  - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
+  - @melpon
+
 ## 2026.4.0
 
 **リリース日**: 2026-08-23

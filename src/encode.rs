@@ -1486,16 +1486,6 @@ fn sync_and_collect(
     let offset = bitstream.DataOffset as usize;
     let length = bitstream.DataLength as usize;
 
-    // VPL のドレイン処理では syncp は返るが DataLength == 0 となるケースがあるため、
-    // 空ビットストリームをエラーではなく空データとして正常に処理する。
-    if length == 0 {
-        return Ok(SyncedBitstream {
-            data: vec![],
-            frame_seq: bitstream.TimeStamp,
-            picture_type: picture_type_from_frame_type(bitstream.FrameType),
-        });
-    }
-
     // VPL が返したオフセットと長さがバッファ範囲内か検証する
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::new_custom_owned(
