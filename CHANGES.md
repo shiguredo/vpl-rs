@@ -11,6 +11,14 @@
 
 ## develop
 
+- [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
+  - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
+  - @melpon
+
+## 2026.4.0
+
+**リリース日**: 2026-08-23
+
 - [CHANGE] MSRV (rust-version) を 1.88 から 1.93 に上げる
   - @voluntas
 - [CHANGE] `Vp9EncoderConfig` に `write_ivf_headers` を追加する
@@ -24,9 +32,6 @@
 - [FIX] Decoder の DEVICE_BUSY / MORE_SURFACE リトライに上限を設ける
   - Encoder と同様に 1ms スリープで最大 30 回リトライし、上限超過時はエラーを返す
   - `finish` のドレインループの `FrameSurface::new` 呼び出し順序を `decode_bitstream` と統一する
-  - @melpon
-- [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
-  - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon
 
 ### misc

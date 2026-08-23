@@ -5,7 +5,7 @@ description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。In
 
 # shiguredo_vpl クレート
 
-- **バージョン**: 2026.3.0 (依存する libvpl は 2.17.0)
+- **バージョン**: 2026.4.0 (依存する libvpl は 2.17.0)
 - **リポジトリ**: https://github.com/shiguredo/vpl-rs
 - **Rust エディション**: 2024 (rust-version: 1.93)
 - **ライセンス**: Apache-2.0
@@ -146,6 +146,7 @@ while let Ok(result) = rx.try_recv() {
 - コーデック: `codec: CodecConfig`
   - `CodecConfig::H264(H264EncoderConfig)` / `Hevc(...)` / `Vp9(...)` / `Av1(...)`
   - 各設定は `profile: Option<...>` を持つ。 `None` でコーデックのデフォルトプロファイル。
+  - `Vp9EncoderConfig` だけは `write_ivf_headers: bool` を持つ。 `true` で IVF ヘッダー付き、 `false` で raw VP9 を出力する。 Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、 従来の IVF 付き出力を維持するには `true` を指定する。 構造体リテラルで構築する場合は必須フィールド。
 - フレーム情報 (`mfxFrameInfo` 対応): `width` / `height` / `frame_format` / `framerate_num` / `framerate_den` / `aspect_ratio_w` / `aspect_ratio_h`
 - 非同期深度: `async_depth` (`mfxVideoParam.AsyncDepth`)。 `None` の場合は 4 を使用。 1 は最小メモリだが性能が低く、4 が高スループット寄りの推奨値。
 - エンコード制御 (`mfxInfoMFX` 対応): `low_power` / `brc_param_multiplier` / `target_usage` (1=最高品質, 4=バランス, 7=最高速)
@@ -250,6 +251,11 @@ encoder.reconfigure(ReconfigureParams {
 ```
 
 警告ステータス (`MFX_WRN_*`) は内部で許容される (`check_mfx_allow_warn`)。 リセット自体は成功している。
+
+### 出力設定の検証 (`write_ivf_headers`)
+
+- `Encoder::write_ivf_headers() -> bool` は VP9 の IVF ヘッダー出力設定を返す。 `Vp9EncoderConfig::write_ivf_headers` の要求値そのもの。
+- 初期化時に `mfxExtVP9Param::WriteIVFHeaders` の実効値を GetVideoParam で読み戻し、 要求値と一致しない場合はエラーを返す。 非 VP9 コーデックでは常に `false`。
 
 ### `Encoder::query` / 統計
 
@@ -383,6 +389,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 - 変更は `CHANGES.md` の `## develop` セクションへ追記する。 種別ラベルは `[CHANGE]` / `[UPDATE]` / `[ADD]` / `[FIX]` (CHANGES.md 冒頭の凡例順) を使う。 担当者は内容のサブ箇条書きの最後に `- @user` で書く。
 - **vpl-rs は良い設計のためには破壊的変更を積極的に行う**。 古い API を残すよりも、 VPL の概念に正しくマップした新 API に置き換える。 互換シムは作らない。
 - 直近の破壊的変更例:
+  - `2026.4.0` — `Vp9EncoderConfig` に `write_ivf_headers` を追加 (構造体リテラル構築では明示指定が必須化)、 Decoder の DEVICE_BUSY / MORE_SURFACE リトライに上限 (30 回) を導入
   - `2026.3.0` — `Encoder<H>` / `Decoder<H>` のハンドラー方式化、`next_frame` 廃止、`async_depth` 追加、`DECODE_SURFACE_POOL_SIZE` を廃止し VPL 内部割り当てに移行、`DEVICE_BUSY` リトライ 10 → 30
   - `2026.2.0` — `EncoderConfig::new` / `DecoderConfig::new` / `codec_info::supported_codecs` にアダプタ指定を必須化
 - 詳細は `shiguredo-changelog` スキルの規約も併用すること。
