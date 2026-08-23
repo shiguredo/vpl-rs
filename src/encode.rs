@@ -78,6 +78,10 @@ pub struct HevcEncoderConfig {
 pub struct Vp9EncoderConfig {
     /// プロファイル（None の場合はデフォルト）
     pub profile: Option<Vp9Profile>,
+    /// IVF ヘッダーを出力するかどうか
+    ///
+    /// true の場合は IVF ヘッダー付き、false の場合は raw VP9 を出力する。
+    pub write_ivf_headers: bool,
 }
 
 /// AV1 エンコーダ固有の設定
@@ -666,6 +670,7 @@ pub struct Encoder<H: EncodeHandler> {
     video_param: sys::mfxVideoParam,
     frame_info: sys::mfxFrameInfo,
     frame_format: FrameFormat,
+    write_ivf_headers: bool,
     bitstream_buffer_size: usize,
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     worker_handle: Option<thread::JoinHandle<()>>,
@@ -875,6 +880,34 @@ impl<H: EncodeHandler> Encoder<H> {
         // 拡張バッファの設定
         let mut ext_co2: Option<sys::mfxExtCodingOption2> = None;
         let mut ext_co3: Option<sys::mfxExtCodingOption3> = None;
+        let mut ext_vp9: Option<sys::mfxExtVP9Param> = None;
+
+        // VP9 の場合、IVF ヘッダー出力の要求値 (write_ivf_headers) を MFX_CODINGOPTION_* の値へ変換して
+        // mfxExtVP9Param を構築する。非 VP9 コーデックでは write_ivf_headers は false 固定とし、
+        // ext_vp9 は構築しない。
+        //
+        // WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
+        // ref:
+        // - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
+        // - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
+        let write_ivf_headers_value: Option<u16> = match &config.codec {
+            CodecConfig::Vp9(vp9) => {
+                let value = if vp9.write_ivf_headers {
+                    sys::MFX_CODINGOPTION_ON as u16
+                } else {
+                    sys::MFX_CODINGOPTION_OFF as u16
+                };
+                let mut vp9_param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
+                vp9_param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
+                vp9_param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
+                vp9_param.WriteIVFHeaders = value;
+                ext_vp9 = Some(vp9_param);
+                Some(value)
+            }
+            _ => None,
+        };
+        // getter が返す bool は要求値が ON かどうかで決まる
+        let write_ivf_headers = write_ivf_headers_value == Some(sys::MFX_CODINGOPTION_ON as u16);
 
         // Look Ahead depth の設定 (mfxExtCodingOption2)
         let needs_co2 = config.look_ahead_depth.is_some();
@@ -908,6 +941,9 @@ impl<H: EncodeHandler> Encoder<H> {
         if let Some(ref mut co3) = ext_co3 {
             ext_bufs.push(co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer);
         }
+        if let Some(ref mut vp9) = ext_vp9 {
+            ext_bufs.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
+        }
         if !ext_bufs.is_empty() {
             video_param.ExtParam = ext_bufs.as_mut_ptr();
             video_param.NumExtParam = ext_bufs.len() as u16;
@@ -922,9 +958,59 @@ impl<H: EncodeHandler> Encoder<H> {
         video_param.ExtParam = std::ptr::null_mut();
         video_param.NumExtParam = 0;
 
-        // 初期化後の実効パラメータを反映する
-        lib.mfx_video_encode_get_video_param(session_ptr, &mut video_param)?;
+        // 初期化後に実効パラメータを読み戻す。
+        // VP9 の場合、write_ivf_headers の要求値が oneVPL に尊重されるかを検証するため、
+        // 読み戻し専用の mfxExtVP9Param を attach して GetVideoParam を呼ぶ。
+        //
+        // GetVideoParam は mfxVideoParam に attach した拡張バッファへ実効値を書き戻す。
+        // 読み戻し用バッファの WriteIVFHeaders は zeroed 初期化により UNKNOWN (0) のままにしておき、
+        // 書き戻されなかった場合に下の一致検証で必ず検出できるようにする。
+        // ref:
+        // - libvpl api/vpl/mfxvideo.h (MFXVideoENCODE_GetVideoParam の拡張バッファ説明)
+        let mut ext_vp9_readback: Option<sys::mfxExtVP9Param> = None;
+        if matches!(&config.codec, CodecConfig::Vp9(_)) {
+            let mut vp9_param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
+            vp9_param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
+            vp9_param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
+            ext_vp9_readback = Some(vp9_param);
+        }
+
+        // 読み戻し用の拡張バッファポインタ配列を構築する
+        let mut ext_bufs_readback: Vec<*mut sys::mfxExtBuffer> = Vec::new();
+        if let Some(ref mut vp9) = ext_vp9_readback {
+            ext_bufs_readback.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
+        }
+        if !ext_bufs_readback.is_empty() {
+            video_param.ExtParam = ext_bufs_readback.as_mut_ptr();
+            video_param.NumExtParam = ext_bufs_readback.len() as u16;
+        }
+
+        lib.mfx_video_encode_get_video_param(session_ptr, &mut video_param)
+            .inspect_err(|_| {
+                // GetVideoParam 失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
+                let _ = lib.mfx_video_encode_close(session_ptr);
+            })?;
+        video_param.ExtParam = std::ptr::null_mut();
+        video_param.NumExtParam = 0;
         frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
+
+        // VP9 の場合、WriteIVFHeaders の実効値が要求値と完全一致することを検証する。
+        // 一致しない場合（UNKNOWN を含む）は oneVPL が要求を尊重しなかったことを意味するため、
+        // エンコーダをクローズしてエラーを返す。
+        if let Some(expected) = write_ivf_headers_value
+            && let Some(vp9) = ext_vp9_readback
+            && vp9.WriteIVFHeaders != expected
+        {
+            let _ = lib.mfx_video_encode_close(session_ptr);
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "VP9 WriteIVFHeaders mismatch: requested {} but got {}",
+                    coding_option_name(expected),
+                    coding_option_name(vp9.WriteIVFHeaders),
+                ),
+            ));
+        }
 
         let bitstream_buffer_size = (buffer_size_in_kb as usize) * 1024;
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -949,6 +1035,7 @@ impl<H: EncodeHandler> Encoder<H> {
             video_param,
             frame_info,
             frame_format: config.frame_format,
+            write_ivf_headers,
             bitstream_buffer_size,
             worker_tx,
             worker_handle: Some(worker_handle),
@@ -1042,6 +1129,17 @@ impl<H: EncodeHandler> Encoder<H> {
     pub fn coded_size(&self) -> (usize, usize) {
         let fi = unsafe { self.frame_info.__bindgen_anon_1.__bindgen_anon_1 };
         (usize::from(fi.Width), usize::from(fi.Height))
+    }
+
+    /// IVF ヘッダーを出力する設定かどうかを返す
+    ///
+    /// `Vp9EncoderConfig::write_ivf_headers` で指定した値（oneVPL へ要求し、初期化時に実効値との一致を検証済みの値）を返す。
+    /// 非 VP9 コーデックでは常に `false` を返す。
+    ///
+    /// 実効値の一致検証は GetVideoParam が拡張バッファへ実効値を書き戻す挙動に依存している。
+    /// この挙動は libvpl の実装由来で、将来のバージョンで変更される可能性がある。
+    pub fn write_ivf_headers(&self) -> bool {
+        self.write_ivf_headers
     }
 
     /// エンコード統計情報を取得する
@@ -1516,6 +1614,20 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     match value.checked_add(alignment - 1) {
         Some(v) => v & !(alignment - 1),
         None => !(alignment - 1),
+    }
+}
+
+/// MFX_CODINGOPTION_* の数値を記号名へ変換する
+///
+/// CodingOptionValue (mfxstructures.h) の値をエラーメッセージで判読可能にするための表示用関数。
+/// 想定外の値は unknown (0xNN) で表示する。
+fn coding_option_name(value: u16) -> String {
+    match value {
+        v if v == sys::MFX_CODINGOPTION_UNKNOWN as u16 => "MFX_CODINGOPTION_UNKNOWN".to_owned(),
+        v if v == sys::MFX_CODINGOPTION_ON as u16 => "MFX_CODINGOPTION_ON".to_owned(),
+        v if v == sys::MFX_CODINGOPTION_OFF as u16 => "MFX_CODINGOPTION_OFF".to_owned(),
+        v if v == sys::MFX_CODINGOPTION_ADAPTIVE as u16 => "MFX_CODINGOPTION_ADAPTIVE".to_owned(),
+        v => format!("unknown ({v:#x})"),
     }
 }
 

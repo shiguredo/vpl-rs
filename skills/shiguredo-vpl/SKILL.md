@@ -1,13 +1,13 @@
 ---
 name: shiguredo-vpl
-description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.16 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、coded_size と frame_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
+description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、coded_size と frame_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
 ---
 
 # shiguredo_vpl クレート
 
-- **バージョン**: 2026.3.0 (依存する libvpl は 2.16.0)
+- **バージョン**: 2026.4.0 (依存する libvpl は 2.17.0)
 - **リポジトリ**: https://github.com/shiguredo/vpl-rs
-- **Rust エディション**: 2024 (rust-version: 1.88)
+- **Rust エディション**: 2024 (rust-version: 1.93)
 - **ライセンス**: Apache-2.0
 - **動作要件**: Linux (x86_64) + 第 6 世代 Core 以降の Intel GPU。ビルド時に git と clang が必要。
 
@@ -146,6 +146,7 @@ while let Ok(result) = rx.try_recv() {
 - コーデック: `codec: CodecConfig`
   - `CodecConfig::H264(H264EncoderConfig)` / `Hevc(...)` / `Vp9(...)` / `Av1(...)`
   - 各設定は `profile: Option<...>` を持つ。 `None` でコーデックのデフォルトプロファイル。
+  - `Vp9EncoderConfig` だけは `write_ivf_headers: bool` を持つ。 `true` で IVF ヘッダー付き、 `false` で raw VP9 を出力する。 Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、 従来の IVF 付き出力を維持するには `true` を指定する。 構造体リテラルで構築する場合は必須フィールド。
 - フレーム情報 (`mfxFrameInfo` 対応): `width` / `height` / `frame_format` / `framerate_num` / `framerate_den` / `aspect_ratio_w` / `aspect_ratio_h`
 - 非同期深度: `async_depth` (`mfxVideoParam.AsyncDepth`)。 `None` の場合は 4 を使用。 1 は最小メモリだが性能が低く、4 が高スループット寄りの推奨値。
 - エンコード制御 (`mfxInfoMFX` 対応): `low_power` / `brc_param_multiplier` / `target_usage` (1=最高品質, 4=バランス, 7=最高速)
@@ -224,6 +225,7 @@ pub trait EncodeHandler: Send + 'static {
 - VPL の遅延 (LookAhead / B フレーム並び替え) のため、`encode` 1 回が即 1 回の `on_encoded` 呼び出しに対応するわけではない。 `encode` を複数回呼んでから `on_encoded` がまとめて呼ばれることもある。
 - `encode` のたびに渡した `user_data` は worker 内の `PendingFrameStore` に `frame_seq` で登録され、 出力 bitstream の `TimeStamp` と完全一致で引き当てられる (B フレーム並び替えがあっても元の入力に正しく戻る)。 1 ID が二度使われると重複エラーになる。
 - `MFX_ERR_MORE_DATA` と `MFX_WRN_DEVICE_BUSY` は内部で吸収される。 `DEVICE_BUSY` は 1ms スリープで最大 30 回までリトライ (旧 10 回から拡張)。 30 回を超えると致命的エラー。
+- `MFX_ERR_MORE_SURFACE` は **Decoder 側のみ** 1ms スリープで最大 30 回リトライし、上限超過時はエラーになる (内部割り当て `surface_work=NULL` では通常発生しないが、AV1 の `FilmGrain != 0` 等のサーフェス不足で返り得る)。 **Encoder 側は `MFX_ERR_MORE_SURFACE` をリトライせず即エラー** として扱う。
 
 ### `Encoder::encode` / `finish` のセマンティクス
 
@@ -249,6 +251,11 @@ encoder.reconfigure(ReconfigureParams {
 ```
 
 警告ステータス (`MFX_WRN_*`) は内部で許容される (`check_mfx_allow_warn`)。 リセット自体は成功している。
+
+### 出力設定の検証 (`write_ivf_headers`)
+
+- `Encoder::write_ivf_headers() -> bool` は VP9 の IVF ヘッダー出力設定を返す。 `Vp9EncoderConfig::write_ivf_headers` の要求値そのもの。
+- 初期化時に `mfxExtVP9Param::WriteIVFHeaders` の実効値を GetVideoParam で読み戻し、 要求値と一致しない場合はエラーを返す。 非 VP9 コーデックでは常に `false`。
 
 ### `Encoder::query` / 統計
 
@@ -382,6 +389,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 - 変更は `CHANGES.md` の `## develop` セクションへ追記する。 種別ラベルは `[CHANGE]` / `[UPDATE]` / `[ADD]` / `[FIX]` (CHANGES.md 冒頭の凡例順) を使う。 担当者は内容のサブ箇条書きの最後に `- @user` で書く。
 - **vpl-rs は良い設計のためには破壊的変更を積極的に行う**。 古い API を残すよりも、 VPL の概念に正しくマップした新 API に置き換える。 互換シムは作らない。
 - 直近の破壊的変更例:
+  - `2026.4.0` — `Vp9EncoderConfig` に `write_ivf_headers` を追加 (構造体リテラル構築では明示指定が必須化)、 Decoder の DEVICE_BUSY / MORE_SURFACE リトライに上限 (30 回) を導入
   - `2026.3.0` — `Encoder<H>` / `Decoder<H>` のハンドラー方式化、`next_frame` 廃止、`async_depth` 追加、`DECODE_SURFACE_POOL_SIZE` を廃止し VPL 内部割り当てに移行、`DEVICE_BUSY` リトライ 10 → 30
   - `2026.2.0` — `EncoderConfig::new` / `DecoderConfig::new` / `codec_info::supported_codecs` にアダプタ指定を必須化
 - 詳細は `shiguredo-changelog` スキルの規約も併用すること。
