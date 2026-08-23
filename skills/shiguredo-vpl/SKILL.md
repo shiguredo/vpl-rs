@@ -303,8 +303,8 @@ while let Ok(result) = rx.try_recv() {
 - 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 ヘッダ未到達のうちは `MFX_ERR_MORE_DATA` を内部で吸収して何も出さない (`initialized` フラグで管理)。
 - 出力フォーマットは **NV12 固定** (`IOPattern = OUT_SYSTEM_MEMORY`)。 別フォーマットへの変換は VPP 等で別途処理する。
 - サーフェスは VPL の **内部割り当て** (`surface_work = NULL`)。 アプリ側でサーフェスプールを持つ必要はなく、`FrameSurface` の Drop で `Release` が自動的に呼ばれる。
-- worker スレッド名は `vpl-decoder-sync`。 `user_data` は **FIFO キュー** (`VecDeque`) で `decode()` 呼び出し順に対応付く。 ビットストリームがフレーム境界をまたいでも順序は保たれる。
-- `decode` 呼び出しごとに `user_data` を 1 つ供給する。 VPL が内部蓄積でフレームを出さないターンでは消費されず、出力フレーム数より供給数が多い場合の残余は `finish` 後の Drop までキューに残る。
+- worker スレッド名は `vpl-decoder-sync`。 `user_data` は入力ビットストリームの `TimeStamp` に載せた連番と、 出力フレームの `TimeStamp` の**完全一致**で対応付く (Encoder と同じ方式)。 B フレームの表示順並び替えがあっても正しい入力フレームに戻る。 なお、 1 フレームが複数の `decode()` 呼び出しに分割して供給されるケースでは、 出力フレームの TimeStamp がどの呼び出しの連番になるかが VPL 実装依存のため、 user_data の対応付けは保証されない (分割入力で未消費の連番が残留した場合、 `finish()` が残留チェックエラーを返す)。
+- `decode` 呼び出しごとに `user_data` を 1 つ供給する。 VPL が内部蓄積でフレームを出さないターンでは消費されず、 出力フレーム数より供給数が多い場合の残余は `finish()` の残留チェックでエラーになる (エラーが通知され、 `finish()` が `Err` を返す)。 `decode` がエラーを返した場合も `frame_seq` は消費済みで、 失敗フレームの `user_data` は出力に紐付かず `finish()` の残留チェック (または `Drop` 時の `MFX_ERR_ABORTED` 通知) でエラーとして通知される。
 - `finish(&mut self) -> Result<(), Error>` はエンコーダと同じくバリア。 null bitstream でドレインを呼び切り、worker の `WaitIdle` が応答するまでブロックする。 `decode` を一度も呼んでいない (未初期化) 場合は即 `Ok(())` を返す。
 - `Decoder` を `Drop` すると worker スレッドへ `Stop` が送られ、未消費の `user_data` は `MFX_ERR_ABORTED` のエラー結果として `on_decoded` に通知される。
 
@@ -365,7 +365,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 - **`MFX_WRN_*` の解釈**: `Init` / `Reset` 系では警告は「成功」扱い。 自分でラッパーを書くときは `check_mfx_allow_warn` の方を使う。
 - **ハンドラはワーカースレッドから呼ばれる**: `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は `vpl-encoder-sync` / `vpl-decoder-sync` のワーカースレッドから呼ばれる。 ハンドラ実装は `Send + 'static`。 メインスレッドへ届けるなら mpsc などのチャネルにブリッジする。
 - **`DecodedFrame` の借用**: `DecodedFrame<'_, T>` の `y()` / `uv()` スライスはコールバック呼び出し中のみ有効。 外に持ち出すには `to_vec()` などでコピーする必要がある。 `pitch() != width()` が普通で、 単純連結すると壊れる。
-- **`user_data` の枯渇**: `Decoder` 側で `decode` の呼び出し数より VPL の出力フレーム数が多い (= キューが枯渇する) と、 余分なフレームは worker 内で drain 扱いとなり破棄される。 1 入力で複数枚出ることはないが、 順序保証は **FIFO のみ** なので元入力との 1:1 対応が必要なら `decode` 1 回ごとに `user_data` を必ず供給する。
+- **`user_data` の対応付け**: `Decoder` は入力 `decode()` の連番 (`TimeStamp`) と出力フレームの `TimeStamp` を完全一致で対応付ける。 出力フレームの TimeStamp がどの入力にも一致しない (= 供給不足) 場合は worker 内で drain 扱いとなり破棄される。 1 入力で複数枚出ることはないが、 元入力との 1:1 対応を確実にするには `decode` 1 回ごとに `user_data` を必ず供給する。
 - **動作 OS の制約**: 実機サポートは Linux x86_64 + Intel GPU のみ。 macOS / Windows でビルドできるとしても `list_adapters()` は空を返し、 セッション生成は失敗する。
 - **静的リンク**: 実行時に libvpl 共有ライブラリは不要だが、 ビルド時に対応 GPU ドライバ (Intel Media Driver / iHD) が動作環境にないと実機テストは通らない。
 

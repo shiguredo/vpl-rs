@@ -31,6 +31,7 @@ struct DecodedFrameInfo {
     pitch: usize,
     width: usize,
     height: usize,
+    user_data: usize,
 }
 
 /// ダミー NV12 フレームを生成する
@@ -45,7 +46,7 @@ fn generate_dummy_nv12(
 ) -> Vec<u8> {
     assert!(
         width <= coded_width && height <= coded_height,
-        "source size {}x{} exceeds coded size {}x{}",
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
         width,
         height,
         coded_width,
@@ -80,7 +81,7 @@ fn generate_colorbar_nv12(
 ) -> Vec<u8> {
     assert!(
         width <= coded_width && height <= coded_height,
-        "source size {}x{} exceeds coded size {}x{}",
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
         width,
         height,
         coded_width,
@@ -242,25 +243,26 @@ fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFra
                     pitch: frame.pitch(),
                     width: frame.width(),
                     height: frame.height(),
+                    user_data: *frame.user_data(),
                 }
             });
             tx.send(info)
-                .expect("failed to send decoded frame callback result");
+                .expect("デコード結果コールバックの送信に失敗した");
         }),
     )
-    .expect("failed to create decoder");
+    .expect("デコーダの生成に失敗した");
 
     for (index, bs) in bitstreams.iter().enumerate() {
-        decoder.decode(bs, index).expect("failed to decode");
+        decoder.decode(bs, index).expect("デコードに失敗した");
     }
-    decoder.finish().expect("failed to finish");
+    decoder.finish().expect("finish に失敗した");
 
     let mut decoded_frames = Vec::new();
     for _ in 0..num_frames {
         let result = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("timed out waiting for decoded frame callback");
-        let info = result.expect("failed to decode");
+            .expect("デコード結果コールバックの受信がタイムアウトした");
+        let info = result.expect("デコードに失敗した");
         decoded_frames.push(info);
     }
 
@@ -281,10 +283,13 @@ fn roundtrip(
 
     assert!(
         !encoded_frames.is_empty(),
-        "no encoded frames were produced"
+        "エンコードされたフレームが生成されなかった"
     );
     for (i, frame) in encoded_frames.iter().enumerate() {
-        assert!(!frame.data().is_empty(), "encoded frame {i} has empty data");
+        assert!(
+            !frame.data().is_empty(),
+            "エンコード結果フレーム {i} のデータが空"
+        );
     }
 
     let decoded_frames = decode(decoder_codec, &bitstreams);
@@ -292,15 +297,21 @@ fn roundtrip(
     assert_eq!(
         decoded_frames.len(),
         num_frames,
-        "decoded {} frames, expected {num_frames}",
+        "デコード結果 {} フレーム、期待値 {num_frames} フレーム",
         decoded_frames.len()
     );
     for (i, frame) in decoded_frames.iter().enumerate() {
-        assert_eq!(frame.width, width, "decoded frame {i} width mismatch");
-        assert_eq!(frame.height, height, "decoded frame {i} height mismatch");
+        assert_eq!(
+            frame.width, width,
+            "デコード結果フレーム {i} の width が不一致"
+        );
+        assert_eq!(
+            frame.height, height,
+            "デコード結果フレーム {i} の height が不一致"
+        );
         assert!(
             !frame.y_data.is_empty(),
-            "decoded frame {i} has empty y plane"
+            "デコード結果フレーム {i} の Y プレーンが空"
         );
     }
 
@@ -311,7 +322,7 @@ fn roundtrip(
 fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
     let encoder: Encoder<FnEncodeHandler<()>> =
         Encoder::new(config.clone(), FnEncodeHandler::new(|_| {}))
-            .expect("failed to create encoder");
+            .expect("エンコーダの生成に失敗した");
     encoder.coded_size()
 }
 
@@ -345,7 +356,190 @@ fn roundtrip_colorbar(
         );
         assert!(
             psnr >= min_psnr_db,
-            "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
+            "フレーム {i}: PSNR {psnr:.1} dB が {min_psnr_db} dB 未満"
+        );
+    }
+}
+
+/// B フレーム有効時のラウンドトリップで user_data 対応付けを検証するヘルパー
+///
+/// `gop_ref_dist >= 2`（B フレーム有り）のエンコーダ設定で N フレームをエンコードし、
+/// エンコーダ出力の `EncodedFrame::user_data()` をデコーダ入力の user_data に転送してから
+/// デコードする。デコード結果のフレーム一覧を返す。
+///
+/// エンコーダ出力のうち、ドレイン期の空データフレーム（`data()` が空）はデコーダに渡さず
+/// 除外する。空フレームを `decode()` に渡すと QueueFrame が 1 つ消費されるだけでフレームが
+/// 出力されず、pending に残留して `finish()` の残留チェックでエラーになるためである。
+///
+/// また、ドレイン空フレームは `TimeStamp = 0` のまま生成されるため、エンコーダ側の pending
+/// 引き当てに失敗して `Err` 通知になることがある（エンコーダ側の既知の課題）。この `Err` は
+/// ドレイン期の空フレームに限って許容し、それ以外のエラーは実エラーとして失敗させる。
+fn roundtrip_b_frames(
+    encoder_config: EncoderConfig,
+    decoder_codec: DecoderCodec,
+    input_frames: &[Vec<u8>],
+) -> Vec<DecodedFrameInfo> {
+    let num_frames = input_frames.len();
+    assert!(
+        num_frames >= 15,
+        "B フレームテストは N >= 15 で行うこと (実際は {num_frames})"
+    );
+
+    let (mut encoder, rx) = create_encoder(encoder_config);
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    for (index, frame) in input_frames.iter().enumerate() {
+        encoder
+            .encode(frame, index, &options)
+            .expect("エンコードに失敗した");
+    }
+    encoder.finish().expect("finish に失敗した");
+
+    // エンコード結果を収集する。実フレームが num_frames 個そろうまでループし、
+    // ドレイン期の空フレームと、その TimeStamp = 0 による引き当て失敗 Err は除外・許容する。
+    // チャネルの送信側はエンコーダ Drop まで生き残るため、while let Ok でチャネル終端を
+    // 待つと全メッセージ受信後に必ず 10 秒タイムアウト待ちになる。実フレーム数で束縛する。
+    let mut encoded_frames: Vec<EncodedFrame<usize>> = Vec::new();
+    while encoded_frames.len() < num_frames {
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("エンコード結果の受信がタイムアウトした");
+        match result {
+            Ok(encoded) => {
+                if encoded.data().is_empty() {
+                    // ドレイン期の空フレームはデコーダに渡さない
+                    continue;
+                }
+                encoded_frames.push(encoded);
+            }
+            Err(error) => {
+                // ドレイン空フレームは TimeStamp = 0 のまま生成されるため、エンコーダ側の
+                // pending 引き当てに失敗して「no pending frame for bitstream timestamp 0」の
+                // Err 通知になることがある（エンコーダ側の既知の課題で、対応により不要になる想定）。
+                // このドレイン空フレーム起因の Err のみ許容し、それ以外は実エラーとして失敗させる。
+                let is_drain_empty_frame_error = error.function() == "Encoder::sync_worker"
+                    && error.status_message().is_some_and(|m| {
+                        m.starts_with("no pending frame for bitstream timestamp 0")
+                    });
+                assert!(is_drain_empty_frame_error, "エンコードに失敗した: {error}");
+            }
+        }
+    }
+
+    // B ピクチャが実際に生成されていることを確認する
+    let b_count = encoded_frames
+        .iter()
+        .filter(|frame| frame.picture_type() == PictureType::B)
+        .count();
+    assert!(
+        b_count >= 1,
+        "B ピクチャが 1 枚以上生成されること (実際は {b_count} 枚)"
+    );
+
+    // デコードする。Encoder 出力の user_data を Decoder 入力に転送する。
+    let decoder_config = DecoderConfig::new(test_adapter(), decoder_codec);
+    let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
+    let mut decoder = Decoder::new(
+        decoder_config,
+        FnDecodeHandler::new(move |result| {
+            let info = result.map(|frame| {
+                let y_data = frame.y().to_vec();
+                DecodedFrameInfo {
+                    y_data,
+                    pitch: frame.pitch(),
+                    width: frame.width(),
+                    height: frame.height(),
+                    user_data: *frame.user_data(),
+                }
+            });
+            tx.send(info)
+                .expect("デコード結果コールバックの送信に失敗した");
+        }),
+    )
+    .expect("デコーダの生成に失敗した");
+
+    for frame in &encoded_frames {
+        decoder
+            .decode(frame.data(), *frame.user_data())
+            .expect("デコードに失敗した");
+    }
+    decoder.finish().expect("finish に失敗した");
+
+    // デコード結果を収集する。実フレームが num_frames 個そろうまでループする。
+    // エンコード側と同様に、チャネルの送信側はデコーダ Drop まで生き残るため、
+    // while let Ok でチャネル終端を待つと 10 秒タイムアウト待ちになる。実フレーム数で束縛する。
+    let mut decoded_frames = Vec::new();
+    while decoded_frames.len() < num_frames {
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("デコード結果コールバックの受信がタイムアウトした");
+        decoded_frames.push(result.expect("デコードに失敗した"));
+    }
+
+    decoded_frames
+}
+
+/// `user_data == i` の出力フレームが入力フレーム i の内容と一致することを検証する
+///
+/// 各 `user_data` が集合 `{0..N-1}` と過不足なく一致し、ちょうど 1 回出現することを確認する。
+/// さらに、`user_data == i` の出力フレームの Y プレーンが入力フレーム i と一致すること
+/// （PSNR が閾値以上）を、誤対応フレーム（入力 j, j ≠ i）との PSNR より十分高いことを
+/// もって直接検証する。これにより B フレームの表示順並び替えがあっても user_data が
+/// 正しい入力フレームに対応付くことを確認できる。
+///
+/// `input_frames_for_psnr` は PSNR 計算用に `width` 幅ストライドで生成した入力フレーム
+/// （`generate_dummy_nv12(width, height, width, height, i)`）を渡すこと。
+fn assert_user_data_matches_input(
+    decoded_frames: &[DecodedFrameInfo],
+    input_frames_for_psnr: &[Vec<u8>],
+    width: usize,
+    height: usize,
+) {
+    // 各 user_data が集合 {0..N-1} と一致し、ちょうど 1 回出現すること
+    let mut seen = vec![0u32; input_frames_for_psnr.len()];
+    for frame in decoded_frames {
+        let user_data = frame.user_data;
+        assert!(
+            user_data < input_frames_for_psnr.len(),
+            "user_data {user_data} が範囲外"
+        );
+        seen[user_data] += 1;
+    }
+    for (index, count) in seen.iter().enumerate() {
+        assert_eq!(
+            *count, 1,
+            "user_data {index} は 1 回だけ出現すること (実際は {count} 回)"
+        );
+    }
+
+    // user_data == i の出力が入力 i と一致すること（対応付けの正しさの直接検証）
+    for frame in decoded_frames {
+        let i = frame.user_data;
+        let psnr_with_i = psnr_y(
+            &input_frames_for_psnr[i],
+            &frame.y_data,
+            frame.pitch,
+            width,
+            height,
+        );
+        assert!(
+            psnr_with_i >= 25.0,
+            "user_data {i}: 入力 {i} との PSNR {psnr_with_i:.1} dB が 25.0 dB 未満"
+        );
+
+        // 誤対応フレーム（入力 j, j != i）との PSNR の最大値
+        let mut max_wrong_psnr = 0.0_f64;
+        for (j, other) in input_frames_for_psnr.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let psnr = psnr_y(other, &frame.y_data, frame.pitch, width, height);
+            max_wrong_psnr = max_wrong_psnr.max(psnr);
+        }
+        assert!(
+            psnr_with_i > max_wrong_psnr + 5.0,
+            "user_data {i}: 正しい入力との PSNR {psnr_with_i:.1} dB が誤対応の最大 {max_wrong_psnr:.1} dB より十分高いこと"
         );
     }
 }
@@ -421,10 +615,10 @@ fn test_roundtrip_h264_force_idr() {
         config,
         FnEncodeHandler::new(move |result| {
             tx.send(result)
-                .expect("failed to send encoded frame callback result");
+                .expect("エンコード結果コールバックの送信に失敗した");
         }),
     )
-    .expect("failed to create encoder");
+    .expect("エンコーダの生成に失敗した");
     let (coded_width, coded_height) = encoder.coded_size();
     let mut encoded_frames = Vec::new();
     let mut bitstreams: Vec<Vec<u8>> = Vec::new();
@@ -442,14 +636,14 @@ fn test_roundtrip_h264_force_idr() {
         };
         encoder
             .encode(&frame_data, i, &options)
-            .expect("failed to encode");
+            .expect("エンコードに失敗した");
     }
-    encoder.finish().expect("failed to finish");
+    encoder.finish().expect("finish に失敗した");
     for _ in 0..15 {
         let encoded = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("timed out waiting for encoded frame callback")
-            .expect("failed to encode");
+            .expect("エンコード結果コールバックの受信がタイムアウトした")
+            .expect("エンコードに失敗した");
         bitstreams.push(encoded.data().to_vec());
         encoded_frames.push(encoded);
     }
@@ -460,12 +654,68 @@ fn test_roundtrip_h264_force_idr() {
         .count();
     assert!(
         idr_count >= 2,
-        "expected at least 2 IDR frames, got {idr_count}"
+        "IDR フレームが 2 枚以上であること (実際は {idr_count} 枚)"
     );
 
     // デコードで復号できることを確認する
     let decoded_frames = decode(DecoderCodec::H264, &bitstreams);
     assert_eq!(decoded_frames.len(), 15);
+
+    // デコード結果の user_data が集合 {0..14} と過不足なく一致することを検証する。
+    // decode() はビットストリームの index を user_data として渡しているため、
+    // 各 index がちょうど 1 回出現することを確認する。
+    let mut seen = [0u32; 15];
+    for frame in &decoded_frames {
+        let user_data = frame.user_data;
+        assert!(
+            user_data < 15,
+            "デコード結果の user_data {user_data} が範囲外"
+        );
+        seen[user_data] += 1;
+    }
+    for (index, count) in seen.iter().enumerate() {
+        assert_eq!(
+            *count, 1,
+            "デコード結果の user_data {index} は 1 回だけ出現すること (実際は {count} 回)"
+        );
+    }
+}
+
+/// B フレーム（2 枚）有りの H.264 ラウンドトリップで user_data 対応付けを検証する
+#[test]
+fn test_roundtrip_h264_b_frame_user_data() {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    // 2 枚の B フレームを含む GOP 構造にする
+    config.gop_ref_dist = Some(3);
+
+    let num_frames = 15;
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let (coded_width, coded_height) = coded_size_for(&config);
+    let input_frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
+        .collect();
+    // PSNR 計算用は width 幅ストライドの入力フレームで生成する
+    let input_for_psnr: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(width, height, width, height, i))
+        .collect();
+
+    let decoded_frames = roundtrip_b_frames(config, DecoderCodec::H264, &input_frames);
+
+    assert_user_data_matches_input(&decoded_frames, &input_for_psnr, width, height);
 }
 
 /// encode に渡した user_data が callback で回収できることを確認する
@@ -491,10 +741,10 @@ fn test_encode_user_data_callback() {
         config,
         FnEncodeHandler::new(move |result| {
             tx.send(result)
-                .expect("failed to send encoded frame callback result");
+                .expect("エンコード結果コールバックの送信に失敗した");
         }),
     )
-    .expect("failed to create encoder");
+    .expect("エンコーダの生成に失敗した");
     let (coded_width, coded_height) = encoder.coded_size();
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
@@ -504,23 +754,26 @@ fn test_encode_user_data_callback() {
         let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
         encoder
             .encode(&frame_data, i, &options)
-            .expect("failed to encode");
+            .expect("エンコードに失敗した");
     }
-    encoder.finish().expect("failed to finish");
+    encoder.finish().expect("finish に失敗した");
 
     let mut seen = [false; 8];
     for _ in 0..8 {
         let encoded = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("timed out waiting for encoded frame callback")
-            .expect("failed to encode");
+            .expect("エンコード結果コールバックの受信がタイムアウトした")
+            .expect("エンコードに失敗した");
         let user_data = *encoded.user_data();
-        assert!(user_data < 8, "user_data {user_data} is out of range");
+        assert!(user_data < 8, "user_data {user_data} が範囲外");
         seen[user_data] = true;
     }
 
     for (index, appeared) in seen.iter().enumerate() {
-        assert!(*appeared, "user_data {index} did not appear in callback");
+        assert!(
+            *appeared,
+            "user_data {index} がコールバックに出現しなかった"
+        );
     }
 }
 
@@ -558,31 +811,31 @@ fn test_decode_user_data_callback() {
         FnDecodeHandler::new(move |result| {
             let user_data = result.map(|frame| *frame.user_data());
             tx.send(user_data)
-                .expect("failed to send decoded frame callback result");
+                .expect("デコード結果コールバックの送信に失敗した");
         }),
     )
-    .expect("failed to create decoder");
+    .expect("デコーダの生成に失敗した");
 
     for (i, bs) in bitstreams.iter().enumerate() {
-        decoder.decode(bs, i).expect("failed to decode");
+        decoder.decode(bs, i).expect("デコードに失敗した");
     }
-    decoder.finish().expect("failed to finish");
+    decoder.finish().expect("finish に失敗した");
 
     let mut seen = [false; 8];
     for _ in 0..num_frames {
         let user_data = rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("timed out waiting for decoded frame callback")
-            .expect("failed to decode");
-        assert!(
-            user_data < num_frames,
-            "user_data {user_data} is out of range"
-        );
+            .expect("デコード結果コールバックの受信がタイムアウトした")
+            .expect("デコードに失敗した");
+        assert!(user_data < num_frames, "user_data {user_data} が範囲外");
         seen[user_data] = true;
     }
 
     for (index, appeared) in seen.iter().enumerate() {
-        assert!(*appeared, "user_data {index} did not appear in callback");
+        assert!(
+            *appeared,
+            "user_data {index} がコールバックに出現しなかった"
+        );
     }
 }
 
@@ -613,10 +866,10 @@ fn test_drop_cancels_pending_callbacks() {
             config,
             FnEncodeHandler::new(move |result| {
                 tx.send(result)
-                    .expect("failed to send encoded frame callback result");
+                    .expect("エンコード結果コールバックの送信に失敗した");
             }),
         )
-        .expect("failed to create encoder");
+        .expect("エンコーダの生成に失敗した");
         let (coded_width, coded_height) = encoder.coded_size();
         let options = EncodeOptions {
             frame_type: frame_type::UNKNOWN,
@@ -625,24 +878,24 @@ fn test_drop_cancels_pending_callbacks() {
         let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, 0);
         encoder
             .encode(&frame_data, 0, &options)
-            .expect("failed to encode");
+            .expect("エンコードに失敗した");
     }
 
     let result = rx
         .recv_timeout(Duration::from_secs(1))
-        .expect("timed out waiting for callback result");
+        .expect("コールバック結果の受信がタイムアウトした");
     let error = match result {
-        Ok(_) => panic!("drop callback must be an error"),
+        Ok(_) => panic!("drop 時のコールバックはエラーであること"),
         Err(error) => error,
     };
     assert_eq!(
         error.status_code(),
         Some(shiguredo_vpl::ffi::mfxStatus_MFX_ERR_ABORTED),
-        "canceled callback must return MFX_ERR_ABORTED"
+        "キャンセルされたコールバックは MFX_ERR_ABORTED を返すこと"
     );
     assert!(
         rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "unexpected extra callback after canceled result"
+        "キャンセル結果の後に予期しない追加コールバックが送信された"
     );
 }
 
@@ -690,6 +943,43 @@ fn test_roundtrip_hevc_cqp() {
     config.gop_pic_size = Some(10);
 
     roundtrip_colorbar(config, DecoderCodec::Hevc, 10, 25.0);
+}
+
+/// B フレーム（2 枚）有りの H.265 ラウンドトリップで user_data 対応付けを検証する
+#[test]
+fn test_roundtrip_hevc_b_frame_user_data() {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    // 2 枚の B フレームを含む GOP 構造にする
+    config.gop_ref_dist = Some(3);
+
+    let num_frames = 15;
+    let width = config.width as usize;
+    let height = config.height as usize;
+    let (coded_width, coded_height) = coded_size_for(&config);
+    let input_frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
+        .collect();
+    // PSNR 計算用は width 幅ストライドの入力フレームで生成する
+    let input_for_psnr: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(width, height, width, height, i))
+        .collect();
+
+    let decoded_frames = roundtrip_b_frames(config, DecoderCodec::Hevc, &input_frames);
+
+    assert_user_data_matches_input(&decoded_frames, &input_for_psnr, width, height);
 }
 
 // --- AV1 ---
@@ -754,7 +1044,7 @@ fn generate_dummy_yuy2(
 ) -> Vec<u8> {
     assert!(
         width <= coded_width && height <= coded_height,
-        "source size {}x{} exceeds coded size {}x{}",
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
         width,
         height,
         coded_width,
@@ -785,7 +1075,7 @@ fn generate_dummy_bgra(
 ) -> Vec<u8> {
     assert!(
         width <= coded_width && height <= coded_height,
-        "source size {}x{} exceeds coded size {}x{}",
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
         width,
         height,
         coded_width,
@@ -879,7 +1169,7 @@ fn roundtrip_format_with_size(
     // フレームサイズが FrameFormat::frame_size() と一致することを確認する
     let expected_size = format
         .frame_size(coded_width, coded_height)
-        .expect("frame size calculation overflowed");
+        .expect("フレームサイズ計算がオーバーフローした");
     for (i, frame) in input_frames.iter().enumerate() {
         assert_eq!(
             frame.len(),
