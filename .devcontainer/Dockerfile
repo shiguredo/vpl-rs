@@ -25,7 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust ツールチェインのインストール
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+# rust-toolchain.toml がツールチェインを固定するため、デフォルトも同じ 1.93 に合わせる
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # clippy / rustfmt コンポーネント (rust-toolchain.toml と同期)
