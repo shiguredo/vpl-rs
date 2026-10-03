@@ -28,11 +28,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: rustup update stable
+      # Rust ツールチェイン (1.93) は rust-toolchain.toml に従って rustup が自動導入する
       - uses: shiguredo/github-actions/.github/actions/rust-cache@main
         with:
           os: ${{ matrix.os }}
-          toolchain: stable
+          toolchain: 1.93
       - run: cargo fmt --all --check
       - run: cargo build --workspace
       - run: cargo clippy --workspace -- -D warnings
@@ -49,6 +49,7 @@ jobs:
       INTEL_VPL: 1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Rust ツールチェイン (1.93) は rust-toolchain.toml に従って rustup が自動導入する
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -67,7 +68,7 @@ jobs:
       DOCS_RS: 1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: rustup update stable
+      # Rust ツールチェイン (1.93) は rust-toolchain.toml に従って rustup が自動導入する
       - run: cargo doc --no-deps
 
   slack_notify:

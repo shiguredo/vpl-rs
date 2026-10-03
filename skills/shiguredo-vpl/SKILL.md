@@ -7,7 +7,7 @@ description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。In
 
 - **バージョン**: 2026.4.0 (依存する libvpl は 2.17.0)
 - **リポジトリ**: https://github.com/shiguredo/vpl-rs
-- **Rust エディション**: 2024 (rust-version: 1.93)
+- **Rust エディション**: 2024 (rust-version: 1.93、`rust-toolchain.toml` の channel も 1.93 に固定)
 - **ライセンス**: Apache-2.0
 - **動作要件**: Linux (x86_64) + 第 6 世代 Core 以降の Intel GPU。ビルド時に git と clang が必要。
 
