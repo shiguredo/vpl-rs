@@ -15,6 +15,12 @@
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon
 
+### misc
+
+- [UPDATE] Rust ツールチェーンを rust-version と同じ 1.93 に固定する
+  - CI と devcontainer のツールチェーンも 1.93 に合わせる
+  - @voluntas
+
 ## 2026.4.0
 
 **リリース日**: 2026-08-23
