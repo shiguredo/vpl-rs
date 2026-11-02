@@ -1246,8 +1246,9 @@ fn strip_vp9_ivf_headers(data: &[u8]) -> Vec<u8> {
 ///
 /// `write_ivf_headers` の値で encode → decode を実行し、getter の戻り値・
 /// 出力の IVF ヘッダー有無・デコード後の PSNR を検証する。
+/// `reconfigure` が true の場合はエンコード前に reconfigure を呼び出す。
 /// IVF 付きの場合は sora-rust-sdk の payload 処理と同様にヘッダーを除去してからデコードする。
-fn roundtrip_vp9(write_ivf_headers: bool) {
+fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
     let mut config = EncoderConfig::new(
         test_adapter(),
         CodecConfig::Vp9(Vp9EncoderConfig {
@@ -1265,7 +1266,16 @@ fn roundtrip_vp9(write_ivf_headers: bool) {
     config.gop_pic_size = Some(30);
 
     // getter 検証・coded_size 取得・エンコードに同じエンコーダを使い回す
-    let (encoder, rx) = create_encoder(config.clone());
+    let (mut encoder, rx) = create_encoder(config.clone());
+
+    if reconfigure {
+        encoder
+            .reconfigure(ReconfigureParams {
+                target_kbps: Some(800),
+                ..Default::default()
+            })
+            .expect("reconfigure に失敗した");
+    }
 
     // getter が設定した値 (write_ivf_headers) をそのまま返すことを検証する
     assert_eq!(
@@ -1356,80 +1366,25 @@ fn roundtrip_vp9(write_ivf_headers: bool) {
 /// VP9 raw (write_ivf_headers=false) のラウンドトリップ
 #[test]
 fn test_roundtrip_vp9_write_ivf_headers_false() {
-    roundtrip_vp9(false);
+    roundtrip_vp9(false, false);
 }
 
 /// VP9 IVF 付き (write_ivf_headers=true) のラウンドトリップ
 #[test]
 fn test_roundtrip_vp9_write_ivf_headers_true() {
-    roundtrip_vp9(true);
-}
-
-/// reconfigure 後も `write_ivf_headers` の設定が維持されることを検証する
-fn reconfigure_vp9_preserves_write_ivf_headers(write_ivf_headers: bool) {
-    let mut config = EncoderConfig::new(
-        test_adapter(),
-        CodecConfig::Vp9(Vp9EncoderConfig {
-            profile: Some(Vp9Profile::Profile0),
-            write_ivf_headers,
-        }),
-        320,
-        240,
-        FrameFormat::Nv12,
-        30,
-        1,
-        RateControlMode::Cbr,
-    );
-    config.target_kbps = Some(1000);
-    config.gop_pic_size = Some(30);
-
-    let (mut encoder, rx) = create_encoder(config.clone());
-    encoder
-        .reconfigure(ReconfigureParams {
-            target_kbps: Some(800),
-            ..Default::default()
-        })
-        .expect("reconfigure に失敗した");
-    assert_eq!(
-        encoder.write_ivf_headers(),
-        write_ivf_headers,
-        "reconfigure 後も getter は設定値を返すこと"
-    );
-
-    let width = config.width as usize;
-    let height = config.height as usize;
-    let (coded_width, coded_height) = encoder.coded_size();
-    let colorbar = generate_colorbar_nv12(width, height, coded_width, coded_height);
-    let input_frames: Vec<Vec<u8>> = (0..3).map(|_| colorbar.clone()).collect();
-    let (encoded_frames, _) = encode_with_encoder(encoder, rx, &input_frames);
-
-    // 出力ビットストリームの先頭が `DKIF` かどうかで IVF ヘッダーの有無を判定する
-    for (i, frame) in encoded_frames.iter().enumerate() {
-        if write_ivf_headers && i == 0 {
-            // 先頭フレームには 32 byte のファイルヘッダー (DKIF) が付く
-            assert!(
-                frame.data().starts_with(b"DKIF"),
-                "reconfigure 後の先頭フレームは DKIF で始まること"
-            );
-        } else {
-            assert!(
-                !frame.data().starts_with(b"DKIF"),
-                "reconfigure 後のフレーム {i} が DKIF で始まってはいけない"
-            );
-        }
-    }
+    roundtrip_vp9(true, false);
 }
 
 /// reconfigure 後も VP9 raw (write_ivf_headers=false) が維持されることを検証する
 #[test]
 fn test_reconfigure_vp9_write_ivf_headers_false() {
-    reconfigure_vp9_preserves_write_ivf_headers(false);
+    roundtrip_vp9(false, true);
 }
 
 /// reconfigure 後も VP9 IVF 付き (write_ivf_headers=true) が維持されることを検証する
 #[test]
 fn test_reconfigure_vp9_write_ivf_headers_true() {
-    reconfigure_vp9_preserves_write_ivf_headers(true);
+    roundtrip_vp9(true, true);
 }
 
 /// 非 VP9 コーデックの write_ivf_headers getter が常に false を返すことを検証する

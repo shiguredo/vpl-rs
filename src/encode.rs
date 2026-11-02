@@ -515,11 +515,7 @@ impl ExtBuffers {
             let mut param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
             param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
             param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
-            param.WriteIVFHeaders = if value {
-                sys::MFX_CODINGOPTION_ON as u16
-            } else {
-                sys::MFX_CODINGOPTION_OFF as u16
-            };
+            param.WriteIVFHeaders = coding_option_value(value);
             Box::new(param)
         });
 
@@ -547,6 +543,26 @@ impl ExtBuffers {
         }
         ext_bufs
     }
+}
+
+/// `video_param` に ExtParam を設定する
+///
+/// 空の場合は設定しない（空 `Vec` の `as_mut_ptr()` は dangling ポインタを返すため）。
+fn attach_ext_param(video_param: &mut sys::mfxVideoParam, ext_bufs: &mut [*mut sys::mfxExtBuffer]) {
+    if ext_bufs.is_empty() {
+        return;
+    }
+    video_param.ExtParam = ext_bufs.as_mut_ptr();
+    video_param.NumExtParam = ext_bufs.len() as u16;
+}
+
+/// `video_param` の ExtParam をクリアする
+///
+/// `video_param.ExtParam` は VPL API 呼び出しの直前だけ設定し、呼び出し直後に
+/// 必ずこの関数でクリアする。
+fn clear_ext_param(video_param: &mut sys::mfxVideoParam) {
+    video_param.ExtParam = std::ptr::null_mut();
+    video_param.NumExtParam = 0;
 }
 
 /// エンコーダ再構成パラメータ
@@ -765,9 +781,6 @@ pub struct Encoder<H: EncodeHandler> {
     write_ivf_headers: bool,
     bitstream_buffer_size: usize,
     /// Init / Reset で VPL へ渡す拡張バッファの本体
-    ///
-    /// このフィールドがバッファを所有するため、[`ExtBuffers::ext_param`] が返す
-    /// ポインタは Encoder の生存期間中ずっと有効である。
     ext_buffers: ExtBuffers,
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     worker_handle: Option<thread::JoinHandle<()>>,
@@ -778,11 +791,10 @@ pub struct Encoder<H: EncodeHandler> {
 // Safety: エンコード完了通知は専用スレッドで行い、メインスレッドは EncodeFrameAsync のみ実行する。
 // VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
-// また ext_buffers が保持する mfxExtCodingOption2 / mfxExtCodingOption3 は生ポインタを
-// 含まない全整数フィールドの POD であり、Box<...> は自動で Send になる。
-// video_param は ExtParam に生ポインタを持つが Init / Reset の外では常に null であり、
-// VPL に渡すポインタも呼び出し中だけ組み立てて使うため、Encoder をスレッド間で
-// move しても無効なポインタが残ることはない。
+// また ext_buffers が保持する mfxExtCodingOption2 / mfxExtCodingOption3 / mfxExtVP9Param は
+// 生ポインタを含まない全整数フィールドの POD であり、Box<...> は自動で Send になる。
+// video_param.ExtParam は VPL API 呼び出しの直前だけ設定し、呼び出し直後に必ず null に
+// 戻すため、Encoder をスレッド間で move しても無効なポインタが残ることはない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
@@ -983,40 +995,31 @@ impl<H: EncodeHandler> Encoder<H> {
         //
         // reconfigure (MFXVideoENCODE_Reset) でも Init 時と同じ拡張バッファを渡すため、
         // Box に包んだバッファを構築して Encoder に保持する。
+        let write_ivf_headers_setting = vp9_write_ivf_headers(&config.codec);
         let mut ext_buffers = ExtBuffers::new(
             config.look_ahead_depth,
             config.qvbr_quality,
-            vp9_write_ivf_headers(&config.codec),
+            write_ivf_headers_setting,
         );
 
         // Init 直後に WriteIVFHeaders の実効値が要求値と一致するかを検証するため、
-        // 要求値を保持しておく。非 VP9 コーデックでは None になる。
-        let write_ivf_headers_value: Option<u16> = ext_buffers
-            .ext_vp9
-            .as_deref()
-            .map(|vp9| vp9.WriteIVFHeaders);
+        // 要求値を MFX_CODINGOPTION_* の値に変換して保持しておく。
+        // 非 VP9 コーデックでは None になる。
+        let write_ivf_headers_value = write_ivf_headers_setting.map(coding_option_value);
         // getter が返す bool は要求値が ON かどうかで決まる
-        let write_ivf_headers = write_ivf_headers_value == Some(sys::MFX_CODINGOPTION_ON as u16);
+        let write_ivf_headers = write_ivf_headers_setting.unwrap_or(false);
 
         // Init 用の拡張バッファポインタ配列を構築する
         let mut init_ext_bufs = ext_buffers.ext_param();
-        if !init_ext_bufs.is_empty() {
-            video_param.ExtParam = init_ext_bufs.as_mut_ptr();
-            video_param.NumExtParam = init_ext_bufs.len() as u16;
-        }
+        attach_ext_param(&mut video_param, &mut init_ext_bufs);
 
         lib.mfx_video_encode_init(session.as_ptr(), &mut video_param)?;
 
         let lib = session.lib();
         let session_ptr = session.as_ptr();
 
-        // Init 後に ExtParam ポインタをクリアする
-        //
-        // video_param.ExtParam は Init / Reset の外では常にクリア済みという不変条件を
-        // 維持するため、ここで null に戻す。ext_buffers が保持する Box はこの後も
-        // Encoder が所有し続ける。
-        video_param.ExtParam = std::ptr::null_mut();
-        video_param.NumExtParam = 0;
+        // Init の呼び出しが終わったので ExtParam をクリアする
+        clear_ext_param(&mut video_param);
 
         // 初期化後に実効パラメータを読み戻す。
         // VP9 の場合、write_ivf_headers の要求値が oneVPL に尊重されるかを検証するため、
@@ -1040,18 +1043,15 @@ impl<H: EncodeHandler> Encoder<H> {
         if let Some(ref mut vp9) = ext_vp9_readback {
             ext_bufs_readback.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
         }
-        if !ext_bufs_readback.is_empty() {
-            video_param.ExtParam = ext_bufs_readback.as_mut_ptr();
-            video_param.NumExtParam = ext_bufs_readback.len() as u16;
-        }
+        attach_ext_param(&mut video_param, &mut ext_bufs_readback);
 
         lib.mfx_video_encode_get_video_param(session_ptr, &mut video_param)
             .inspect_err(|_| {
                 // GetVideoParam 失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
                 let _ = lib.mfx_video_encode_close(session_ptr);
             })?;
-        video_param.ExtParam = std::ptr::null_mut();
-        video_param.NumExtParam = 0;
+        // GetVideoParam の呼び出しが終わったので ExtParam をクリアする
+        clear_ext_param(&mut video_param);
         frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
 
         // VP9 の場合、WriteIVFHeaders の実効値が要求値と完全一致することを検証する。
@@ -1170,24 +1170,18 @@ impl<H: EncodeHandler> Encoder<H> {
 
         // Init 時に設定した拡張バッファを Reset にも渡す。
         //
-        // MFXVideoENCODE_Reset は渡された mfxVideoParam だけを新しい設定として扱うため、
-        // 拡張バッファを維持するには Init 時と同じ ExtParam を渡す。
-        // 空 Vec の as_mut_ptr() は dangling ポインタを返すため、空の場合はセットしない。
+        // Reset で attach されなかった拡張バッファの扱いはバッファ種別と実装に依存するため、
+        // Init 時の設定を確実に再要求するには Init と同じ ExtParam を渡す必要がある。
         let mut ext_bufs = self.ext_buffers.ext_param();
-        if !ext_bufs.is_empty() {
-            self.video_param.ExtParam = ext_bufs.as_mut_ptr();
-            self.video_param.NumExtParam = ext_bufs.len() as u16;
-        }
+        attach_ext_param(&mut self.video_param, &mut ext_bufs);
 
         let result = self
             .session
             .lib()
             .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param);
 
-        // Reset の成否にかかわらず、reconfigure の外では video_param.ExtParam が
-        // 常にクリア済みという不変条件を維持する。
-        self.video_param.ExtParam = std::ptr::null_mut();
-        self.video_param.NumExtParam = 0;
+        // Reset の成否にかかわらず ExtParam をクリアする
+        clear_ext_param(&mut self.video_param);
 
         result
     }
@@ -1701,6 +1695,17 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     }
 }
 
+/// bool を MFX_CODINGOPTION_* の値へ変換する
+///
+/// CodingOptionValue (mfxstructures.h) の ON / OFF に対応する値だけを扱う。
+fn coding_option_value(enabled: bool) -> u16 {
+    if enabled {
+        sys::MFX_CODINGOPTION_ON as u16
+    } else {
+        sys::MFX_CODINGOPTION_OFF as u16
+    }
+}
+
 /// MFX_CODINGOPTION_* の数値を記号名へ変換する
 ///
 /// CodingOptionValue (mfxstructures.h) の値をエラーメッセージで判読可能にするための表示用関数。
@@ -1907,12 +1912,9 @@ mod tests {
         config.look_ahead_depth = Some(16);
         config.qvbr_quality = Some(25);
 
-        let (tx, _rx) = mpsc::channel();
         let mut encoder = Encoder::new(
             config,
-            FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
-                let _ = tx.send(result);
-            }),
+            FnEncodeHandler::new(|_: Result<EncodedFrame<u32>, Error>| {}),
         )
         .expect("Encoder::new に失敗した");
 
