@@ -457,6 +457,98 @@ impl EncoderConfig {
     }
 }
 
+/// ExtParam として VPL に渡す拡張バッファの本体を所有する
+///
+/// [`ExtBuffers::ext_param`] が返すポインタは、この構造体が所有する `Box` の
+/// ヒープ領域を指す。`Box` のヒープアドレスはこの構造体の move では変わらないため、
+/// ポインタはこの構造体の生存期間中ずっと有効である。
+struct ExtBuffers {
+    /// mfxExtCodingOption2（LookAheadDepth 用）
+    ext_co2: Option<Box<sys::mfxExtCodingOption2>>,
+    /// mfxExtCodingOption3（QVBRQuality 用）
+    ext_co3: Option<Box<sys::mfxExtCodingOption3>>,
+    /// mfxExtVP9Param（WriteIVFHeaders 用）
+    ext_vp9: Option<Box<sys::mfxExtVP9Param>>,
+}
+
+impl ExtBuffers {
+    /// ExtParam として VPL に渡す拡張バッファ一式を構築する
+    ///
+    /// `look_ahead_depth` は mfxExtCodingOption2、`qvbr_quality` は mfxExtCodingOption3、
+    /// `write_ivf_headers` は mfxExtVP9Param として構築する。None の項目は構築しない。
+    fn new(
+        look_ahead_depth: Option<u16>,
+        qvbr_quality: Option<u16>,
+        write_ivf_headers: Option<bool>,
+    ) -> Self {
+        // Look Ahead depth の設定 (mfxExtCodingOption2)
+        //
+        // LA / LA_ICQ / LA_HRD モードでは LookAheadDepth で先読みフレーム数を指定する。
+        // ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption2::LookAheadDepth)
+        let ext_co2 = look_ahead_depth.map(|depth| {
+            let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+            co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
+            co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
+            co2.LookAheadDepth = depth;
+            Box::new(co2)
+        });
+
+        // QVBR Quality の設定 (mfxExtCodingOption3)
+        //
+        // QVBR モードでは QVBRQuality で品質値を指定する。
+        // ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption3::QVBRQuality)
+        let ext_co3 = qvbr_quality.map(|quality| {
+            let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+            co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
+            co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
+            co3.QVBRQuality = quality;
+            Box::new(co3)
+        });
+
+        // IVF ヘッダー出力の設定 (mfxExtVP9Param)
+        //
+        // WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
+        // ref:
+        // - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
+        // - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
+        let ext_vp9 = write_ivf_headers.map(|value| {
+            let mut param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
+            param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
+            param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
+            param.WriteIVFHeaders = if value {
+                sys::MFX_CODINGOPTION_ON as u16
+            } else {
+                sys::MFX_CODINGOPTION_OFF as u16
+            };
+            Box::new(param)
+        });
+
+        Self {
+            ext_co2,
+            ext_co3,
+            ext_vp9,
+        }
+    }
+
+    /// VPL に渡す ExtParam のポインタ配列を組み立てる
+    ///
+    /// 戻り値の `Vec` は VPL の呼び出しが終わるまで保持すること。
+    /// 空の場合は ExtParam を渡さない（拡張バッファを要求しない）ことを意味する。
+    fn ext_param(&mut self) -> Vec<*mut sys::mfxExtBuffer> {
+        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = Vec::new();
+        if let Some(co2) = self.ext_co2.as_deref_mut() {
+            ext_bufs.push(co2 as *mut sys::mfxExtCodingOption2 as *mut sys::mfxExtBuffer);
+        }
+        if let Some(co3) = self.ext_co3.as_deref_mut() {
+            ext_bufs.push(co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer);
+        }
+        if let Some(vp9) = self.ext_vp9.as_deref_mut() {
+            ext_bufs.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
+        }
+        ext_bufs
+    }
+}
+
 /// エンコーダ再構成パラメータ
 ///
 /// `Encoder::reconfigure` で動的に変更可能なパラメータ。
@@ -672,6 +764,11 @@ pub struct Encoder<H: EncodeHandler> {
     frame_format: FrameFormat,
     write_ivf_headers: bool,
     bitstream_buffer_size: usize,
+    /// Init / Reset で VPL へ渡す拡張バッファの本体
+    ///
+    /// このフィールドがバッファを所有するため、[`ExtBuffers::ext_param`] が返す
+    /// ポインタは Encoder の生存期間中ずっと有効である。
+    ext_buffers: ExtBuffers,
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     worker_handle: Option<thread::JoinHandle<()>>,
     frame_count: u64,
@@ -681,6 +778,11 @@ pub struct Encoder<H: EncodeHandler> {
 // Safety: エンコード完了通知は専用スレッドで行い、メインスレッドは EncodeFrameAsync のみ実行する。
 // VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
+// また ext_buffers が保持する mfxExtCodingOption2 / mfxExtCodingOption3 は生ポインタを
+// 含まない全整数フィールドの POD であり、Box<...> は自動で Send になる。
+// video_param は ExtParam に生ポインタを持つが Init / Reset の外では常に null であり、
+// VPL に渡すポインタも呼び出し中だけ組み立てて使うため、Encoder をスレッド間で
+// move しても無効なポインタが残ることはない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
@@ -878,75 +980,29 @@ impl<H: EncodeHandler> Encoder<H> {
         }
 
         // 拡張バッファの設定
-        let mut ext_co2: Option<sys::mfxExtCodingOption2> = None;
-        let mut ext_co3: Option<sys::mfxExtCodingOption3> = None;
-        let mut ext_vp9: Option<sys::mfxExtVP9Param> = None;
-
-        // VP9 の場合、IVF ヘッダー出力の要求値 (write_ivf_headers) を MFX_CODINGOPTION_* の値へ変換して
-        // mfxExtVP9Param を構築する。非 VP9 コーデックでは write_ivf_headers は false 固定とし、
-        // ext_vp9 は構築しない。
         //
-        // WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
-        // ref:
-        // - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
-        // - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
-        let write_ivf_headers_value: Option<u16> = match &config.codec {
-            CodecConfig::Vp9(vp9) => {
-                let value = if vp9.write_ivf_headers {
-                    sys::MFX_CODINGOPTION_ON as u16
-                } else {
-                    sys::MFX_CODINGOPTION_OFF as u16
-                };
-                let mut vp9_param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
-                vp9_param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
-                vp9_param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
-                vp9_param.WriteIVFHeaders = value;
-                ext_vp9 = Some(vp9_param);
-                Some(value)
-            }
-            _ => None,
-        };
+        // reconfigure (MFXVideoENCODE_Reset) でも Init 時と同じ拡張バッファを渡すため、
+        // Box に包んだバッファを構築して Encoder に保持する。
+        let mut ext_buffers = ExtBuffers::new(
+            config.look_ahead_depth,
+            config.qvbr_quality,
+            vp9_write_ivf_headers(&config.codec),
+        );
+
+        // Init 直後に WriteIVFHeaders の実効値が要求値と一致するかを検証するため、
+        // 要求値を保持しておく。非 VP9 コーデックでは None になる。
+        let write_ivf_headers_value: Option<u16> = ext_buffers
+            .ext_vp9
+            .as_deref()
+            .map(|vp9| vp9.WriteIVFHeaders);
         // getter が返す bool は要求値が ON かどうかで決まる
         let write_ivf_headers = write_ivf_headers_value == Some(sys::MFX_CODINGOPTION_ON as u16);
 
-        // Look Ahead depth の設定 (mfxExtCodingOption2)
-        let needs_co2 = config.look_ahead_depth.is_some();
-        if needs_co2 {
-            let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
-            co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
-            co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
-            if let Some(depth) = config.look_ahead_depth {
-                co2.LookAheadDepth = depth;
-            }
-            ext_co2 = Some(co2);
-        }
-
-        // QVBR Quality の設定 (mfxExtCodingOption3)
-        let needs_co3 = config.qvbr_quality.is_some();
-        if needs_co3 {
-            let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
-            co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
-            co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
-            if let Some(quality) = config.qvbr_quality {
-                co3.QVBRQuality = quality;
-            }
-            ext_co3 = Some(co3);
-        }
-
-        // 拡張バッファポインタ配列を構築する
-        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = Vec::new();
-        if let Some(ref mut co2) = ext_co2 {
-            ext_bufs.push(co2 as *mut sys::mfxExtCodingOption2 as *mut sys::mfxExtBuffer);
-        }
-        if let Some(ref mut co3) = ext_co3 {
-            ext_bufs.push(co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer);
-        }
-        if let Some(ref mut vp9) = ext_vp9 {
-            ext_bufs.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
-        }
-        if !ext_bufs.is_empty() {
-            video_param.ExtParam = ext_bufs.as_mut_ptr();
-            video_param.NumExtParam = ext_bufs.len() as u16;
+        // Init 用の拡張バッファポインタ配列を構築する
+        let mut init_ext_bufs = ext_buffers.ext_param();
+        if !init_ext_bufs.is_empty() {
+            video_param.ExtParam = init_ext_bufs.as_mut_ptr();
+            video_param.NumExtParam = init_ext_bufs.len() as u16;
         }
 
         lib.mfx_video_encode_init(session.as_ptr(), &mut video_param)?;
@@ -954,7 +1010,11 @@ impl<H: EncodeHandler> Encoder<H> {
         let lib = session.lib();
         let session_ptr = session.as_ptr();
 
-        // Init 後に ExtParam ポインタをクリアする（ローカルの ext_bufs が drop されるため）
+        // Init 後に ExtParam ポインタをクリアする
+        //
+        // video_param.ExtParam は Init / Reset の外では常にクリア済みという不変条件を
+        // 維持するため、ここで null に戻す。ext_buffers が保持する Box はこの後も
+        // Encoder が所有し続ける。
         video_param.ExtParam = std::ptr::null_mut();
         video_param.NumExtParam = 0;
 
@@ -1037,6 +1097,7 @@ impl<H: EncodeHandler> Encoder<H> {
             frame_format: config.frame_format,
             write_ivf_headers,
             bitstream_buffer_size,
+            ext_buffers,
             worker_tx,
             worker_handle: Some(worker_handle),
             frame_count: 0,
@@ -1069,7 +1130,11 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// エンコーダパラメータを動的に変更する
     ///
-    /// MFXVideoENCODE_Reset を呼び出す。ビットレートやフレームレートの変更に使用する。
+    /// ビットレートやフレームレートの変更に使用する。
+    ///
+    /// `EncoderConfig` で指定した拡張バッファも Reset 時に VPL へ渡し直すため、
+    /// reconfigure 後もそれらの設定は維持される。拡張バッファの値を reconfigure で
+    /// 変更することはできない。
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         if let Some(0) = params.framerate_den {
             return Err(Error::new_custom(
@@ -1103,9 +1168,28 @@ impl<H: EncodeHandler> Encoder<H> {
             }
         }
 
-        self.session
+        // Init 時に設定した拡張バッファを Reset にも渡す。
+        //
+        // MFXVideoENCODE_Reset は渡された mfxVideoParam だけを新しい設定として扱うため、
+        // 拡張バッファを維持するには Init 時と同じ ExtParam を渡す。
+        // 空 Vec の as_mut_ptr() は dangling ポインタを返すため、空の場合はセットしない。
+        let mut ext_bufs = self.ext_buffers.ext_param();
+        if !ext_bufs.is_empty() {
+            self.video_param.ExtParam = ext_bufs.as_mut_ptr();
+            self.video_param.NumExtParam = ext_bufs.len() as u16;
+        }
+
+        let result = self
+            .session
             .lib()
-            .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param)
+            .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param);
+
+        // Reset の成否にかかわらず、reconfigure の外では video_param.ExtParam が
+        // 常にクリア済みという不変条件を維持する。
+        self.video_param.ExtParam = std::ptr::null_mut();
+        self.video_param.NumExtParam = 0;
+
+        result
     }
 
     /// Init 後の実効パラメータを取得する
@@ -1550,6 +1634,16 @@ fn picture_type_from_frame_type(frame_type: u16) -> PictureType {
     }
 }
 
+/// VP9 の IVF ヘッダー出力設定を返す
+///
+/// 非 VP9 コーデックは IVF ヘッダー出力の設定を持たないため None を返す。
+fn vp9_write_ivf_headers(codec: &CodecConfig) -> Option<bool> {
+    match codec {
+        CodecConfig::Vp9(vp9) => Some(vp9.write_ivf_headers),
+        _ => None,
+    }
+}
+
 /// コーデック ID を返す
 fn codec_id(codec: &CodecConfig) -> u32 {
     match codec {
@@ -1750,6 +1844,108 @@ mod tests {
         assert_eq!(
             callback_count, 2,
             "expected callbacks for all pending frames"
+        );
+    }
+
+    /// エンコーダが実際に使っている LookAheadDepth と QVBRQuality を読み戻す
+    ///
+    /// 実機 (Intel GPU) 上でのみ動作する。
+    #[cfg(intel_vpl)]
+    fn read_coding_option_ext_params<H: EncodeHandler>(encoder: &Encoder<H>) -> (u16, u16) {
+        // 公開 API の `Encoder::get_video_param` は ExtParam を渡す手段を持たないため、
+        // private な `session` と `video_param` を直接使う。
+        //
+        // 読み戻し先の拡張バッファを zeroed で用意する。
+        // GetVideoParam は attach したバッファへ実効値を書き戻す。
+        let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+        co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
+        co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
+        let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+        co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
+        co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
+        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = vec![
+            &mut co2 as *mut sys::mfxExtCodingOption2 as *mut sys::mfxExtBuffer,
+            &mut co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer,
+        ];
+
+        // 現在の動画パラメータを取得してから、拡張バッファを attach して再度取得する
+        let mut param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+        param.ExtParam = ext_bufs.as_mut_ptr();
+        param.NumExtParam = ext_bufs.len() as u16;
+        encoder
+            .session
+            .lib()
+            .mfx_video_encode_get_video_param(encoder.session.as_ptr(), &mut param)
+            .expect("GetVideoParam に失敗した");
+
+        (co2.LookAheadDepth, co3.QVBRQuality)
+    }
+
+    /// reconfigure 後も Init 時に設定した LookAheadDepth / QVBRQuality が維持されることを確認する
+    ///
+    /// 実機 (Intel GPU) 上でのみ動作するため `INTEL_VPL=1` ビルドでのみコンパイルする。
+    #[cfg(intel_vpl)]
+    #[test]
+    fn reconfigure_preserves_coding_option_ext_params() {
+        let adapters = crate::list_adapters().expect("list_adapters に失敗した");
+        let first = adapters.first().expect("Intel アダプタが見つからない");
+
+        // HEVC の QVBR は LookAheadDepth と QVBRQuality の両方を ExtParam として
+        // 受け付けるため、両方の維持を 1 つのエンコーダで確認できる。
+        let mut config = EncoderConfig::new(
+            AdapterSelector::DrmRenderNode(first.drm_render_node),
+            CodecConfig::Hevc(HevcEncoderConfig { profile: None }),
+            320,
+            240,
+            FrameFormat::Nv12,
+            30,
+            1,
+            RateControlMode::Qvbr,
+        );
+        config.target_kbps = Some(2000);
+        config.max_kbps = Some(4000);
+        config.look_ahead_depth = Some(16);
+        config.qvbr_quality = Some(25);
+
+        let (tx, _rx) = mpsc::channel();
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
+                let _ = tx.send(result);
+            }),
+        )
+        .expect("Encoder::new に失敗した");
+
+        // Init 直後の実効値を取得する。
+        // 拡張バッファが実効値として反映されない GPU ではこのテストの前提が
+        // 崩れるため、0 でないことも確認する。
+        let (look_ahead_before, qvbr_before) = read_coding_option_ext_params(&encoder);
+        assert!(
+            look_ahead_before > 0,
+            "Init 後の LookAheadDepth が 0: この GPU は HEVC QVBR の LookAheadDepth をサポートしていない"
+        );
+        assert!(
+            qvbr_before > 0,
+            "Init 後の QVBRQuality が 0: この GPU は HEVC QVBR の QVBRQuality をサポートしていない"
+        );
+
+        encoder
+            .reconfigure(ReconfigureParams {
+                target_kbps: Some(3000),
+                ..Default::default()
+            })
+            .expect("reconfigure に失敗した");
+
+        // reconfigure (MFXVideoENCODE_Reset) 後も Init 時の拡張バッファが
+        // 維持されていることを確認する。
+        let (look_ahead_after, qvbr_after) = read_coding_option_ext_params(&encoder);
+        assert_eq!(
+            look_ahead_after, look_ahead_before,
+            "reconfigure で LookAheadDepth が変わった (before: {look_ahead_before}, after: {look_ahead_after})"
+        );
+        assert_eq!(
+            qvbr_after, qvbr_before,
+            "reconfigure で QVBRQuality が変わった (before: {qvbr_before}, after: {qvbr_after})"
         );
     }
 }
