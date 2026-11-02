@@ -871,6 +871,99 @@ fn test_drop_cancels_pending_callbacks() {
     );
 }
 
+/// reconfigure を挟んだエンコードで、すべてのフレームが Ok で通知されることを確認する
+///
+/// reconfigure の前後で encode したフレームが、破棄や重複なく 1 回ずつ Ok で
+/// 通知されることを検証する。
+#[test]
+fn test_reconfigure_drains_pending_frames() {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    // 入力を複数枚まとめてから出力する GOP 構造にして、
+    // reconfigure の時点で pending frame が残る状況を作る。
+    config.gop_ref_dist = Some(3);
+
+    let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new(move |result| {
+            tx.send(result)
+                .expect("エンコード結果コールバックの送信に失敗した");
+        }),
+    )
+    .expect("エンコーダの生成に失敗した");
+    let (coded_width, coded_height) = encoder.coded_size();
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    let before_count = 8;
+    let after_count = 8;
+
+    for i in 0..before_count {
+        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        encoder
+            .encode(&frame_data, i, &options)
+            .expect("エンコードに失敗した");
+    }
+
+    encoder
+        .reconfigure(ReconfigureParams {
+            target_kbps: Some(1200),
+            ..Default::default()
+        })
+        .expect("reconfigure に失敗した");
+
+    for i in before_count..before_count + after_count {
+        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        encoder
+            .encode(&frame_data, i, &options)
+            .expect("エンコードに失敗した");
+    }
+
+    // finish() は残留した pending をエラーにする。この呼び出しが Ok であることで、
+    // reconfigure が pending を残していないことを確認できる。
+    encoder.finish().expect("finish に失敗した");
+
+    let mut ok_user_data = Vec::new();
+    let mut errors = Vec::new();
+    while let Ok(result) = rx.recv_timeout(Duration::from_millis(100)) {
+        match result {
+            Ok(frame) => ok_user_data.push(*frame.user_data()),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    // reconfigure の前後で、全フレームが Ok で 1 回ずつ通知される
+    assert!(
+        errors.is_empty(),
+        "reconfigure でフレームが破棄された: {}",
+        errors
+            .iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut sorted_ok_user_data = ok_user_data.clone();
+    sorted_ok_user_data.sort_unstable();
+    let expected: Vec<usize> = (0..before_count + after_count).collect();
+    assert_eq!(
+        sorted_ok_user_data, expected,
+        "全フレームが Ok で 1 回ずつ通知されること"
+    );
+}
+
 // --- H.265 ---
 
 /// H.265 CBR カラーバーのラウンドトリップ（PSNR 検証）
