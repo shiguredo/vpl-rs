@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/fix-decoder-b-frame-user-data-mismatch
 - Polished: 2026-08-21
@@ -268,3 +268,58 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 - **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): デバイスエラー伝搬の検証と二重通知の扱いの確定を行う。0010 は「`SyncData` への `frame_seq` 追加と Sync エラー時の `take_by_frame_seq` による pending 消費」を**廃案**にし、Encoder 側も二重通知を許容する方針に確定した（0010 の設計方針 2）。本 issue の Decoder 側方針（Sync 失敗時は pending を消費せず二重通知を許容）は 0010 の最終方針と同じであり、対比の必要はなくなった。`sync_and_drain` / `sync_and_callback` の `MFX_INFINITE` は変更しない（有限タイムアウト化は廃案）。適用順序は 0010 → 0008（0010 はプロダクションコード変更なしで closed 済みのため、実質の依存は情報参照のみ）。
 - **issue 0009** (`0009-bug-decoder-device-busy-infinite-retry`): `decode_bitstream` / `finish` の DEVICE_BUSY 無限再試行を上限付きにする修正。当初は「`decode_bitstream` がエラーを返した場合、送信済み `QueueFrame` の `frame_seq` はインクリメントされないため、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる。0009 を先に適用するか、エラー後の `frame_count` の扱いを 0009 の実装と整合させること」としていた。0009（リトライ上限追加）は適用済みで、エラー後の `frame_count` の整合は本 issue の変更概要 2 の「デコード実行前インクリメント」順序で満たす（0009 は `frame_count` 自体には触れない）。
 - **issue 0014** (`0014-bug-frame-surface-drop-silently-swallows-errors`): `FrameSurface::Drop` のエラー処理を stderr 出力に変更する issue。`sync_and_drain` は変更対象外（0008 の削除に委ねる）。**0014 はログライブラリ（tracing 等）未導入のため `issues/pending/` に移動済み（pending）**。0008 は 0014 の変更（`src/vpl.rs` の Drop とヘルパー追加）と競合しないため、0014 の適用を待たずに実装する。0014 が将来実装された際は、0008 適用後の `FrameSurface::Drop`（Unmap / Release）の失敗が観測可能になる。
+
+## 解決方法
+
+設計方針どおり、Decoder の user_data 対応付けを FIFO キューから `TimeStamp` 完全一致方式へ変更した。入力ビットストリームの `TimeStamp` に連番 `frame_seq` を載せ、出力フレームの `Data.TimeStamp` との完全一致で `user_data` を引き当てるため、B フレームで表示順が並び替えられても正しい入力フレームに紐付く。Encoder と同じ方式になり、両者の非対称も解消した。
+
+### 変更内容
+
+#### `src/decode.rs`
+
+- `Decoder` に `frame_count: u64`（初期値 0）を追加した。
+- `decode()` で `bs.TimeStamp = frame_seq` を設定し、`WorkerCommand::QueueFrame { frame_seq, user_data }` を worker に送るようにした。
+- `frame_count` のインクリメントを `decode_bitstream()` の実行前に移した。デコードがエラーを返しても `frame_seq` が再利用されないため、pending の重複キーや `user_data` の上書き喪失が起きない。エラーで出力に紐付かなかった `user_data` は `pending_map` に残留し、`finish()` の残留チェックまたは `Drop` 時の `Stop` で通知される。
+- `WorkerCommand::QueueFrame` に `frame_seq: u64` を追加した。
+- `run_sync_worker` の `pending_values: VecDeque<H::UserData>` を `pending_map: HashMap<u64, H::UserData>` に置き換えた。`QueueFrame` 受信時の重複キーは `duplicate frame sequence in pending frames: {frame_seq}` のエラー通知にした。
+- `sync_and_callback` は `pending_map: &mut HashMap<u64, H::UserData>` を受け取り、`SyncOperation` 完了後に出力サーフェスの `Data.TimeStamp` を読んで `pending_map.remove(&frame_seq)` で `user_data` を引き当てる形に変更した。引き当て失敗はドレインの空フレームや異常出力による正常な破棄として扱い、`Err` にしない（Map 済みサーフェスは Drop で Unmap / Release される）。
+- 呼び出し元が消滅した `sync_and_drain` を削除した。
+- `WaitIdle` アームに残留チェックを追加した。残留エントリは `decode pending frame seq={frame_seq} (pending count: {N})` のエラーとしてハンドラに通知し、`finish()` は `finish completed but {N} pending frames remained` で `Err` を返す。
+- `Stop` アームは `pending_map.drain()` で全エントリに `MFX_ERR_ABORTED` を通知するようにした。
+- `WorkerCommand` / `decode()` / `decode_bitstream()` / `finish()` / `run_sync_worker()` の doc comment とコードコメントを TimeStamp 一致方式に更新した。
+
+#### `tests/test_roundtrip.rs` と `src/decode.rs` の単体テスト
+
+- `DecodedFrameInfo` に `user_data: usize` を追加し、`decode()` ヘルパーが `DecodedFrame::user_data()` を保持するようにした。
+- `roundtrip_b_frames` ヘルパーを追加した。`gop_ref_dist` で B フレームを有効にした Encoder の出力を Decoder に流し、`EncodedFrame::user_data()` を Decoder 入力の `user_data` に転送する。エンコーダ出力に `PictureType::B` のフレームが 1 枚以上含まれることも検証する。
+- `assert_user_data_matches_input` ヘルパーを追加した。`user_data` の集合が `{0..N-1}` と過不足なく一致し、各値がちょうど 1 回出現すること、`user_data == i` の出力フレームの Y プレーンが入力フレーム i と PSNR で一致し、誤対応フレームとの PSNR より十分高いことを検証する。
+- `test_roundtrip_h264_b_frame_user_data`（H.264 High、`gop_pic_size = 30`、`gop_ref_dist = 3`、15 フレーム）と `test_roundtrip_hevc_b_frame_user_data`（H.265 Main、同じ設定）を追加した。
+- `src/decode.rs` に `worker_wait_idle_returns_error_when_pending_remains` / `worker_stop_returns_aborted_for_all_pending` / `worker_reports_duplicate_frame_sequence` の単体テストを追加した。
+
+#### `skills/shiguredo-vpl/SKILL.md`
+
+- Decoder の `user_data` 対応付けに関する FIFO キューの記述を TimeStamp 完全一致方式に更新した。
+- 供給過多の残余が `finish()` の残留チェックでエラーになること、分割入力時の対応付けが保証されないこと、`decode` がエラーを返した場合も `frame_seq` は消費済みであることを明記した。
+
+#### `CHANGES.md`
+
+- `## develop` に `[FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する` を追記した。
+
+### 完了条件の対応
+
+1. 実機での `bs.TimeStamp` → `surface.Data.TimeStamp` 伝搬確認 — セルフホストの Intel GPU ランナーで `cargo test --workspace` を実行する CI の `Test (Intel GPU)` ジョブが pass した。伝搬が成立しなければ引き当てが空振りして出力フレームが 1 枚も通知されず、デコード済みフレーム数を検証するラウンドトリップテストが失敗する。H.264 / H.265 の B フレーム有りテストと VP9 / AV1 の既存テストが同時に pass したため、4 コーデックすべてで伝搬が成立していると判断し、コーデック別の分岐（FIFO 方式の維持）は実装していない。
+2. B フレームを含むビットストリームでの `user_data` 対応付け — 追加した 2 つの B フレーム有りテストで検証する。遅延出力される B フレームと `finish()` のドレイン期に出力される末尾フレームの双方が `user_data` 付きで通知されることを、出力フレーム数と `user_data` の完全一致で確認している。
+3. 統合テストの追加 — `gop_ref_dist = 3`（2 個の B フレーム）で N = 15 フレームのラウンドトリップを行い、`user_data` の過不足・重複・PSNR による対応の正しさ・B ピクチャの生成を検証する。
+4. `skills/shiguredo-vpl/SKILL.md` の更新 — FIFO の記述を TimeStamp 一致方式に置き換え、供給過多と分割入力の挙動変化を反映した。
+5. `CHANGES.md` の `[FIX]` 追記 — 追記済み。
+6. `finish()` の正常完了 — 全ラウンドトリップテストが `decoder.finish().expect(...)` を通しており、ドレインフレームが `Sync` 経由で処理され残留チェックに掛からないことを確認している。
+7. 既存の VP9 / AV1 ラウンドトリップテスト — `test_roundtrip_vp9_write_ivf_headers_true` / `test_roundtrip_vp9_write_ivf_headers_false` / `test_roundtrip_av1_cbr` / `test_roundtrip_av1_cqp` が CI で pass した。
+
+### 残課題（本 issue のスコープ外）
+
+VP9 temporal scalability の層切り替えフレーム（`showFrame = 0`）のように、正当なストリームでも出力が発生しないフレームが存在すると `user_data` が残留して `finish()` が `Err` になる。本 crate は VP9 temporal layer 設定を公開していないため自前エンコードでは発生しないが、第三者のビットストリームでは発生し得る。設計方針 項目 11 に既知の制約として記録し、対応は別途検討する。
+
+### 参考
+
+- PR: https://github.com/shiguredo/vpl-rs/pull/9
+
