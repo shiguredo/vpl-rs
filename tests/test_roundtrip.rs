@@ -8,7 +8,8 @@ use shiguredo_vpl::{
     AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec,
     DecoderConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler,
     FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
-    PictureType, RateControlMode, Vp9EncoderConfig, Vp9Profile, frame_type, list_adapters,
+    PictureType, RateControlMode, ReconfigureParams, Vp9EncoderConfig, Vp9Profile, frame_type,
+    list_adapters,
 };
 
 /// テスト用アダプタを返す
@@ -1245,8 +1246,9 @@ fn strip_vp9_ivf_headers(data: &[u8]) -> Vec<u8> {
 ///
 /// `write_ivf_headers` の値で encode → decode を実行し、getter の戻り値・
 /// 出力の IVF ヘッダー有無・デコード後の PSNR を検証する。
+/// `reconfigure` が true の場合はエンコード前に reconfigure を呼び出す。
 /// IVF 付きの場合は sora-rust-sdk の payload 処理と同様にヘッダーを除去してからデコードする。
-fn roundtrip_vp9(write_ivf_headers: bool) {
+fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
     let mut config = EncoderConfig::new(
         test_adapter(),
         CodecConfig::Vp9(Vp9EncoderConfig {
@@ -1264,7 +1266,16 @@ fn roundtrip_vp9(write_ivf_headers: bool) {
     config.gop_pic_size = Some(30);
 
     // getter 検証・coded_size 取得・エンコードに同じエンコーダを使い回す
-    let (encoder, rx) = create_encoder(config.clone());
+    let (mut encoder, rx) = create_encoder(config.clone());
+
+    if reconfigure {
+        encoder
+            .reconfigure(ReconfigureParams {
+                target_kbps: Some(800),
+                ..Default::default()
+            })
+            .expect("reconfigure に失敗した");
+    }
 
     // getter が設定した値 (write_ivf_headers) をそのまま返すことを検証する
     assert_eq!(
@@ -1355,13 +1366,25 @@ fn roundtrip_vp9(write_ivf_headers: bool) {
 /// VP9 raw (write_ivf_headers=false) のラウンドトリップ
 #[test]
 fn test_roundtrip_vp9_write_ivf_headers_false() {
-    roundtrip_vp9(false);
+    roundtrip_vp9(false, false);
 }
 
 /// VP9 IVF 付き (write_ivf_headers=true) のラウンドトリップ
 #[test]
 fn test_roundtrip_vp9_write_ivf_headers_true() {
-    roundtrip_vp9(true);
+    roundtrip_vp9(true, false);
+}
+
+/// reconfigure 後も VP9 raw (write_ivf_headers=false) が維持されることを検証する
+#[test]
+fn test_reconfigure_vp9_write_ivf_headers_false() {
+    roundtrip_vp9(false, true);
+}
+
+/// reconfigure 後も VP9 IVF 付き (write_ivf_headers=true) が維持されることを検証する
+#[test]
+fn test_reconfigure_vp9_write_ivf_headers_true() {
+    roundtrip_vp9(true, true);
 }
 
 /// 非 VP9 コーデックの write_ivf_headers getter が常に false を返すことを検証する
