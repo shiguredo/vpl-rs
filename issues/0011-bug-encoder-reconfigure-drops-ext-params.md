@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-drops-ext-params
 - Polished: 2026-08-02
@@ -133,3 +134,43 @@ pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
 - Init 時の ExtParam 組み立て: `src/encode.rs` の `Encoder::new` の拡張バッファ設定部
 - reconfigure の実装: `src/encode.rs` の `Encoder::reconfigure`
 - 関連 issue: 0012（reconfigure が pending frame を drain しない別問題。適用順序は「設計方針」の「適用順序」を参照）、0020（encode.rs のサブモジュール分割。本 issue 適用後の設計に合わせて調整する）
+
+
+## 解決方法
+
+`Encoder` が Init 時に構築した拡張バッファを保持し、`reconfigure` の `MFXVideoENCODE_Reset` にも Init 時と同じ ExtParam を渡すようにした。これにより、`EncoderConfig::look_ahead_depth` / `EncoderConfig::qvbr_quality` と `Vp9EncoderConfig::write_ivf_headers` が reconfigure 後も維持される。
+
+### 変更内容
+
+#### `src/encode.rs`
+
+- `ExtBuffers` を追加し、`mfxExtCodingOption2`（LookAheadDepth）、`mfxExtCodingOption3`（QVBRQuality）、`mfxExtVP9Param`（WriteIVFHeaders）を `Box` で保持するようにした。`Box` のヒープアドレスは move で変わらないため、保持したバッファを指すポインタは `Encoder` の生存期間中ずっと有効になる。
+- `ExtBuffers::new(look_ahead_depth, qvbr_quality, write_ivf_headers)` で各拡張バッファを構築し、`ExtBuffers::ext_param` で VPL に渡すポインタ配列を組み立てるようにした。
+- `Encoder` に `ext_buffers: ExtBuffers` を追加し、Init と Reset で同じポインタ配列を使うようにした。
+- `video_param.ExtParam` は Init / Reset の外では常に null にクリアする不変条件を維持した。
+- `unsafe impl Send` の Safety コメントに、保持する拡張バッファと `ExtParam` の扱いを追記した。
+- `Encoder::reconfigure` の doc に、拡張バッファの設定が reconfigure 後も維持されることを明記した。
+
+#### `tests/test_roundtrip.rs`
+
+- `test_reconfigure_vp9_write_ivf_headers_false` / `test_reconfigure_vp9_write_ivf_headers_true` を追加し、reconfigure 後にエンコードしたビットストリームの `DKIF` の有無で `write_ivf_headers` が維持されることを検証するようにした。
+
+#### `src/encode.rs` の単体テスト
+
+- `reconfigure_preserves_coding_option_ext_params` を追加し、HEVC QVBR で reconfigure 後の LookAheadDepth / QVBRQuality の実効値を `GetVideoParam` で読み戻して検証するようにした。実機 (Intel GPU) 上でのみ動作するため `INTEL_VPL=1` ビルドでのみコンパイルされる。
+
+#### `CHANGES.md`
+
+- `## develop` に `[FIX]` として「reconfigure 時に Init 時の拡張バッファを再送するよう修正する」を追記した。
+
+### 実機確認
+
+Intel Core Ultra 5 125H (Meteor Lake) 上で確認した。
+
+- 修正あり: HEVC QVBR で `look_ahead_depth=16` / `qvbr_quality=25` が reconfigure 後も 16 / 25 のまま維持されることを確認した。
+- Reset に ExtParam を渡さない実装では `LookAheadDepth` が 16 から 0 に戻ることを確認した。
+- `cargo test --workspace` (`INTEL_VPL=1`)、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` が通ることを確認した。
+
+### 補足
+
+自動検証は issue 0012 の reconfigure テストを待たず、上記の単体テストと統合テストとして追加した。VP9 の `WriteIVFHeaders` はこのドライバでは Reset 時に省略しても Init 時の値が継承されるため、追加したテストは変更を外しても通る。Init と同じ拡張バッファを Reset に渡す実装にそろえる目的で対応した。
