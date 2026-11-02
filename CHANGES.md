@@ -17,6 +17,9 @@
 - [FIX] reconfigure 時に Init 時の拡張バッファを再送するよう修正する
   - `EncoderConfig::look_ahead_depth` / `EncoderConfig::qvbr_quality` / `Vp9EncoderConfig::write_ivf_headers` が reconfigure 後も維持される
   - @melpon
+- [FIX] reconfigure が pending frame を回収してから Reset するよう修正する
+  - reconfigure 時に未出力フレームが `Ok` で通知され、`finish()` の残留エラーにならない
+  - @melpon
 
 ### misc
 
