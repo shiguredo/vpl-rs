@@ -14,6 +14,9 @@
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon
+- [FIX] reconfigure 時に Init 時の拡張バッファを再送するよう修正する
+  - `EncoderConfig::look_ahead_depth` / `EncoderConfig::qvbr_quality` / `Vp9EncoderConfig::write_ivf_headers` が reconfigure 後も維持される
+  - @melpon
 
 ### misc
 
