@@ -11,6 +11,10 @@
 
 ## develop
 
+- [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
+  - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
+  - @melpon
+
 ### misc
 
 - [UPDATE] Rust ツールチェーンを rust-version と同じ 1.93 に固定する

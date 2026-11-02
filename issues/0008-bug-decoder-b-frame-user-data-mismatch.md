@@ -134,9 +134,9 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
      2. `let frame_seq = self.frame_count` で現在の連番を取得
      3. `bs.TimeStamp = frame_seq` でビットストリームに設定
      4. `self.send_worker_command("Decoder::decode", WorkerCommand::QueueFrame { frame_seq, user_data })` で Worker に転送
-     5. `self.decode_bitstream(&mut bs)` でデコード実行
-     6. `self.frame_count = self.frame_count.checked_add(1).ok_or_else(|| ...)?` でインクリメント
-   - 注意: `decode_bitstream` がエラーを返した場合 `frame_count` はインクリメントされないため、送信済み `QueueFrame` の `frame_seq` が次回 `decode()` で再利用され重複キー検出エラーになる。この挙動は「依存 issue」セクションの 0009 の項目を参照。
+     5. `self.frame_count = self.frame_count.checked_add(1).ok_or_else(|| ...)?` でインクリメント
+     6. `self.decode_bitstream(&mut bs)` でデコード実行
+   - 注意: 手順 5 のインクリメントをデコード実行（手順 6）より前に置くことで、`decode_bitstream` がエラーを返しても送信済み `QueueFrame` の `frame_seq` が次回 `decode()` で再利用されて重複キー検出エラーになったり、旧 `user_data` が上書き喪失したりしない。エラーで出力に紐付かなかった `user_data` は `pending_map` に残留したままなので、`finish()` の残留チェック（項目 11）または `Drop` 時の `Stop` アーム（項目 10）でエラーとして通知される（0009 の「エラー後の `frame_count` の扱いを整合させる」要求をこの順序で満たす）。
 
 3. **`WorkerCommand` の `QueueFrame` に `frame_seq: u64` を追加する**
    - 現在: `WorkerCommand::QueueFrame(T)`
@@ -196,6 +196,7 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
     - このエラーメッセージはテスト可能であること。
     - 残留の処理担当の整理: 通常フロー（`finish()` を呼ぶ）では、Sync 失敗時に消費されなかった `pending_map` エントリはここ（`WaitIdle`）で drain され、`finish()` が `Err` を返す。`finish()` を呼ばずに `Drop` した場合のみ `Stop` アーム（項目 10）が一括 `MFX_ERR_ABORTED` で通知する（項目 6 参照）。「Stop に委ねる」は `finish()` を呼ばない Drop 経路の話であり、通常フローでは `WaitIdle` が先に処理するため、項目 6 と矛盾しない。
     - B フレーム表示順出力では `finish()` のドレインで末尾フレームが出力されるため、1 フレーム = 1 `decode()` 呼び出しの通常利用では残留は発生しない。残留が発生するのは「入力フレームが出力されない」異常系（Sync 失敗の連続等）と、フレーム境界をまたぐ分割入力（リスク B 参照。分割入力では複数の `frame_seq` のうち出力に消費されないものが残留する）。
+    - 既知の制約: 正当なストリームでも出力が発生しないフレームが存在すると残留し、`finish()` が `Err` になる。代表例は VP9 temporal scalability の層切り替えフレーム（エンコーダ側 `refs/oneVPL-intel-gpu/_studio/mfx_lib/encode_hw/vp9/src/mfx_vp9_encode_hw_utils.cpp` で `showFrame = 0` が設定され、デコーダ側 `mfx_vp9_dec_decode_hw.cpp` は showFrame 時のみ出力する）。本 crate は VP9 temporal layer 設定を公開していないため自前エンコードでは発生しないが、第三者の temporal-layer VP9 ビットストリームでは発生し得る。対応は本 issue のスコープ外として別途検討する（レビュー指摘 4-2 の記録）。
 
 12. **`use std::collections::HashMap;` を import に追加する**
     - `VecDeque` は `decode.rs` 内で `pending_values` のみで使用されていたため削除し、`HashMap` に置き換える。
@@ -265,5 +266,5 @@ Encoder 側 (`src/encode.rs`) は `frame_seq` を `mfxFrameSurface1.Data.TimeSta
 
 - **issue 0013** (`0013-bug-encoder-frame-seq-zero-timestamp-collision`): 当初は「Encoder 側の `frame_count` 初期値を 1 に変更する修正」として本 issue の初期値を 1 と整合させる前提だったが、**0013 は closed で `frame_count` 1 スタート化は不採用**（`src/encode.rs` の `Encoder::new` は `frame_count: 0` のまま）。本 issue の `frame_count` 初期値は 0 とし、0013 に依存しない（変更概要 1 参照）。
 - **issue 0010** (`0010-bug-drop-deadlock-on-sync-operation-infinite`): デバイスエラー伝搬の検証と二重通知の扱いの確定を行う。0010 は「`SyncData` への `frame_seq` 追加と Sync エラー時の `take_by_frame_seq` による pending 消費」を**廃案**にし、Encoder 側も二重通知を許容する方針に確定した（0010 の設計方針 2）。本 issue の Decoder 側方針（Sync 失敗時は pending を消費せず二重通知を許容）は 0010 の最終方針と同じであり、対比の必要はなくなった。`sync_and_drain` / `sync_and_callback` の `MFX_INFINITE` は変更しない（有限タイムアウト化は廃案）。適用順序は 0010 → 0008（0010 はプロダクションコード変更なしで closed 済みのため、実質の依存は情報参照のみ）。
-- **issue 0009** (`0009-bug-decoder-device-busy-infinite-retry`): `decode_bitstream` / `finish` の DEVICE_BUSY 無限再試行を上限付きにする修正。`decode_bitstream` がエラーを返した場合、送信済み `QueueFrame` の `frame_seq` はインクリメントされないため、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる。0009 を先に適用するか、エラー後の `frame_count` の扱いを 0009 の実装と整合させること。
-- **issue 0014** (`0014-bug-frame-surface-drop-silently-swallows-errors`): `FrameSurface::Drop` のエラー処理を変更する。`sync_and_drain` は変更対象外（0008 の削除に委ねる）。0014 を 0008 より先に適用してから本 issue の変更を重ねること。
+- **issue 0009** (`0009-bug-decoder-device-busy-infinite-retry`): `decode_bitstream` / `finish` の DEVICE_BUSY 無限再試行を上限付きにする修正。当初は「`decode_bitstream` がエラーを返した場合、送信済み `QueueFrame` の `frame_seq` はインクリメントされないため、次回 `decode()` で同一 `frame_seq` となり重複キーエラーになる。0009 を先に適用するか、エラー後の `frame_count` の扱いを 0009 の実装と整合させること」としていた。0009（リトライ上限追加）は適用済みで、エラー後の `frame_count` の整合は本 issue の変更概要 2 の「デコード実行前インクリメント」順序で満たす（0009 は `frame_count` 自体には触れない）。
+- **issue 0014** (`0014-bug-frame-surface-drop-silently-swallows-errors`): `FrameSurface::Drop` のエラー処理を stderr 出力に変更する issue。`sync_and_drain` は変更対象外（0008 の削除に委ねる）。**0014 はログライブラリ（tracing 等）未導入のため `issues/pending/` に移動済み（pending）**。0008 は 0014 の変更（`src/vpl.rs` の Drop とヘルパー追加）と競合しないため、0014 の適用を待たずに実装する。0014 が将来実装された際は、0008 適用後の `FrameSurface::Drop`（Unmap / Release）の失敗が観測可能になる。

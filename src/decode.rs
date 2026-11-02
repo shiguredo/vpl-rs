@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
@@ -139,12 +139,12 @@ struct DecodeSyncData {
 
 /// Worker スレッドへの命令
 ///
-/// - `QueueFrame`: Main スレッドから Worker へ user_data を転送する。
-/// - `Sync`: デコード済みフレームの SyncOperation。Worker 側で QueueFrame と対応付ける。
-/// - `WaitIdle`: finish() のバリア。全コマンド処理後に応答を返す。
-/// - `Stop`: Drop 時の中断。残りの pending_values を通知して Worker を停止する。
+/// - `QueueFrame`: Main スレッドから Worker へ frame_seq と user_data を転送する。
+/// - `Sync`: デコード済みフレームの SyncOperation。Worker 側で frame_seq の一致により対応付ける。
+/// - `WaitIdle`: finish() のバリア。残留 pending_map のチェック後に応答を返す。
+/// - `Stop`: Drop 時の中断。残りの pending_map を通知して Worker を停止する。
 enum WorkerCommand<T> {
-    QueueFrame(T),
+    QueueFrame { frame_seq: u64, user_data: T },
     Sync { sync_data: DecodeSyncData },
     WaitIdle(mpsc::Sender<Result<(), Error>>),
     Stop,
@@ -221,6 +221,8 @@ pub struct Decoder<H: DecodeHandler> {
     async_depth: u16,
     /// DecodeHeader + Init が完了しているか
     initialized: bool,
+    /// 入力フレームの連番
+    frame_count: u64,
     /// Worker スレッドへの命令チャネル
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     /// Worker スレッドの join ハンドル
@@ -319,6 +321,7 @@ impl<H: DecodeHandler> Decoder<H> {
             codec: config.codec,
             async_depth: config.async_depth.unwrap_or(4),
             initialized: false,
+            frame_count: 0,
             worker_tx,
             worker_handle: Some(worker_handle),
         })
@@ -372,7 +375,7 @@ impl<H: DecodeHandler> Decoder<H> {
     /// `user_data` は対応するフレームがデコードされたときに [`DecodedFrame::user_data`] で取得できる。
     /// VPL は内部バッファにビットストリームを蓄積するため、
     /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない場合がある。
-    /// user_data は Worker スレッド内で FIFO キューにより管理される。
+    /// user_data は Worker スレッド内で frame_seq の一致により管理される。
     pub fn decode(&mut self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
         let data_len = u32::try_from(data.len()).map_err(|_| {
@@ -391,9 +394,27 @@ impl<H: DecodeHandler> Decoder<H> {
             self.initialize(&mut bs)?;
         }
 
+        // 入力ビットストリームの TimeStamp に連番 frame_seq を設定し、
+        // 出力フレームの TimeStamp との完全一致で user_data を対応付ける。
+        let frame_seq = self.frame_count;
+        bs.TimeStamp = frame_seq;
+
         // QueueFrame を送信してからデコードを開始する。
-        // これにより Worker 内で user_data と出力フレームが FIFO 対応付けられる。
-        self.send_worker_command("Decoder::decode", WorkerCommand::QueueFrame(user_data))?;
+        // これにより Worker 内で user_data と出力フレームが frame_seq の一致で対応付けられる。
+        self.send_worker_command(
+            "Decoder::decode",
+            WorkerCommand::QueueFrame {
+                frame_seq,
+                user_data,
+            },
+        )?;
+
+        // frame_seq を進める。デコード開始前に進めることで、decode_bitstream がエラーを返しても
+        // 同じ frame_seq が再利用されることが無いようにする。
+        self.frame_count = self
+            .frame_count
+            .checked_add(1)
+            .ok_or_else(|| Error::new_custom("Decoder::decode", "frame sequence overflowed"))?;
 
         self.decode_bitstream(&mut bs)
     }
@@ -403,9 +424,6 @@ impl<H: DecodeHandler> Decoder<H> {
     /// `bs.DataLength > 0` の間 `DecodeFrameAsync` を繰り返し呼び出す。
     /// VPL は `MORE_DATA` 時にビットストリームを内部バッファに蓄積し、
     /// 十分なデータが溜まった時点でフレームを出力する。
-    ///
-    /// 出力フレームはすべて Worker に送信され、Worker 内の FIFO キューで
-    /// user_data と対応付けられる。user_data が枯渇した場合は drain 扱いで破棄する。
     fn decode_bitstream(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
         while bs.DataLength > 0 {
             let mut syncp: sys::mfxSyncPoint = std::ptr::null_mut();
@@ -441,12 +459,8 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// これ以上データが来ないことをデコーダに伝え、残留フレームを排出する
     ///
-    /// null bitstream で `DecodeFrameAsync` を `MORE_DATA` が返るまで繰り返す。
-    /// 出力フレームはすべて Worker に送信され、Worker 内の FIFO キューで
-    /// user_data と対応付けられる。
-    ///
     /// この関数は全ての Worker コマンドの完了を待ち、
-    /// コールバックが呼び出され終わるまでブロックする。
+    /// 全てのコールバックが呼び出され終わるまでブロックする。
     pub fn finish(&mut self) -> Result<(), Error> {
         // 初期化前（decode 未呼び出し）なら排出するフレームがないので即座に返す
         if !self.initialized {
@@ -481,7 +495,12 @@ impl<H: DecodeHandler> Decoder<H> {
                         },
                     },
                 )?;
+                continue;
             }
+            // 正の警告（MFX_WRN_ALLOC_TIMEOUT_EXPIRED 等）で出力フレームが生成されない場合、1ms 待って再試行する。
+            // libvpl 仕様（mfxvideo.h の MFXVideoDECODE_DecodeFrameAsync の
+            // MFX_WRN_ALLOC_TIMEOUT_EXPIRED）では「数 ms 後に再呼び出しする」ように指示されているため。
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // ここまでに送ったコマンドが Worker 側で全て処理されるまで待つ
@@ -508,7 +527,7 @@ impl<H: DecodeHandler> Decoder<H> {
 impl<H: DecodeHandler> Decoder<H> {
     fn stop_worker(&mut self) {
         if let Some(handle) = self.worker_handle.take() {
-            // Worker 内の pending_values は Stop ハンドラで処理される。
+            // Worker 内の pending_map は Stop ハンドラで処理される。
             let _ = self.worker_tx.send(WorkerCommand::Stop);
             let _ = handle.join();
         }
@@ -534,41 +553,69 @@ impl<H: DecodeHandler> Drop for Decoder<H> {
 /// セッション操作は全てこのスレッドで行うため、VPL のスレッド安全性に関する
 /// 暗黙の制約に抵触しない。
 ///
-/// `pending_values` は Main スレッドからの `QueueFrame` で蓄積され、
-/// `Sync` で消費される FIFO キュー。
+/// `pending_map` は Main スレッドからの `QueueFrame` で frame_seq ごとに蓄積され、
+/// `Sync` の出力フレームの TimeStamp との完全一致で消費される。
 fn run_sync_worker<H: DecodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
     mut handler: H,
 ) {
-    let mut pending_values: VecDeque<H::UserData> = VecDeque::new();
+    let mut pending_map: HashMap<u64, H::UserData> = HashMap::new();
     while let Ok(command) = worker_rx.recv() {
         match command {
-            WorkerCommand::QueueFrame(user_data) => {
-                pending_values.push_back(user_data);
+            WorkerCommand::QueueFrame {
+                frame_seq,
+                user_data,
+            } => {
+                // 入力フレームの frame_seq で user_data を登録する。
+                // 同一 frame_seq が二度使われると誤対応付けになるため、重複を検出する。
+                if pending_map.insert(frame_seq, user_data).is_some() {
+                    handler.on_decoded(Err(Error::new_custom_owned(
+                        "Decoder::sync_worker",
+                        format!("duplicate frame sequence in pending frames: {frame_seq}"),
+                    )
+                    .into()));
+                }
             }
             WorkerCommand::Sync { sync_data } => {
-                if let Some(user_data) = pending_values.pop_front() {
-                    // SyncOperation + Map + 読み取り + callback + Unmap + Release
-                    if let Err(error) =
-                        sync_and_callback(lib, session_handle, sync_data, user_data, &mut handler)
-                    {
-                        handler.on_decoded(Err(error.into()));
-                    }
-                } else {
-                    // user_data が枯渇しているので drain 扱いで破棄する
-                    sync_and_drain(lib, session_handle, sync_data);
+                if let Err(error) = sync_and_callback(
+                    lib,
+                    session_handle,
+                    sync_data,
+                    &mut pending_map,
+                    &mut handler,
+                ) {
+                    handler.on_decoded(Err(error.into()));
                 }
             }
             WorkerCommand::WaitIdle(reply_tx) => {
                 // finish 側のバリア。ここに到達した時点で、それ以前に送信された
-                // コマンドはすべて処理済みである。
-                let _ = reply_tx.send(Ok(()));
+                // コマンドはすべて処理済みになっているはず。
+                if pending_map.is_empty() {
+                    let _ = reply_tx.send(Ok(()));
+                    continue;
+                }
+
+                // もし出力されなかった入力フレームが残留しているなら、異常系のためエラーとして通知する。
+                let remaining_count = pending_map.len();
+                for (frame_seq, _user_data) in pending_map.drain() {
+                    handler.on_decoded(Err(Error::new_custom_owned(
+                        "Decoder::finish",
+                        format!(
+                            "decode pending frame seq={frame_seq} (pending count: {remaining_count})"
+                        ),
+                    )
+                    .into()));
+                }
+                let _ = reply_tx.send(Err(Error::new_custom_owned(
+                    "Decoder::finish",
+                    format!("finish completed but {remaining_count} pending frames remained"),
+                )));
             }
             WorkerCommand::Stop => {
                 // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
-                for _user_data in pending_values.drain(..) {
+                for (_frame_seq, _user_data) in pending_map.drain() {
                     handler.on_decoded(Err(Error::from_mfx(
                         sys::mfxStatus_MFX_ERR_ABORTED,
                         "Decoder::drop",
@@ -582,14 +629,19 @@ fn run_sync_worker<H: DecodeHandler>(
 }
 
 /// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
+/// 出力フレームの TimeStamp (=frame_seq) と完全一致する user_data を消費し、
 /// handler の `on_decoded` を呼び出す。
 ///
 /// `DecodedFrame` 内の y/uv スライスは `on_decoded` 呼び出し中のみ有効。
+///
+/// `Err` はデータ破損系（`SyncOperation` 失敗・`map_read` 失敗・`read_decoded_surface` の検証エラー）
+/// のみを返す。frame_seq 引き当て失敗はドレインの空フレームや異常出力が原因の正常な破棄として扱い、
+/// `Err` にせず `Ok(())` で返す（対応する user_data が存在しないだけで、出力自体は解放すればよいため）。
 fn sync_and_callback<H: DecodeHandler>(
     lib: VplLibrary,
     session_handle: usize,
     sync_data: DecodeSyncData,
-    user_data: H::UserData,
+    pending_map: &mut HashMap<u64, H::UserData>,
     handler: &mut H,
 ) -> Result<(), crate::Error> {
     let DecodeSyncData {
@@ -614,34 +666,16 @@ fn sync_and_callback<H: DecodeHandler>(
 
     frame_surface.map_read()?;
 
+    // 出力フレームの TimeStamp から user_data を探す
+    let frame_seq = unsafe { (*frame_surface.as_ptr()).Data.TimeStamp };
+    let Some(user_data) = pending_map.remove(&frame_seq) else {
+        return Ok(());
+    };
+
     // デコードされたフレームデータを読み取る
     let frame = read_decoded_surface(&frame_surface, user_data)?;
     handler.on_decoded(Ok(frame));
     Ok(())
-}
-
-/// ドレインフレームの Sync + Map/Unmap + Release を行う
-///
-/// ドレインフレームには user_data がないため、データは読み取らずに解放のみ行う。
-/// エラーはすべて無視する（データ破棄が目的のため）。
-fn sync_and_drain(lib: VplLibrary, session_handle: usize, sync_data: DecodeSyncData) {
-    let DecodeSyncData {
-        syncp,
-        mut frame_surface,
-    } = sync_data;
-
-    if syncp.is_null() {
-        return;
-    }
-
-    let _ = lib.mfx_video_core_sync_operation(
-        session_handle as sys::mfxSession,
-        syncp,
-        sys::MFX_INFINITE,
-    );
-
-    // Drop での自動解放を使ってクリーンアップする
-    let _ = frame_surface.map_read();
 }
 
 /// デコード済みサーフェスから Y/UV スライスを読み取り `DecodedFrame` を構築する
@@ -702,4 +736,183 @@ fn read_decoded_surface<'a, T>(
         height: crop_h,
         user_data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// [run_sync_worker] を VPL セッションなしで起動するヘルパー
+    ///
+    /// [WorkerCommand::Sync] 節の [sync_and_callback] は `MFXVideoCORE_SyncOperation` を呼ぶため
+    /// 実セッションが必要で単体テストできない。
+    /// [WorkerCommand::QueueFrame] / [WorkerCommand::WaitIdle] / [WorkerCommand::Stop] の節は
+    /// VPL を一切呼ばないため、ダミーの [VplLibrary] と `session_handle = 0` でテストできる。
+    /// TimeStamp 引き当て失敗ドレイン（[sync_and_callback] 内）は roundtrip 統合テストで
+    /// 間接的にカバーされる。
+    fn spawn_worker<F>(callback: F) -> (mpsc::Sender<WorkerCommand<u32>>, thread::JoinHandle<()>)
+    where
+        F: FnMut(Result<DecodedFrame<'_, u32>, Error>) + Send + 'static,
+    {
+        let (command_tx, command_rx) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("vpl-decoder-sync".to_owned())
+            .spawn(move || {
+                run_sync_worker(VplLibrary, 0, command_rx, FnDecodeHandler::new(callback));
+            })
+            .expect("sync worker thread の起動に失敗した");
+        (command_tx, handle)
+    }
+
+    #[test]
+    fn worker_wait_idle_returns_error_when_pending_remains() {
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let (command_tx, handle) = spawn_worker(move |result| {
+            callback_tx
+                .send(result.map(|_| ()))
+                .expect("デコード結果の送信に失敗した");
+        });
+
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 77,
+                user_data: 7,
+            })
+            .expect("QueueFrame の送信に失敗した");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        command_tx
+            .send(WorkerCommand::WaitIdle(reply_tx))
+            .expect("WaitIdle の送信に失敗した");
+
+        let wait_result = reply_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("WaitIdle 応答の受信に失敗した");
+        let wait_error = wait_result.expect_err("残留 pending があるのに WaitIdle が成功した");
+        assert_eq!(wait_error.function(), "Decoder::finish");
+        assert_eq!(
+            wait_error.status_message(),
+            Some("finish completed but 1 pending frames remained"),
+            "残留 pending の件数を示すエラーメッセージであること"
+        );
+
+        let callback_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("残留通知コールバックの受信に失敗した");
+        let callback_error = callback_result.expect_err("残留 pending はエラー通知されること");
+        assert_eq!(callback_error.function(), "Decoder::finish");
+        assert_eq!(
+            callback_error.status_message(),
+            Some("decode pending frame seq=77 (pending count: 1)"),
+            "frame_seq と残留件数を含むエラーメッセージであること"
+        );
+
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("Stop の送信に失敗した");
+        handle.join().expect("worker thread がパニックした");
+    }
+
+    #[test]
+    fn worker_stop_returns_aborted_for_all_pending() {
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let (command_tx, handle) = spawn_worker(move |result| {
+            callback_tx
+                .send(result.map(|_| ()))
+                .expect("デコード結果の送信に失敗した");
+        });
+
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 1,
+                user_data: 10,
+            })
+            .expect("QueueFrame の送信に失敗した");
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 2,
+                user_data: 20,
+            })
+            .expect("QueueFrame の送信に失敗した");
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("Stop の送信に失敗した");
+        handle.join().expect("worker thread がパニックした");
+
+        let mut callback_count = 0;
+        while let Ok(result) = callback_rx.recv_timeout(Duration::from_millis(200)) {
+            callback_count += 1;
+            let error = result.expect_err("Stop 時のコールバックはエラーであること");
+            assert_eq!(
+                error.status_code(),
+                Some(sys::mfxStatus_MFX_ERR_ABORTED),
+                "Stop 時のコールバックは MFX_ERR_ABORTED を返すこと"
+            );
+        }
+        assert_eq!(
+            callback_count, 2,
+            "全ての残留 pending 分のコールバックが通知されること"
+        );
+    }
+
+    #[test]
+    fn worker_reports_duplicate_frame_sequence() {
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let (command_tx, handle) = spawn_worker(move |result| {
+            callback_tx
+                .send(result.map(|_| ()))
+                .expect("デコード結果の送信に失敗した");
+        });
+
+        // 同一 frame_seq の QueueFrame を 2 回送信する
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 42,
+                user_data: 1,
+            })
+            .expect("QueueFrame の送信に失敗した");
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 42,
+                user_data: 2,
+            })
+            .expect("QueueFrame の送信に失敗した");
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("Stop の送信に失敗した");
+        handle.join().expect("worker thread がパニックした");
+
+        // 1 つ目のコールバックが重複 frame_seq のエラー通知であること
+        let callback_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("重複通知コールバックの受信に失敗した");
+        let error = callback_result.expect_err("重複 frame_seq はエラー通知されること");
+        assert_eq!(error.function(), "Decoder::sync_worker");
+        assert_eq!(
+            error.status_message(),
+            Some("duplicate frame sequence in pending frames: 42"),
+            "重複した frame_seq を含むエラーメッセージであること"
+        );
+
+        // 重複検出後も pending エントリは残るため、Stop で残留分が ABORTED 通知されること
+        let stop_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("残留 pending の ABORTED 通知の受信に失敗した");
+        let stop_error = stop_result.expect_err("Stop 時のコールバックはエラーであること");
+        assert_eq!(
+            stop_error.status_code(),
+            Some(sys::mfxStatus_MFX_ERR_ABORTED),
+            "残留 pending は MFX_ERR_ABORTED で通知されること"
+        );
+
+        // 通知は重複エラーと残留 ABORTED の 2 回だけであること
+        assert!(
+            callback_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "通知は 2 回だけであること"
+        );
+    }
 }
