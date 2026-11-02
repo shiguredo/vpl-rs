@@ -14,11 +14,9 @@
 //! 参照バージョンは `Cargo.toml` の `package.metadata.external-dependencies.vpl.version`。
 //! 将来 libvpl の挙動が変わる可能性があるため、本実装は当該バージョンに依存する。
 
-#[cfg(target_os = "linux")]
 use std::ffi::CStr;
 
 use crate::Error;
-#[cfg(target_os = "linux")]
 use crate::sys;
 
 /// `Encoder` / `Decoder` のセッションを開くときの対象アダプタ
@@ -101,7 +99,6 @@ pub struct AdapterInfo {
 ///
 /// 呼び出しごとに `MFXLoad` + 列挙 + `MFXUnload` を行う重い処理なので、
 /// 利用側はアプリ起動時に 1 回だけ呼んで結果を保持することを想定する。
-#[cfg(target_os = "linux")]
 pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
     let loader = unsafe { sys::MFXLoad() };
     if loader.is_null() {
@@ -214,14 +211,7 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
     Ok(adapters)
 }
 
-/// Linux 以外では実機が存在しないため空 `Vec` を返す
-#[cfg(not(target_os = "linux"))]
-pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
-    Ok(Vec::new())
-}
-
 /// `mfxDeviceDescription.MediaAdapterType` (`mfxU16`) を Rust 側の enum にマップする
-#[cfg(target_os = "linux")]
 fn map_media_adapter_type(value: sys::mfxU16) -> MediaAdapterType {
     // MFX_MEDIA_* は本来 c_uint だが、mfxDeviceDescription.MediaAdapterType フィールドは mfxU16。
     // u16 にキャストして比較する。
@@ -239,7 +229,6 @@ fn map_media_adapter_type(value: sys::mfxU16) -> MediaAdapterType {
 ///
 /// NUL 終端があればそこまでを切り出し、なければ配列全体を UTF-8 として解釈する。
 /// 不正 UTF-8 のときは空文字列にフォールバックする。
-#[cfg(target_os = "linux")]
 fn c_array_to_string(arr: &[sys::mfxChar]) -> String {
     // mfxChar は c_char = i8 / u8 (環境依存) なので u8 にキャストする
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arr.as_ptr() as *const u8, arr.len()) };
@@ -250,12 +239,10 @@ fn c_array_to_string(arr: &[sys::mfxChar]) -> String {
 }
 
 /// `MFXUnload` を Drop で呼ぶガード
-#[cfg(target_os = "linux")]
 struct LoaderGuard {
     loader: sys::mfxLoader,
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for LoaderGuard {
     fn drop(&mut self) {
         unsafe { sys::MFXUnload(self.loader) };
@@ -263,13 +250,11 @@ impl Drop for LoaderGuard {
 }
 
 /// `MFXDispReleaseImplDescription` を Drop で呼ぶガード
-#[cfg(target_os = "linux")]
 struct HdlGuard {
     loader: sys::mfxLoader,
     hdl: sys::mfxHDL,
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for HdlGuard {
     fn drop(&mut self) {
         unsafe { sys::MFXDispReleaseImplDescription(self.loader, self.hdl) };

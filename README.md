@@ -51,7 +51,7 @@ cargo build
 
 ### docs.rs 向けビルド
 
-libvpl がない環境では、docs.rs 向けのドキュメント生成のみ可能です。
+Linux (x86_64) 上では、libvpl がない環境でも docs.rs 向けのドキュメント生成のみ行えます。
 
 ```bash
 DOCS_RS=1 cargo doc --no-deps
