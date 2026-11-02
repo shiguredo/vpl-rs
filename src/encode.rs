@@ -726,7 +726,11 @@ enum WorkerCommand<T> {
         pending_frame: PendingFrame<T>,
     },
     Sync(SyncData),
-    WaitIdle(mpsc::Sender<Result<(), Error>>),
+    WaitIdle {
+        reply_tx: mpsc::Sender<Result<(), Error>>,
+        /// pending が残留したときのエラーに付けるコンテキスト
+        function: &'static str,
+    },
     Stop,
 }
 
@@ -1132,9 +1136,15 @@ impl<H: EncodeHandler> Encoder<H> {
     ///
     /// ビットレートやフレームレートの変更に使用する。
     ///
-    /// `EncoderConfig` で指定した拡張バッファも Reset 時に VPL へ渡し直すため、
-    /// reconfigure 後もそれらの設定は維持される。拡張バッファの値を reconfigure で
-    /// 変更することはできない。
+    /// 呼び出し時点で未出力だったフレームは、この関数が返るまでにすべて `Ok` として
+    /// [`EncodeHandler::on_encoded`] に通知される。Reset で破棄されるフレームはない。
+    ///
+    /// - frame_seq は reconfigure 後も継続し、リセットされない
+    /// - この関数は、呼び出し時点までに送信したフレームのエンコード完了と、
+    ///   すべてのコールバックの完了までブロックする
+    /// - パラメータの検証に失敗した場合を除き、`Err` を返したときはエンコーダが
+    ///   使用できない状態のまま残ることがあるため、呼び出し側は [`Encoder`] を
+    ///   作り直すこと
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         if let Some(0) = params.framerate_den {
             return Err(Error::new_custom(
@@ -1168,10 +1178,22 @@ impl<H: EncodeHandler> Encoder<H> {
             }
         }
 
+        // Reset は VPL 内部の未出力フレームを破棄する場合がある
+        // (VPL プログラミングガイドの Configuration Change 節)。
+        // pending に対応する出力を失わないよう、Reset より前に NULL 入力で
+        // cached frame をすべて回収する。
+        //
+        // worker はコマンドを FIFO で処理するため、この待機は先行する QueueFrame と
+        // Sync の処理完了も意味する。
+        self.drain_cached_frames("Encoder::reconfigure")?;
+
         // Init 時に設定した拡張バッファを Reset にも渡す。
         //
         // Reset で attach されなかった拡張バッファの扱いはバッファ種別と実装に依存するため、
         // Init 時の設定を確実に再要求するには Init と同じ ExtParam を渡す必要がある。
+        //
+        // ExtParam の設定は drain の完了後に行う。drain のエラーで早期リターンしたときに、
+        // ExtParam が設定されたまま残らないようにするため。
         let mut ext_bufs = self.ext_buffers.ext_param();
         attach_ext_param(&mut self.video_param, &mut ext_bufs);
 
@@ -1374,11 +1396,10 @@ impl<H: EncodeHandler> Encoder<H> {
         ))
     }
 
-    /// エンコーダをフラッシュして残りのフレームを取得する
+    /// 保留しているフレームをすべて回収する
     ///
-    /// この関数は全てのエンコードの完了を待ち、内部で保持している
-    /// フレームをすべて排出してコールバックを呼び出し終わるまでブロックする。
-    pub fn finish(&mut self) -> Result<(), Error> {
+    /// 送信済みのフレームの出力がすべて揃い、それらのコールバックの処理が終わるまで待つ。
+    fn drain_cached_frames(&mut self, function: &'static str) -> Result<(), Error> {
         loop {
             // null surface でエンコードを呼び出して、残りのフレームをすべて排出する
             let (mut bitstream, bitstream_buffer) = self.create_bitstream();
@@ -1391,7 +1412,7 @@ impl<H: EncodeHandler> Encoder<H> {
             };
 
             self.send_worker_command(
-                "Encoder::finish",
+                function,
                 WorkerCommand::Sync(SyncData {
                     syncp,
                     bitstream,
@@ -1402,10 +1423,23 @@ impl<H: EncodeHandler> Encoder<H> {
 
         // ここまでに送った Sync が worker 側で全て処理されるまで待つ。
         let (tx, rx) = mpsc::channel();
-        self.send_worker_command("Encoder::finish", WorkerCommand::WaitIdle(tx))?;
-        rx.recv().map_err(|_| {
-            Error::new_custom("Encoder::finish", "sync worker thread stopped unexpectedly")
-        })?
+        self.send_worker_command(
+            function,
+            WorkerCommand::WaitIdle {
+                reply_tx: tx,
+                function,
+            },
+        )?;
+        rx.recv()
+            .map_err(|_| Error::new_custom(function, "sync worker thread stopped unexpectedly"))?
+    }
+
+    /// エンコーダをフラッシュして残りのフレームを取得する
+    ///
+    /// この関数は全てのエンコードの完了を待ち、内部で保持している
+    /// フレームをすべて排出してコールバックを呼び出し終わるまでブロックする。
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.drain_cached_frames("Encoder::finish")
     }
 
     fn create_bitstream(&self) -> (Box<sys::mfxBitstream>, Vec<u8>) {
@@ -1477,23 +1511,29 @@ fn run_sync_worker<H: EncodeHandler>(
                         .map_err(Into::into),
                 );
             }
-            WorkerCommand::WaitIdle(reply_tx) => {
-                // finish 側のバリア。ここに到達した時点で、それ以前に送信された
-                // QueueFrame / Sync はすべて処理済みである。
+            WorkerCommand::WaitIdle { reply_tx, function } => {
+                // finish / reconfigure 側のバリア。ここに到達した時点で、それ以前に
+                // 送信された QueueFrame / Sync はすべて処理済みである。
                 if pending_store.is_empty() {
                     let _ = reply_tx.send(Ok(()));
                     continue;
                 }
 
+                // バリア時点で回収できなかったフレームは、対応する出力が得られなかった
+                // ものとしてエラー通知する。
                 let pending = pending_store.drain_all();
                 let remaining_count = pending.len();
                 for (frame_seq, _meta) in pending {
-                    handler
-                        .on_encoded(Err(finish_pending_error(frame_seq, remaining_count).into()));
+                    handler.on_encoded(Err(pending_frames_error(
+                        function,
+                        frame_seq,
+                        remaining_count,
+                    )
+                    .into()));
                 }
                 let _ = reply_tx.send(Err(Error::new_custom_owned(
-                    "Encoder::finish",
-                    format!("finish completed but {remaining_count} pending frames remained"),
+                    function,
+                    format!("{remaining_count} pending frames remained"),
                 )));
             }
             WorkerCommand::Stop => {
@@ -1601,11 +1641,12 @@ fn mismatched_timestamp_error(frame_seq: u64, pending_len: usize) -> Error {
     )
 }
 
-fn finish_pending_error(frame_seq: u64, pending_count: usize) -> Error {
+/// バリア時点で回収できなかった pending frame のエラー
+fn pending_frames_error(function: &'static str, frame_seq: u64, pending_count: usize) -> Error {
     Error::new_custom_owned(
-        "Encoder::finish",
+        function,
         format!(
-            "pending frames remained after flush for frame sequence {frame_seq} (pending count: {pending_count})"
+            "pending frame remained for frame sequence {frame_seq} (pending count: {pending_count})"
         ),
     )
 }
@@ -1755,6 +1796,8 @@ mod tests {
 
     #[test]
     fn worker_wait_idle_returns_error_when_pending_remains() {
+        // WaitIdle は残留 pending をエラー通知し、呼び出し元に渡した
+        // コンテキストをエラーに付けることを確認する。
         let (command_tx, command_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
         let worker = thread::spawn(move || {
@@ -1765,7 +1808,7 @@ mod tests {
                 FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
                     callback_tx
                         .send(result.map(|_| ()))
-                        .expect("failed to forward callback result");
+                        .expect("コールバック結果の送信に失敗した");
                 }),
             );
         });
@@ -1775,31 +1818,38 @@ mod tests {
                 frame_seq: 77,
                 pending_frame: make_pending(7700, 7),
             })
-            .expect("failed to send QueueFrame");
+            .expect("QueueFrame の送信に失敗した");
         let (reply_tx, reply_rx) = mpsc::channel();
         command_tx
-            .send(WorkerCommand::WaitIdle(reply_tx))
-            .expect("failed to send WaitIdle");
-        let wait_result = reply_rx
+            .send(WorkerCommand::WaitIdle {
+                reply_tx,
+                function: "Encoder::reconfigure",
+            })
+            .expect("WaitIdle の送信に失敗した");
+        let wait_error = reply_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("failed to receive WaitIdle response");
-        assert!(
-            wait_result.is_err(),
-            "WaitIdle should fail when pending frames remain"
+            .expect("WaitIdle の応答の受信に失敗した")
+            .expect_err("残留 pending があるのに WaitIdle が成功した");
+        assert_eq!(
+            wait_error.function(),
+            "Encoder::reconfigure",
+            "WaitIdle のエラーは渡したコンテキストを持つこと"
         );
 
-        let callback_result = callback_rx
+        let callback_error = callback_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("failed to receive callback result");
-        assert!(
-            callback_result.is_err(),
-            "pending frames on WaitIdle must be reported as callback error"
+            .expect("コールバック結果の受信に失敗した")
+            .expect_err("残留 pending はコールバックのエラーとして通知されること");
+        assert_eq!(
+            callback_error.function(),
+            "Encoder::reconfigure",
+            "残留 pending のエラーは渡したコンテキストを持つこと"
         );
 
         command_tx
             .send(WorkerCommand::Stop)
-            .expect("failed to send Stop");
-        worker.join().expect("worker thread panicked");
+            .expect("Stop の送信に失敗した");
+        worker.join().expect("worker スレッドがパニックした");
     }
 
     #[test]
