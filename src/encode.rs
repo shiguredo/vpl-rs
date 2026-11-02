@@ -1136,8 +1136,10 @@ impl<H: EncodeHandler> Encoder<H> {
     ///
     /// ビットレートやフレームレートの変更に使用する。
     ///
-    /// 呼び出し時点で未出力だったフレームは、この関数が返るまでにすべて `Ok` として
-    /// [`EncodeHandler::on_encoded`] に通知される。Reset で破棄されるフレームはない。
+    /// この関数が `Ok` を返した場合、呼び出し時点で未出力だったフレームは、その時点で
+    /// すべて `Ok` として [`EncodeHandler::on_encoded`] に通知されている。`Err` を
+    /// 返した場合は、未出力フレームの一部が `Err` として通知されるか、通知されないまま
+    /// 残ることがある。
     ///
     /// - frame_seq は reconfigure 後も継続し、リセットされない
     /// - この関数は、呼び出し時点までに送信したフレームのエンコード完了と、
@@ -1153,7 +1155,19 @@ impl<H: EncodeHandler> Encoder<H> {
             ));
         }
 
-        // 現在の video_param をベースに変更を適用する
+        // Reset は VPL 内部の未出力フレームを破棄する場合がある。
+        // ref:
+        // - doc/spec/source/programming_guide/VPL_prg_encoding.rst (Configuration Change)
+        // pending に対応する出力を失わないよう、Reset より前に NULL 入力で
+        // cached frame をすべて回収する。
+        //
+        // worker はコマンドを FIFO で処理するため、この待機は先行する QueueFrame と
+        // Sync の処理完了も意味する。
+        self.drain_cached_frames("Encoder::reconfigure")?;
+
+        // 現在の video_param をベースに変更を適用する。drain より後に適用するのは、
+        // drain が Err を返したときに Rust 側のパラメータだけが更新された状態を
+        // 残さないため。
         unsafe {
             let enc = &mut self
                 .video_param
@@ -1177,15 +1191,6 @@ impl<H: EncodeHandler> Encoder<H> {
                 self.framerate_den = den as u64;
             }
         }
-
-        // Reset は VPL 内部の未出力フレームを破棄する場合がある
-        // (VPL プログラミングガイドの Configuration Change 節)。
-        // pending に対応する出力を失わないよう、Reset より前に NULL 入力で
-        // cached frame をすべて回収する。
-        //
-        // worker はコマンドを FIFO で処理するため、この待機は先行する QueueFrame と
-        // Sync の処理完了も意味する。
-        self.drain_cached_frames("Encoder::reconfigure")?;
 
         // Init 時に設定した拡張バッファを Reset にも渡す。
         //
@@ -1404,8 +1409,17 @@ impl<H: EncodeHandler> Encoder<H> {
             // null surface でエンコードを呼び出して、残りのフレームをすべて排出する
             let (mut bitstream, bitstream_buffer) = self.create_bitstream();
 
-            let Some(syncp) =
-                self.encode_frame_async(std::ptr::null_mut(), None, bitstream.as_mut())?
+            let Some(syncp) = self
+                .encode_frame_async(std::ptr::null_mut(), None, bitstream.as_mut())
+                .map_err(|error| {
+                    // drain の失敗を呼び出し元の操作のコンテキスト付きで返す。
+                    // 元のメッセージは保持したまま前置きする。
+                    let message = match error.status_message() {
+                        Some(message) => format!("{function}: {message}"),
+                        None => format!("{function}: failed to retrieve a cached frame"),
+                    };
+                    error.with_message(message)
+                })?
             else {
                 // すべて排出済み
                 break;
@@ -1524,16 +1538,16 @@ fn run_sync_worker<H: EncodeHandler>(
                 let pending = pending_store.drain_all();
                 let remaining_count = pending.len();
                 for (frame_seq, _meta) in pending {
-                    handler.on_encoded(Err(pending_frames_error(
-                        function,
+                    handler.on_encoded(Err(pending_frame_error(
                         frame_seq,
                         remaining_count,
+                        function,
                     )
                     .into()));
                 }
                 let _ = reply_tx.send(Err(Error::new_custom_owned(
                     function,
-                    format!("{remaining_count} pending frames remained"),
+                    format!("{function} completed but {remaining_count} pending frames remained"),
                 )));
             }
             WorkerCommand::Stop => {
@@ -1642,7 +1656,7 @@ fn mismatched_timestamp_error(frame_seq: u64, pending_len: usize) -> Error {
 }
 
 /// バリア時点で回収できなかった pending frame のエラー
-fn pending_frames_error(function: &'static str, frame_seq: u64, pending_count: usize) -> Error {
+fn pending_frame_error(frame_seq: u64, pending_count: usize, function: &'static str) -> Error {
     Error::new_custom_owned(
         function,
         format!(
@@ -1834,6 +1848,11 @@ mod tests {
             wait_error.function(),
             "Encoder::reconfigure",
             "WaitIdle のエラーは渡したコンテキストを持つこと"
+        );
+        assert_eq!(
+            wait_error.status_message(),
+            Some("Encoder::reconfigure completed but 1 pending frames remained"),
+            "WaitIdle のエラーメッセージはコンテキストで始まること"
         );
 
         let callback_error = callback_rx
