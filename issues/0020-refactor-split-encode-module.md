@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/refactor-split-encode-module
 - Polished: 2026-08-21
@@ -140,3 +141,22 @@ shiguredo-rust 規約（「`mod.rs` を使わないこと。モジュールは `
 - `skills/shiguredo-vpl/SKILL.md` の「チェンジログ・破壊的変更の方針」節（「良い設計のためには破壊的変更を積極的に行う」「互換シムは作らない」。`pub use` による再エクスポートはシムに該当しない）
 - 関連 issue: 0011（`ExtBuffers` の保持。本 issue の `ExtBuffers` 設計の前提）
 - 関連 issue: 0010 / 0012 / 0014 / 0018 / 0023 / 0025 / 0027 / 0029（適用順序は「前提条件 / 依存関係」参照。0010・0013 は closed 済みで適用差分なし）
+
+## 解決方法
+
+`src/encode.rs` のサブモジュール分割は行わず、本 issue を closed にする。起票時に分割の根拠としていた問題は 0018 と 0011 の適用で解消しており、現在の `src/encode.rs` はエンコーダ実装という 1 つの責務にまとまった構成になっている。行数だけを理由に分割すると、モジュール境界を越えるための可視性の拡大と相互参照が増え、可読性をむしろ悪化させる。
+
+### 判断の根拠
+
+- プロファイル型 `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` は 0018 で `src/codec_info.rs` に移動済みで、重複していた `H264EncodingProfile` などの型は削除済みである。`src/encode.rs` 側はこれらを `use` するだけになった。
+- 拡張バッファの構築は 0011 で `ExtBuffers` / `ExtBuffers::ext_param` と `attach_ext_param` / `clear_ext_param` に切り出し済みである。`Encoder::new` は Init → GetVideoParam → Worker spawn のグルーコードになっている。
+- 残っている内容は、`EncoderConfig` などのエンコーダ設定型、`Encoder` 本体、worker ループ、小さな変換ヘルパー、テストであり、いずれもエンコーダ実装という 1 つの責務に属する。分割すると `EncodedFrame` / `PendingFrame` / `SyncData` / `WorkerCommand` のフィールドや `run_sync_worker` を `pub(crate)` に広げる必要があり、責務分離ではなく可視性を緩めただけの分割になる。
+- テスト（worker 系 3 件と `reconfigure_preserves_coding_option_ext_params`）は別ファイルに分けることもできるが、分ける積極的な理由がない。対象コードの近くに置いてあるほうが変更時に追いやすい。
+- 現在の行数は 1,945 行（起票時の 1,765 行から増加）だが、行数そのものは分割の理由にならない。
+
+### 確認内容
+
+- `src/codec_info.rs` に `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` が定義され、`H264EncodingProfile` などの重複型が残っていないことを確認した。
+- `src/encode.rs` に `ExtBuffers` と拡張バッファ用ヘルパーが存在することを確認した。
+- `cargo test --workspace --lib` の 14 件と `cargo test --workspace --doc` の 2 件が成功した。`tests/test_roundtrip.rs` の 21 件は Intel HW アダプタが見つからないため失敗したが、この環境に Intel GPU がないことによるものであり、本 issue の判断とは無関係である。
+- コード変更を伴わないため、`CHANGES.md` は変更していない。
