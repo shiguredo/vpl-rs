@@ -20,6 +20,10 @@
 - [FIX] reconfigure が pending frame を回収してから Reset するよう修正する
   - reconfigure 時に未出力フレームが `Ok` で通知され、`finish()` の残留エラーにならない
   - @melpon
+- [FIX] `#[cfg(target_os = "linux")]` を削除し、Linux x86_64 以外のターゲットでは `compile_error!` でビルドを拒否する
+  - 非対応ターゲットでリンカの未解決シンボルエラーではなく、意図が明確なコンパイルエラーを返す
+  - 非 Linux 向けに空 `Vec` を返していた `list_adapters()` を削除する
+  - @melpon
 
 ### misc
 

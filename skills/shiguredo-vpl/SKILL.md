@@ -63,7 +63,7 @@ let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
 - `DrmRenderNode(0)` は libvpl 内部で「未設定」を意味する予約値。 `Encoder::new` / `Decoder::new` 系から呼ばれる `AdapterSelector::validate` で必ず弾かれる。 0 は渡さない。
 - `list_adapters()` は `MFXLoad` → `MFXEnumImplementations` → `MFXUnload` を毎回まわす重い処理。 アプリ起動時に 1 回呼んで結果を保持する想定。
 - 同一 `DRMRenderNodeNum` の重複エントリは除去され、`drm_render_node` 昇順で並ぶ。
-- Linux 以外では `list_adapters()` は常に空 `Vec` を返す (`target_os = "linux"` のフィーチャ分岐)。
+- Linux x86_64 以外のターゲットでは crate 自体がビルドできないため、`list_adapters()` は Linux x86_64 でのみ利用できる。
 - `AdapterInfo` も `#[non_exhaustive]`。 `drm_render_node` / `impl_name` / `device_name` / `pci_device_id` / `pci_address` / `media_adapter_type` を持つ。 取れなかった文字列フィールドは空文字列。
 - `MediaAdapterType` は `Integrated` / `Discrete` / `Unknown` のいずれか。 `MFX_MEDIA_UNKNOWN` (0xFFFF) と未知値はすべて `Unknown` に丸める。
 
@@ -362,7 +362,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 
 - `build.rs` が `Cargo.toml` の `[package.metadata.external-dependencies]` を読んで libvpl を GitHub から取得し、 `shiguredo_cmake` 経由で CMake static build する。
 - bindgen の出力は `src/sys.rs` 相当に展開される。 マクロ (`#define`) で定義された定数や一部 static 変数は bindgen が拾えないため、 必要なら `build.rs` で手書きする。
-- docs.rs 向けに `DOCS_RS=1 cargo doc --no-deps` で libvpl なしでもドキュメントだけは生成できる。
+- Linux x86_64 上では `DOCS_RS=1 cargo doc --no-deps` で libvpl をビルドせずにドキュメントだけは生成できる。
 - `BUILD_VERSION` 定数で「ビルド時参照した libvpl のバージョン」が拾える。
 
 ## ライブラリ利用上の落とし穴
@@ -377,7 +377,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 - **ハンドラはワーカースレッドから呼ばれる**: `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は `vpl-encoder-sync` / `vpl-decoder-sync` のワーカースレッドから呼ばれる。 ハンドラ実装は `Send + 'static`。 メインスレッドへ届けるなら mpsc などのチャネルにブリッジする。
 - **`DecodedFrame` の借用**: `DecodedFrame<'_, T>` の `y()` / `uv()` スライスはコールバック呼び出し中のみ有効。 外に持ち出すには `to_vec()` などでコピーする必要がある。 `pitch() != width()` が普通で、 単純連結すると壊れる。
 - **`user_data` の対応付け**: `Decoder` は入力 `decode()` の連番 (`TimeStamp`) と出力フレームの `TimeStamp` を完全一致で対応付ける。 出力フレームの TimeStamp がどの入力にも一致しない (= 供給不足) 場合は worker 内で drain 扱いとなり破棄される。 1 入力で複数枚出ることはないが、 元入力との 1:1 対応を確実にするには `decode` 1 回ごとに `user_data` を必ず供給する。
-- **動作 OS の制約**: 実機サポートは Linux x86_64 + Intel GPU のみ。 macOS / Windows でビルドできるとしても `list_adapters()` は空を返し、 セッション生成は失敗する。
+- **動作 OS の制約**: 実機サポートは Linux x86_64 + Intel GPU のみ。 Linux x86_64 以外のターゲットでは `compile_error!` により crate 自体がビルドできない。
 - **静的リンク**: 実行時に libvpl 共有ライブラリは不要だが、 ビルド時に対応 GPU ドライバ (Intel Media Driver / iHD) が動作環境にないと実機テストは通らない。
 
 ## テスト・ベンチの位置
