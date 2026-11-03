@@ -520,6 +520,10 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::{
+        CodecConfig, Encoder, EncoderConfig, FrameFormat, H264EncoderConfig, RateControlMode,
+    };
+    use crate::{EncodedFrame, FnEncodeHandler};
 
     #[test]
     fn frame_surface_new_rejects_null() {
@@ -529,32 +533,48 @@ mod tests {
 
     #[test]
     fn frame_surface_gpu_required() {
-        let adapters = match crate::list_adapters() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-        if adapters.is_empty() {
-            return;
-        }
+        let adapters = crate::list_adapters().expect("Intel アダプタの列挙に失敗した");
+        assert!(
+            !adapters.is_empty(),
+            "Intel HW アダプタが列挙されない: {adapters:?}"
+        );
 
         let lib = VplLibrary;
         let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
-        let session = match lib.create_session(adapter) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        // MFXMemory_GetSurfaceForEncode はエンコーダー初期化後のセッションでのみ
+        // サーフェスを返すため、テスト用のエンコーダーを作ってセッションを借りる。
+        let config = EncoderConfig::new(
+            adapter,
+            CodecConfig::H264(H264EncoderConfig { profile: None }),
+            320,
+            240,
+            FrameFormat::Nv12,
+            30,
+            1,
+            RateControlMode::Cqp,
+        );
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+        )
+        .unwrap_or_else(|error| panic!("テスト用エンコーダーの初期化に失敗した: {error}"));
+        let session = encoder.session_for_test();
 
         // 正常系: new → map_write → unmap → drop
         {
             let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
             let status = lib.mfx_memory_get_surface_for_encode(session.as_ptr(), &mut surface);
-            if status != sys::mfxStatus_MFX_ERR_NONE {
-                return;
-            }
-            let mut fs = FrameSurface::new(lib, surface).expect("FrameSurface::new should succeed");
+            assert_eq!(
+                status,
+                sys::mfxStatus_MFX_ERR_NONE,
+                "正常系: surface の取得に失敗した: status={status}"
+            );
+            let mut fs = FrameSurface::new(lib, surface)
+                .unwrap_or_else(|error| panic!("正常系: FrameSurface::new に失敗した: {error}"));
             fs.map_write()
-                .expect("map_write should succeed on a valid surface");
-            fs.unmap().expect("unmap should succeed");
+                .unwrap_or_else(|error| panic!("正常系: map_write に失敗した: {error}"));
+            fs.unmap()
+                .unwrap_or_else(|error| panic!("正常系: unmap に失敗した: {error}"));
             // drop 時に Release が呼ばれる
         }
 
@@ -562,57 +582,90 @@ mod tests {
         {
             let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
             let status = lib.mfx_memory_get_surface_for_encode(session.as_ptr(), &mut surface);
-            if status != sys::mfxStatus_MFX_ERR_NONE {
-                return;
-            }
-            let mut fs = FrameSurface::new(lib, surface).expect("FrameSurface::new should succeed");
-            fs.map_write()
-                .expect("first map_write should succeed on a valid surface");
+            assert_eq!(
+                status,
+                sys::mfxStatus_MFX_ERR_NONE,
+                "二重 map_write: surface の取得に失敗した: status={status}"
+            );
+            let mut fs = FrameSurface::new(lib, surface).unwrap_or_else(|error| {
+                panic!("二重 map_write: FrameSurface::new に失敗した: {error}")
+            });
+            fs.map_write().unwrap_or_else(|error| {
+                panic!("二重 map_write: 1 回目の map_write に失敗した: {error}")
+            });
             let result = fs.map_write();
-            assert!(result.is_err(), "second map_write should fail");
-            fs.unmap().expect("unmap should succeed");
+            assert!(
+                result.is_err(),
+                "二重 map_write がエラーにならなかった: {result:?}"
+            );
+            fs.unmap()
+                .unwrap_or_else(|error| panic!("二重 map_write: unmap に失敗した: {error}"));
         }
 
         // map_read の二重呼び出し
         {
             let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
             let status = lib.mfx_memory_get_surface_for_encode(session.as_ptr(), &mut surface);
-            if status != sys::mfxStatus_MFX_ERR_NONE {
-                return;
-            }
-            let mut fs = FrameSurface::new(lib, surface).expect("FrameSurface::new should succeed");
-            fs.map_read()
-                .expect("first map_read should succeed on a valid surface");
+            assert_eq!(
+                status,
+                sys::mfxStatus_MFX_ERR_NONE,
+                "二重 map_read: surface の取得に失敗した: status={status}"
+            );
+            let mut fs = FrameSurface::new(lib, surface).unwrap_or_else(|error| {
+                panic!("二重 map_read: FrameSurface::new に失敗した: {error}")
+            });
+            fs.map_read().unwrap_or_else(|error| {
+                panic!("二重 map_read: 1 回目の map_read に失敗した: {error}")
+            });
             let result = fs.map_read();
-            assert!(result.is_err(), "second map_read should fail");
-            fs.unmap().expect("unmap should succeed");
+            assert!(
+                result.is_err(),
+                "二重 map_read がエラーにならなかった: {result:?}"
+            );
+            fs.unmap()
+                .unwrap_or_else(|error| panic!("二重 map_read: unmap に失敗した: {error}"));
         }
 
         // unmap の二重呼び出し
         {
             let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
             let status = lib.mfx_memory_get_surface_for_encode(session.as_ptr(), &mut surface);
-            if status != sys::mfxStatus_MFX_ERR_NONE {
-                return;
-            }
-            let mut fs = FrameSurface::new(lib, surface).expect("FrameSurface::new should succeed");
+            assert_eq!(
+                status,
+                sys::mfxStatus_MFX_ERR_NONE,
+                "二重 unmap: surface の取得に失敗した: status={status}"
+            );
+            let mut fs = FrameSurface::new(lib, surface).unwrap_or_else(|error| {
+                panic!("二重 unmap: FrameSurface::new に失敗した: {error}")
+            });
             fs.map_write()
-                .expect("map_write should succeed on a valid surface");
-            fs.unmap().expect("first unmap should succeed");
+                .unwrap_or_else(|error| panic!("二重 unmap: map_write に失敗した: {error}"));
+            fs.unmap()
+                .unwrap_or_else(|error| panic!("二重 unmap: 1 回目の unmap に失敗した: {error}"));
             let result = fs.unmap();
-            assert!(result.is_err(), "second unmap should fail");
+            assert!(
+                result.is_err(),
+                "二重 unmap がエラーにならなかった: {result:?}"
+            );
         }
 
         // unmapped 状態での unmap
         {
             let mut surface: *mut sys::mfxFrameSurface1 = std::ptr::null_mut();
             let status = lib.mfx_memory_get_surface_for_encode(session.as_ptr(), &mut surface);
-            if status != sys::mfxStatus_MFX_ERR_NONE {
-                return;
-            }
-            let mut fs = FrameSurface::new(lib, surface).expect("FrameSurface::new should succeed");
+            assert_eq!(
+                status,
+                sys::mfxStatus_MFX_ERR_NONE,
+                "未 map 状態の unmap: surface の取得に失敗した: status={status}"
+            );
+            let mut fs = FrameSurface::new(lib, surface).unwrap_or_else(|error| {
+                panic!("未 map 状態の unmap: FrameSurface::new に失敗した: {error}")
+            });
             let result = fs.unmap();
-            assert!(result.is_err(), "unmap on a non-mapped surface should fail");
+            assert!(
+                result.is_err(),
+                "未 map 状態の unmap がエラーにならなかった: {result:?}"
+            );
         }
     }
 }
