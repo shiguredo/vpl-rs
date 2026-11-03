@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/fix-silent-pass-tests
 - Polished: 2026-08-02
@@ -158,3 +159,22 @@ fn test_list_adapters_sorted_and_deduped() {
 - 関連 issue: 0014（`FrameSurface::Drop` のエラー報告。0023 適用後の `frame_surface_gpu_required` を前提にしている。0014 内の `#[cfg(intel_vpl)]` 付き分割テストという記述は別途更新が必要）
 - 0022 はクローズ済み（GPU 無しでテストを回す前提を採らない）
 - 0015 は非 Linux の `compile_error!` ガード。cfg を付けない方針のため本 issue との依存はない
+
+## 解決方法
+
+`frame_surface_gpu_required` の silent early-return を全て削除し、`test_list_adapters_sorted_and_deduped` の空 Vec 自動パスも排除した。GPU が無ければテストは失敗する。
+
+### 変更内容
+
+- `src/vpl.rs::frame_surface_gpu_required` の `list_adapters()` / `Encoder::new()` / `mfx_memory_get_surface_for_encode()` の early return を `expect` / `unwrap_or_else(panic!)` / `assert!` に置き換えた。テストは 1 個のまま分割せず、5 シナリオをコメントで区切った。
+- `MFXMemory_GetSurfaceForEncode` はエンコーダー初期化後のセッションでのみサーフェスを返すため、テスト用の `Encoder`（H.264 / 320x240 / NV12 / CQP）を作成し、`Encoder::session_for_test()` で `Session` を借りるようにした。`Encoder` はテストの間保持する。
+- `src/encode.rs` の `Encoder` に `#[cfg(test)] pub(crate) fn session_for_test(&self) -> &Session` を追加した。
+- `tests/test_adapter.rs` の `format_adapters` の `#[cfg(intel_vpl)]` を外し、`test_list_adapters_sorted_and_deduped` に空 Vec を検出する assert を追加した。
+- `CHANGES.md` の `## develop` の `### misc` に `[ADD]` を追記した。
+
+### 検証
+
+- リモートの GPU 環境（`shiguredo-gmktec-k9:~/melpon/vpl-rs`）で `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`（`INTEL_VPL` あり / なし）が pass した。
+- `cargo test --lib`（`INTEL_VPL` なし）が 14 件、`cargo test --test test_adapter`（`INTEL_VPL` なし）が 5 件 pass した。
+- `INTEL_VPL=1 cargo test --workspace -- --test-threads=1 --nocapture` が全件 pass した（lib 15、adapter 6、roundtrip 21、doctest 2）。
+- GPU なし環境で `cargo test --lib` が pass することは確認していない（GPU が無ければ失敗する方針のため）。ローカル環境では Intel アダプタが列挙されず、`frame_surface_gpu_required` が失敗することを確認した。
