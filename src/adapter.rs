@@ -24,7 +24,6 @@ use crate::vpl::{VplLibrary, VplLoader};
 ///
 /// 現状は DRM render node 番号による指定のみをサポートする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum AdapterSelector {
     /// `/dev/dri/renderD<N>` の `N`（通常 128 以上）
     DrmRenderNode(u32),
@@ -48,7 +47,6 @@ impl AdapterSelector {
 
 /// integrated GPU か discrete GPU か
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum MediaAdapterType {
     /// integrated GPU（iGPU）
     Integrated,
@@ -63,7 +61,6 @@ pub enum MediaAdapterType {
 /// 各フィールドは libvpl の `mfxExtendedDeviceId` (`PCIDomain` / `PCIBus` /
 /// `PCIDevice` / `PCIFunction` がすべて `mfxU32`) に合わせて `u32` にしている。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct PciAddress {
     /// PCI domain
     pub domain: u32,
@@ -77,7 +74,6 @@ pub struct PciAddress {
 
 /// VPL ローダーで列挙される Intel HW 実装の情報
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct AdapterInfo {
     /// `/dev/dri/renderD<N>` の `N`（通常 128 以上）。`AdapterSelector::DrmRenderNode` に渡す
     pub drm_render_node: u32,

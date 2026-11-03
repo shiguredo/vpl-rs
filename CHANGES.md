@@ -46,6 +46,11 @@
 - [UPDATE] Rust ツールチェーンを rust-version と同じ 1.93 に固定する
   - CI と devcontainer のツールチェーンも 1.93 に合わせる
   - @voluntas
+- [UPDATE] 公開型から `#[non_exhaustive]` を削除する
+  - `DecoderConfig` / `EncoderConfig` / `AdapterSelector` / `MediaAdapterType` / `PciAddress` / `AdapterInfo` が対象
+  - 利用側で `match` の網羅性チェックと構造体リテラルによる構築が可能になる
+  - 今後フィールドや variant を追加する場合は後方互換のない変更として扱う
+  - @melpon
 - [FIX] docs.rs のビルドでネットワークに接続できないためドキュメント生成に失敗する問題を修正する
   - `DOCS_RS` 設定時は libvpl の取得と bindgen をスキップし、ドキュメント生成に必要な最小限のダミー定義を出力する
   - @melpon
