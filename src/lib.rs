@@ -107,8 +107,9 @@ pub use codec_info::*;
 pub use decode::{DecodeHandler, DecodedFrame, Decoder, DecoderConfig, FnDecodeHandler};
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
-    EncoderConfig, EncoderStats, FnEncodeHandler, FrameFormat, H264EncoderConfig,
-    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, Vp9EncoderConfig,
+    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, FrameFormat, H264EncoderConfig,
+    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, VideoParam,
+    Vp9EncoderConfig,
 };
 pub use error::Error;
 pub use vpl::{frame_type, gop_opt_flag};

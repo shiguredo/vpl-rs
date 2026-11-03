@@ -418,6 +418,50 @@ struct ExtBuffers {
     ext_vp9: Option<Box<sys::mfxExtVP9Param>>,
 }
 
+/// mfxExtCodingOption2 を構築する
+///
+/// `Header` を設定し、`LookAheadDepth` に `look_ahead_depth` を設定する。
+///
+/// LA / LA_ICQ / LA_HRD モードでは LookAheadDepth で先読みフレーム数を指定する。
+/// ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption2::LookAheadDepth)
+fn coding_option2(look_ahead_depth: u16) -> Box<sys::mfxExtCodingOption2> {
+    let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+    co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
+    co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
+    co2.LookAheadDepth = look_ahead_depth;
+    Box::new(co2)
+}
+
+/// mfxExtCodingOption3 を構築する
+///
+/// `Header` を設定し、`QVBRQuality` に `qvbr_quality` を設定する。
+///
+/// QVBR モードでは QVBRQuality で品質値を指定する。
+/// ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption3::QVBRQuality)
+fn coding_option3(qvbr_quality: u16) -> Box<sys::mfxExtCodingOption3> {
+    let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+    co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
+    co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
+    co3.QVBRQuality = qvbr_quality;
+    Box::new(co3)
+}
+
+/// mfxExtVP9Param を構築する
+///
+/// `Header` を設定し、`WriteIVFHeaders` に `write_ivf_headers` を設定する。
+///
+/// WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
+/// ref:
+/// - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
+/// - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
+fn vp9_param(write_ivf_headers: u16) -> Box<sys::mfxExtVP9Param> {
+    let mut param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
+    param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
+    param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
+    param.WriteIVFHeaders = write_ivf_headers;
+    Box::new(param)
+}
+
 impl ExtBuffers {
     /// ExtParam として VPL に渡す拡張バッファ一式を構築する
     ///
@@ -428,48 +472,32 @@ impl ExtBuffers {
         qvbr_quality: Option<u16>,
         write_ivf_headers: Option<bool>,
     ) -> Self {
-        // Look Ahead depth の設定 (mfxExtCodingOption2)
-        //
-        // LA / LA_ICQ / LA_HRD モードでは LookAheadDepth で先読みフレーム数を指定する。
-        // ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption2::LookAheadDepth)
-        let ext_co2 = look_ahead_depth.map(|depth| {
-            let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
-            co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
-            co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
-            co2.LookAheadDepth = depth;
-            Box::new(co2)
-        });
-
-        // QVBR Quality の設定 (mfxExtCodingOption3)
-        //
-        // QVBR モードでは QVBRQuality で品質値を指定する。
-        // ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption3::QVBRQuality)
-        let ext_co3 = qvbr_quality.map(|quality| {
-            let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
-            co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
-            co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
-            co3.QVBRQuality = quality;
-            Box::new(co3)
-        });
-
-        // IVF ヘッダー出力の設定 (mfxExtVP9Param)
-        //
-        // WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
-        // ref:
-        // - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
-        // - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
-        let ext_vp9 = write_ivf_headers.map(|value| {
-            let mut param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
-            param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
-            param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
-            param.WriteIVFHeaders = coding_option_value(value);
-            Box::new(param)
-        });
-
         Self {
-            ext_co2,
-            ext_co3,
-            ext_vp9,
+            ext_co2: look_ahead_depth.map(coding_option2),
+            ext_co3: qvbr_quality.map(coding_option3),
+            ext_vp9: write_ivf_headers.map(|enabled| vp9_param(coding_option_value(enabled))),
+        }
+    }
+
+    /// 読み戻し用に、要求したものと同じ種類のバッファをゼロ初期化して構築する
+    ///
+    /// `Header` だけを設定し、値は 0 のままにする。要求値が入ったバッファを読み戻しに
+    /// 使うと、VPL が値を書き戻さなかった場合に要求値がそのまま残り、
+    /// 読み戻せたように見えてしまう。
+    fn zeroed_copy(&self) -> Self {
+        Self {
+            ext_co2: self.ext_co2.as_ref().map(|_| coding_option2(0)),
+            ext_co3: self.ext_co3.as_ref().map(|_| coding_option3(0)),
+            ext_vp9: self.ext_vp9.as_ref().map(|_| vp9_param(0)),
+        }
+    }
+
+    /// 読み戻した拡張バッファを VPL の構造体のまま取り出す
+    fn into_params(self) -> ExtParams {
+        ExtParams {
+            coding_option2: self.ext_co2.map(|buffer| *buffer),
+            coding_option3: self.ext_co3.map(|buffer| *buffer),
+            vp9_param: self.ext_vp9.map(|buffer| *buffer),
         }
     }
 
@@ -721,6 +749,35 @@ where
     fn on_encoded(&mut self, result: Result<EncodedFrame<T>, E>) {
         (self.f)(result);
     }
+}
+
+/// エンコーダが現在使用しているパラメータ
+///
+/// 基本パラメータは VPL の生の構造体、拡張バッファは VPL が書き戻した実効値を保持する。
+/// いずれも要求値ではなく、VPL が報告した値である。
+#[derive(Clone, Copy)]
+pub struct VideoParam {
+    /// 基本パラメータ
+    ///
+    /// `ExtParam` は常に null、`NumExtParam` は常に 0 である。
+    /// VPL の共用体メンバを読む場合は `unsafe` を伴う。
+    pub param: sys::mfxVideoParam,
+    /// 拡張バッファの実効値
+    pub ext: ExtParams,
+}
+
+/// エンコーダが現在使用している拡張バッファ
+///
+/// バッファを要求していない場合は `None` になる。要求した場合でも、VPL が値を
+/// 書き戻さなかった場合はゼロ初期化された値のままになる。
+#[derive(Clone, Copy)]
+pub struct ExtParams {
+    /// mfxExtCodingOption2（`LookAheadDepth`）
+    pub coding_option2: Option<sys::mfxExtCodingOption2>,
+    /// mfxExtCodingOption3（`QVBRQuality`）
+    pub coding_option3: Option<sys::mfxExtCodingOption3>,
+    /// mfxExtVP9Param（`WriteIVFHeaders`）
+    pub vp9_param: Option<sys::mfxExtVP9Param>,
 }
 
 /// エンコーダ
@@ -1169,21 +1226,38 @@ impl<H: EncodeHandler> Encoder<H> {
         result
     }
 
-    /// Init 後の実効パラメータを取得する
+    /// エンコーダが現在使用しているパラメータを取得する
     ///
-    /// MFXVideoENCODE_GetVideoParam を呼び出す。
-    /// エンコーダが実際に使用しているパラメータを確認するために使用する。
+    /// 基本パラメータと、要求した拡張バッファの実効値を返す。拡張バッファの値は
+    /// VPL が報告した値であり、要求値と一致するとは限らない。
     ///
-    /// 戻り値の [`ffi::mfxVideoParam`](crate::ffi::mfxVideoParam) は bindgen 生成の型で、
-    /// VPL API の構造体に直接対応する。
-    pub fn get_video_param(&self) -> Result<sys::mfxVideoParam, Error> {
+    /// 拡張バッファを要求していない場合、対応する [`ExtParams`] のフィールドは
+    /// `None` になる。
+    pub fn get_video_param(&self) -> Result<VideoParam, Error> {
         let mut param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
-        // 現在のパラメータをコピーしてから GetVideoParam で上書きする
+        // 出力先の mfxVideoParam にも Init 時の IOPattern を設定する
         param.IOPattern = self.video_param.IOPattern;
-        self.session
+
+        // 読み戻し用のバッファは毎回新しく構築する。
+        // 保持している要求値のバッファを読み戻し先に使うと、要求値が実効値で
+        // 上書きされ、以降の Reset が要求値ではなくなる。
+        let mut readback = self.ext_buffers.zeroed_copy();
+        let mut ext_bufs = readback.ext_param();
+        attach_ext_param(&mut param, &mut ext_bufs);
+
+        let result = self
+            .session
             .lib()
-            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param)?;
-        Ok(param)
+            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param);
+
+        // 成功・失敗にかかわらず、返す mfxVideoParam に拡張バッファのポインタを残さない
+        clear_ext_param(&mut param);
+        result?;
+
+        Ok(VideoParam {
+            param,
+            ext: readback.into_params(),
+        })
     }
 
     /// エンコーダが要求する coded フレームサイズ（`FrameInfo::Width/Height`）を取得する
@@ -1853,37 +1927,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ext_buffers_zeroed_copy_keeps_header_and_clears_values() {
+        // 読み戻し用のバッファは Header を維持したまま値だけを 0 にする。
+        // 値が残っていると、VPL が書き戻さなかった場合に要求値がそのまま見えてしまう。
+        let requested = ExtBuffers::new(Some(16), Some(25), Some(true));
+        let readback = requested.zeroed_copy();
+
+        let co2 = readback
+            .ext_co2
+            .as_ref()
+            .expect("mfxExtCodingOption2 が構築されていない");
+        assert_eq!(co2.Header.BufferId, sys::MFX_EXTBUFF_CODING_OPTION2);
+        assert_eq!(
+            co2.Header.BufferSz,
+            std::mem::size_of::<sys::mfxExtCodingOption2>() as u32
+        );
+        assert_eq!(
+            co2.LookAheadDepth, 0,
+            "読み戻し用バッファの LookAheadDepth は 0 であること"
+        );
+
+        let co3 = readback
+            .ext_co3
+            .as_ref()
+            .expect("mfxExtCodingOption3 が構築されていない");
+        assert_eq!(co3.Header.BufferId, sys::MFX_EXTBUFF_CODING_OPTION3);
+        assert_eq!(
+            co3.QVBRQuality, 0,
+            "読み戻し用バッファの QVBRQuality は 0 であること"
+        );
+
+        let vp9 = readback
+            .ext_vp9
+            .as_ref()
+            .expect("mfxExtVP9Param が構築されていない");
+        assert_eq!(vp9.Header.BufferId, sys::MFX_EXTBUFF_VP9_PARAM);
+        assert_eq!(
+            vp9.WriteIVFHeaders, 0,
+            "読み戻し用バッファの WriteIVFHeaders は 0 であること"
+        );
+    }
+
+    #[test]
+    fn ext_buffers_zeroed_copy_skips_unrequested_buffers() {
+        let requested = ExtBuffers::new(None, None, None);
+        let readback = requested.zeroed_copy();
+
+        assert!(
+            readback.ext_co2.is_none(),
+            "要求していない mfxExtCodingOption2 は構築しないこと"
+        );
+        assert!(
+            readback.ext_co3.is_none(),
+            "要求していない mfxExtCodingOption3 は構築しないこと"
+        );
+        assert!(
+            readback.ext_vp9.is_none(),
+            "要求していない mfxExtVP9Param は構築しないこと"
+        );
+    }
+
+    #[test]
+    fn ext_buffers_into_params_keeps_requested_values() {
+        let buffers = ExtBuffers::new(Some(16), Some(25), Some(true));
+        let params = buffers.into_params();
+
+        assert_eq!(
+            params
+                .coding_option2
+                .expect("mfxExtCodingOption2 が取り出せない")
+                .LookAheadDepth,
+            16
+        );
+        assert_eq!(
+            params
+                .coding_option3
+                .expect("mfxExtCodingOption3 が取り出せない")
+                .QVBRQuality,
+            25
+        );
+        assert_eq!(
+            params
+                .vp9_param
+                .expect("mfxExtVP9Param が取り出せない")
+                .WriteIVFHeaders,
+            sys::MFX_CODINGOPTION_ON as u16
+        );
+    }
+
     /// エンコーダが実際に使っている LookAheadDepth と QVBRQuality を読み戻す
     ///
     /// 実機 (Intel GPU) 上でのみ動作する。
     #[cfg(intel_vpl)]
     fn read_coding_option_ext_params<H: EncodeHandler>(encoder: &Encoder<H>) -> (u16, u16) {
-        // 公開 API の `Encoder::get_video_param` は ExtParam を渡す手段を持たないため、
-        // private な `session` と `video_param` を直接使う。
-        //
-        // 読み戻し先の拡張バッファを zeroed で用意する。
-        // GetVideoParam は attach したバッファへ実効値を書き戻す。
-        let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
-        co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
-        co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
-        let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
-        co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
-        co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
-        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = vec![
-            &mut co2 as *mut sys::mfxExtCodingOption2 as *mut sys::mfxExtBuffer,
-            &mut co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer,
-        ];
-
-        // 現在の動画パラメータを取得してから、拡張バッファを attach して再度取得する
-        let mut param = encoder.get_video_param().expect("GetVideoParam に失敗した");
-        param.ExtParam = ext_bufs.as_mut_ptr();
-        param.NumExtParam = ext_bufs.len() as u16;
-        encoder
-            .session
-            .lib()
-            .mfx_video_encode_get_video_param(encoder.session.as_ptr(), &mut param)
-            .expect("GetVideoParam に失敗した");
-
+        let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+        let co2 = param
+            .ext
+            .coding_option2
+            .expect("mfxExtCodingOption2 が読み戻されていない");
+        let co3 = param
+            .ext
+            .coding_option3
+            .expect("mfxExtCodingOption3 が読み戻されていない");
         (co2.LookAheadDepth, co3.QVBRQuality)
     }
 
