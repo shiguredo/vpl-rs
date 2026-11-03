@@ -1,4 +1,4 @@
-//! コーデック情報の照会
+//! コーデック種別・プロファイルの定義と、コーデック情報の照会
 
 use crate::{AdapterSelector, Error, sys};
 
@@ -17,7 +17,7 @@ pub enum VideoCodecType {
 
 impl VideoCodecType {
     /// MFX CodecID に変換する
-    fn to_codec_id(self) -> u32 {
+    pub(crate) fn to_codec_id(self) -> u32 {
         match self {
             Self::H264 => sys::MFX_CODEC_AVC,
             Self::Hevc => sys::MFX_CODEC_HEVC,
@@ -29,6 +29,162 @@ impl VideoCodecType {
     /// すべてのコーデック種別を返す
     fn all() -> &'static [Self] {
         &[Self::H264, Self::Hevc, Self::Vp9, Self::Av1]
+    }
+}
+
+/// H.264 プロファイル
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264Profile {
+    /// ベースラインプロファイル
+    Baseline,
+    /// Constrained ベースラインプロファイル
+    ConstrainedBaseline,
+    /// メインプロファイル
+    Main,
+    /// ハイプロファイル
+    High,
+    /// Constrained ハイプロファイル
+    ConstrainedHigh,
+    /// High 10 プロファイル（10bit）
+    High10,
+    /// High 4:2:2 プロファイル
+    High422,
+}
+
+impl H264Profile {
+    /// MFX_PROFILE_AVC_* の値に変換する
+    pub(crate) fn to_mfx_profile(self) -> u32 {
+        match self {
+            Self::Baseline => sys::MFX_PROFILE_AVC_BASELINE,
+            Self::ConstrainedBaseline => sys::MFX_PROFILE_AVC_CONSTRAINED_BASELINE,
+            Self::Main => sys::MFX_PROFILE_AVC_MAIN,
+            Self::High => sys::MFX_PROFILE_AVC_HIGH,
+            Self::ConstrainedHigh => sys::MFX_PROFILE_AVC_CONSTRAINED_HIGH,
+            Self::High10 => sys::MFX_PROFILE_AVC_HIGH10,
+            Self::High422 => sys::MFX_PROFILE_AVC_HIGH_422,
+        }
+    }
+
+    /// MFX_PROFILE_AVC_* の値から変換する
+    ///
+    /// 既知のプロファイル以外の値の場合は None を返す。
+    pub(crate) fn from_mfx_profile(id: u32) -> Option<Self> {
+        match id {
+            sys::MFX_PROFILE_AVC_BASELINE => Some(Self::Baseline),
+            sys::MFX_PROFILE_AVC_CONSTRAINED_BASELINE => Some(Self::ConstrainedBaseline),
+            sys::MFX_PROFILE_AVC_MAIN => Some(Self::Main),
+            sys::MFX_PROFILE_AVC_HIGH => Some(Self::High),
+            sys::MFX_PROFILE_AVC_CONSTRAINED_HIGH => Some(Self::ConstrainedHigh),
+            sys::MFX_PROFILE_AVC_HIGH10 => Some(Self::High10),
+            sys::MFX_PROFILE_AVC_HIGH_422 => Some(Self::High422),
+            _ => None,
+        }
+    }
+}
+
+/// HEVC プロファイル
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HevcProfile {
+    /// メインプロファイル
+    Main,
+    /// Main 10 プロファイル（10bit）
+    Main10,
+    /// Main Still Picture プロファイル
+    MainSp,
+    /// Range Extension プロファイル
+    Rext,
+    /// Screen Content Coding プロファイル
+    Scc,
+}
+
+impl HevcProfile {
+    /// MFX_PROFILE_HEVC_* の値に変換する
+    pub(crate) fn to_mfx_profile(self) -> u32 {
+        match self {
+            Self::Main => sys::MFX_PROFILE_HEVC_MAIN,
+            Self::Main10 => sys::MFX_PROFILE_HEVC_MAIN10,
+            Self::MainSp => sys::MFX_PROFILE_HEVC_MAINSP,
+            Self::Rext => sys::MFX_PROFILE_HEVC_REXT,
+            Self::Scc => sys::MFX_PROFILE_HEVC_SCC,
+        }
+    }
+
+    /// MFX_PROFILE_HEVC_* の値から変換する
+    ///
+    /// 既知のプロファイル以外の値の場合は None を返す。
+    pub(crate) fn from_mfx_profile(id: u32) -> Option<Self> {
+        match id {
+            sys::MFX_PROFILE_HEVC_MAIN => Some(Self::Main),
+            sys::MFX_PROFILE_HEVC_MAIN10 => Some(Self::Main10),
+            sys::MFX_PROFILE_HEVC_MAINSP => Some(Self::MainSp),
+            sys::MFX_PROFILE_HEVC_REXT => Some(Self::Rext),
+            sys::MFX_PROFILE_HEVC_SCC => Some(Self::Scc),
+            _ => None,
+        }
+    }
+}
+
+/// VP9 プロファイル
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vp9Profile {
+    /// Profile 0（8bit YUV 4:2:0）
+    Profile0,
+    /// Profile 1（8bit YUV 4:2:2 または 4:4:4）
+    Profile1,
+    /// Profile 2（10/12bit YUV 4:2:0）
+    Profile2,
+    /// Profile 3（10/12bit YUV 4:2:2 または 4:4:4）
+    Profile3,
+}
+
+impl Vp9Profile {
+    /// MFX_PROFILE_VP9_* の値に変換する
+    pub(crate) fn to_mfx_profile(self) -> u32 {
+        match self {
+            Self::Profile0 => sys::MFX_PROFILE_VP9_0,
+            Self::Profile1 => sys::MFX_PROFILE_VP9_1,
+            Self::Profile2 => sys::MFX_PROFILE_VP9_2,
+            Self::Profile3 => sys::MFX_PROFILE_VP9_3,
+        }
+    }
+
+    /// MFX_PROFILE_VP9_* の値から変換する
+    ///
+    /// 既知のプロファイル以外の値の場合は None を返す。
+    pub(crate) fn from_mfx_profile(id: u32) -> Option<Self> {
+        match id {
+            sys::MFX_PROFILE_VP9_0 => Some(Self::Profile0),
+            sys::MFX_PROFILE_VP9_1 => Some(Self::Profile1),
+            sys::MFX_PROFILE_VP9_2 => Some(Self::Profile2),
+            sys::MFX_PROFILE_VP9_3 => Some(Self::Profile3),
+            _ => None,
+        }
+    }
+}
+
+/// AV1 プロファイル
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Av1Profile {
+    /// メインプロファイル
+    Main,
+}
+
+impl Av1Profile {
+    /// MFX_PROFILE_AV1_* の値に変換する
+    pub(crate) fn to_mfx_profile(self) -> u32 {
+        match self {
+            Self::Main => sys::MFX_PROFILE_AV1_MAIN,
+        }
+    }
+
+    /// MFX_PROFILE_AV1_* の値から変換する
+    ///
+    /// 既知のプロファイル以外の値の場合は None を返す。
+    pub(crate) fn from_mfx_profile(id: u32) -> Option<Self> {
+        match id {
+            sys::MFX_PROFILE_AV1_MAIN => Some(Self::Main),
+            _ => None,
+        }
     }
 }
 
@@ -71,69 +227,15 @@ pub struct EncodingInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodingProfiles {
     /// H.264 プロファイル一覧
-    H264(Vec<H264EncodingProfile>),
+    H264(Vec<H264Profile>),
     /// HEVC プロファイル一覧
-    Hevc(Vec<HevcEncodingProfile>),
+    Hevc(Vec<HevcProfile>),
     /// VP9 プロファイル一覧
-    Vp9(Vec<Vp9EncodingProfile>),
+    Vp9(Vec<Vp9Profile>),
     /// AV1 プロファイル一覧
-    Av1(Vec<Av1EncodingProfile>),
+    Av1(Vec<Av1Profile>),
     /// プロファイル情報なし（エンコード非対応）
     None,
-}
-
-/// H.264 エンコードプロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H264EncodingProfile {
-    /// Baseline
-    Baseline,
-    /// Constrained Baseline
-    ConstrainedBaseline,
-    /// Main
-    Main,
-    /// High
-    High,
-    /// Constrained High
-    ConstrainedHigh,
-    /// High 10 (10bit)
-    High10,
-    /// High 4:2:2
-    High422,
-}
-
-/// HEVC エンコードプロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HevcEncodingProfile {
-    /// Main
-    Main,
-    /// Main10
-    Main10,
-    /// Main Still Picture
-    MainSp,
-    /// Range Extension
-    Rext,
-    /// Screen Content Coding
-    Scc,
-}
-
-/// VP9 エンコードプロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Vp9EncodingProfile {
-    /// Profile 0 (8bit YUV 4:2:0)
-    Profile0,
-    /// Profile 1 (8bit YUV 4:2:2 / 4:4:4)
-    Profile1,
-    /// Profile 2 (10/12bit YUV 4:2:0)
-    Profile2,
-    /// Profile 3 (10/12bit YUV 4:2:2 / 4:4:4)
-    Profile3,
-}
-
-/// AV1 エンコードプロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Av1EncodingProfile {
-    /// Main
-    Main,
 }
 
 /// 指定アダプタで利用可能なコーデック情報の一覧を返す
@@ -311,12 +413,14 @@ unsafe fn probe_encoding(enc: &sys::mfxEncoderDescription, codec: VideoCodecType
 }
 
 /// エンコーダのプロファイル一覧を照会する
+///
+/// 既知のプロファイル ID だけを、`Profiles` に並んでいる順序で返す。
 unsafe fn query_encoding_profiles(
     codec: VideoCodecType,
     entry: &sys::mfxEncoderDescription_encoder,
 ) -> EncodingProfiles {
     let num_profiles = entry.NumProfiles as usize;
-    let mut profile_ids = Vec::with_capacity(num_profiles);
+    let mut profile_ids = Vec::new();
 
     if num_profiles > 0 && !entry.Profiles.is_null() {
         for i in 0..num_profiles {
@@ -326,60 +430,29 @@ unsafe fn query_encoding_profiles(
     }
 
     match codec {
-        VideoCodecType::H264 => {
-            let map: &[(u32, H264EncodingProfile)] = &[
-                (sys::MFX_PROFILE_AVC_BASELINE, H264EncodingProfile::Baseline),
-                (
-                    sys::MFX_PROFILE_AVC_CONSTRAINED_BASELINE,
-                    H264EncodingProfile::ConstrainedBaseline,
-                ),
-                (sys::MFX_PROFILE_AVC_MAIN, H264EncodingProfile::Main),
-                (sys::MFX_PROFILE_AVC_HIGH, H264EncodingProfile::High),
-                (
-                    sys::MFX_PROFILE_AVC_CONSTRAINED_HIGH,
-                    H264EncodingProfile::ConstrainedHigh,
-                ),
-                (sys::MFX_PROFILE_AVC_HIGH10, H264EncodingProfile::High10),
-                (sys::MFX_PROFILE_AVC_HIGH_422, H264EncodingProfile::High422),
-            ];
-            EncodingProfiles::H264(match_profiles(&profile_ids, map))
-        }
-        VideoCodecType::Hevc => {
-            let map: &[(u32, HevcEncodingProfile)] = &[
-                (sys::MFX_PROFILE_HEVC_MAIN, HevcEncodingProfile::Main),
-                (sys::MFX_PROFILE_HEVC_MAIN10, HevcEncodingProfile::Main10),
-                (sys::MFX_PROFILE_HEVC_MAINSP, HevcEncodingProfile::MainSp),
-                (sys::MFX_PROFILE_HEVC_REXT, HevcEncodingProfile::Rext),
-                (sys::MFX_PROFILE_HEVC_SCC, HevcEncodingProfile::Scc),
-            ];
-            EncodingProfiles::Hevc(match_profiles(&profile_ids, map))
-        }
-        VideoCodecType::Vp9 => {
-            let map: &[(u32, Vp9EncodingProfile)] = &[
-                (sys::MFX_PROFILE_VP9_0, Vp9EncodingProfile::Profile0),
-                (sys::MFX_PROFILE_VP9_1, Vp9EncodingProfile::Profile1),
-                (sys::MFX_PROFILE_VP9_2, Vp9EncodingProfile::Profile2),
-                (sys::MFX_PROFILE_VP9_3, Vp9EncodingProfile::Profile3),
-            ];
-            EncodingProfiles::Vp9(match_profiles(&profile_ids, map))
-        }
-        VideoCodecType::Av1 => {
-            let map: &[(u32, Av1EncodingProfile)] =
-                &[(sys::MFX_PROFILE_AV1_MAIN, Av1EncodingProfile::Main)];
-            EncodingProfiles::Av1(match_profiles(&profile_ids, map))
-        }
+        VideoCodecType::H264 => EncodingProfiles::H264(
+            profile_ids
+                .into_iter()
+                .filter_map(H264Profile::from_mfx_profile)
+                .collect(),
+        ),
+        VideoCodecType::Hevc => EncodingProfiles::Hevc(
+            profile_ids
+                .into_iter()
+                .filter_map(HevcProfile::from_mfx_profile)
+                .collect(),
+        ),
+        VideoCodecType::Vp9 => EncodingProfiles::Vp9(
+            profile_ids
+                .into_iter()
+                .filter_map(Vp9Profile::from_mfx_profile)
+                .collect(),
+        ),
+        VideoCodecType::Av1 => EncodingProfiles::Av1(
+            profile_ids
+                .into_iter()
+                .filter_map(Av1Profile::from_mfx_profile)
+                .collect(),
+        ),
     }
-}
-
-/// プロファイル ID の一覧から既知のプロファイルをマッチさせる
-fn match_profiles<T: Copy>(profile_ids: &[u32], map: &[(u32, T)]) -> Vec<T> {
-    let mut profiles = Vec::new();
-    for &id in profile_ids {
-        for &(ref_id, profile) in map {
-            if id == ref_id {
-                profiles.push(profile);
-            }
-        }
-    }
-    profiles
 }

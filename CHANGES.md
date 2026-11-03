@@ -11,6 +11,11 @@
 
 ## develop
 
+- [CHANGE] プロファイル型とコーデック識別型を統合する
+  - `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` に統合する
+  - `EncodingProfiles` の各 variant が `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` の一覧を持つようになる
+  - `DecoderCodec` を削除し、`DecoderConfig` のコーデックを `VideoCodecType` で指定するよう変更する
+  - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon

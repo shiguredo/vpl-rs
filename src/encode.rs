@@ -2,62 +2,9 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
+use crate::codec_info::{Av1Profile, H264Profile, HevcProfile, Vp9Profile};
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
-
-/// H.264 プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H264Profile {
-    /// ベースラインプロファイル
-    Baseline,
-    /// Constrained ベースラインプロファイル
-    ConstrainedBaseline,
-    /// メインプロファイル
-    Main,
-    /// ハイプロファイル
-    High,
-    /// Constrained ハイプロファイル
-    ConstrainedHigh,
-    /// High 10 プロファイル（10bit）
-    High10,
-    /// High 4:2:2 プロファイル
-    High422,
-}
-
-/// HEVC プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HevcProfile {
-    /// メインプロファイル
-    Main,
-    /// Main 10 プロファイル（10bit）
-    Main10,
-    /// Main Still Picture プロファイル
-    MainSp,
-    /// Range Extension プロファイル
-    Rext,
-    /// Screen Content Coding プロファイル
-    Scc,
-}
-
-/// VP9 プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Vp9Profile {
-    /// Profile 0（8bit YUV 4:2:0）
-    Profile0,
-    /// Profile 1（8bit YUV 4:2:2 または 4:4:4）
-    Profile1,
-    /// Profile 2（10/12bit YUV 4:2:0）
-    Profile2,
-    /// Profile 3（10/12bit YUV 4:2:2 または 4:4:4）
-    Profile3,
-}
-
-/// AV1 プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Av1Profile {
-    /// メインプロファイル
-    Main,
-}
 
 /// H.264 エンコーダ固有の設定
 #[derive(Debug, Clone)]
@@ -1704,40 +1651,16 @@ fn codec_id(codec: &CodecConfig) -> u32 {
 }
 
 /// コーデックプロファイルを返す
+///
+/// プロファイル未指定の場合は MFX_PROFILE_UNKNOWN を返す。
 fn codec_profile(codec: &CodecConfig) -> u16 {
-    match codec {
-        CodecConfig::H264(c) => match c.profile {
-            Some(H264Profile::Baseline) => sys::MFX_PROFILE_AVC_BASELINE as u16,
-            Some(H264Profile::ConstrainedBaseline) => {
-                sys::MFX_PROFILE_AVC_CONSTRAINED_BASELINE as u16
-            }
-            Some(H264Profile::Main) => sys::MFX_PROFILE_AVC_MAIN as u16,
-            Some(H264Profile::High) => sys::MFX_PROFILE_AVC_HIGH as u16,
-            Some(H264Profile::ConstrainedHigh) => sys::MFX_PROFILE_AVC_CONSTRAINED_HIGH as u16,
-            Some(H264Profile::High10) => sys::MFX_PROFILE_AVC_HIGH10 as u16,
-            Some(H264Profile::High422) => sys::MFX_PROFILE_AVC_HIGH_422 as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-        CodecConfig::Hevc(c) => match c.profile {
-            Some(HevcProfile::Main) => sys::MFX_PROFILE_HEVC_MAIN as u16,
-            Some(HevcProfile::Main10) => sys::MFX_PROFILE_HEVC_MAIN10 as u16,
-            Some(HevcProfile::MainSp) => sys::MFX_PROFILE_HEVC_MAINSP as u16,
-            Some(HevcProfile::Rext) => sys::MFX_PROFILE_HEVC_REXT as u16,
-            Some(HevcProfile::Scc) => sys::MFX_PROFILE_HEVC_SCC as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-        CodecConfig::Vp9(c) => match c.profile {
-            Some(Vp9Profile::Profile0) => sys::MFX_PROFILE_VP9_0 as u16,
-            Some(Vp9Profile::Profile1) => sys::MFX_PROFILE_VP9_1 as u16,
-            Some(Vp9Profile::Profile2) => sys::MFX_PROFILE_VP9_2 as u16,
-            Some(Vp9Profile::Profile3) => sys::MFX_PROFILE_VP9_3 as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-        CodecConfig::Av1(c) => match c.profile {
-            Some(Av1Profile::Main) => sys::MFX_PROFILE_AV1_MAIN as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-    }
+    let profile = match codec {
+        CodecConfig::H264(config) => config.profile.map(H264Profile::to_mfx_profile),
+        CodecConfig::Hevc(config) => config.profile.map(HevcProfile::to_mfx_profile),
+        CodecConfig::Vp9(config) => config.profile.map(Vp9Profile::to_mfx_profile),
+        CodecConfig::Av1(config) => config.profile.map(Av1Profile::to_mfx_profile),
+    };
+    profile.map_or(sys::MFX_PROFILE_UNKNOWN as u16, |profile| profile as u16)
 }
 
 /// alignment の倍数に切り上げる

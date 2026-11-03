@@ -140,13 +140,13 @@ for _ in 0..2 {
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler,
-    list_adapters,
+    AdapterSelector, Decoder, DecoderConfig, DecodedFrame, Error, FnDecodeHandler,
+    VideoCodecType, list_adapters,
 };
 use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
-let config = DecoderConfig::new(adapter, DecoderCodec::H264);
+let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 
 let (tx, rx) = mpsc::channel();
 let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
@@ -186,12 +186,12 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 
 ### デコード
 
-| コーデック | `DecoderCodec` |
-|-----------|---------------|
-| H.264     | `DecoderCodec::H264` |
-| H.265     | `DecoderCodec::Hevc` |
-| VP9       | `DecoderCodec::Vp9` |
-| AV1       | `DecoderCodec::Av1` |
+| コーデック | `VideoCodecType` |
+|-----------|-----------------|
+| H.264     | `VideoCodecType::H264` |
+| H.265     | `VideoCodecType::Hevc` |
+| VP9       | `VideoCodecType::Vp9` |
+| AV1       | `VideoCodecType::Av1` |
 
 ## サポートフォーマット
 
