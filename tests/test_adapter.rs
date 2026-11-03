@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 use shiguredo_vpl::{
     AdapterSelector, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodedFrame, Encoder,
     EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat, H264EncoderConfig,

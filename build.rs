@@ -59,10 +59,21 @@ fn main() {
         return;
     }
 
-    // Linux のみ libvpl を CMake で static build してリンクする
-    if cfg!(target_os = "linux") {
+    // Linux x86_64 のみ libvpl を CMake で static build してリンクする
+    if is_target_linux_x86_64() {
         build_and_link_libvpl(&clone_dir);
     }
+}
+
+// ビルド対象が Linux x86_64 かどうかを返す
+//
+// build.rs はビルド対象ではなくホスト向けにコンパイルされるため、cfg! では
+// クロスビルド時にビルド対象を判定できない。Cargo が設定する環境変数を使う。
+fn is_target_linux_x86_64() -> bool {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
+    let target_arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
+    target_os == "linux" && target_arch == "x86_64"
 }
 
 // GitHub から libvpl ヘッダをクローンして api/ ディレクトリのパスを返す

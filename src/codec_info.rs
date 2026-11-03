@@ -1,6 +1,5 @@
 //! コーデック情報の照会
 
-#[cfg(target_os = "linux")]
 use crate::{AdapterSelector, Error, sys};
 
 /// コーデック種別
@@ -16,7 +15,6 @@ pub enum VideoCodecType {
     Av1,
 }
 
-#[cfg(target_os = "linux")]
 impl VideoCodecType {
     /// MFX CodecID に変換する
     fn to_codec_id(self) -> u32 {
@@ -143,7 +141,6 @@ pub enum Av1EncodingProfile {
 /// VPL ローダーで `mfxImplDescription.Impl = HW` と
 /// `mfxExtendedDeviceId.DRMRenderNodeNum` を絞り込み、対象アダプタの
 /// ハードウェア実装を照会して各コーデックのエンコード・デコード対応状況を返す。
-#[cfg(target_os = "linux")]
 pub fn supported_codecs(adapter: AdapterSelector) -> Result<Vec<CodecInfo>, Error> {
     adapter.validate()?;
     let AdapterSelector::DrmRenderNode(render_node) = adapter;
@@ -228,7 +225,6 @@ pub fn supported_codecs(adapter: AdapterSelector) -> Result<Vec<CodecInfo>, Erro
 }
 
 /// mfxImplDescription からコーデック情報の一覧を構築する
-#[cfg(target_os = "linux")]
 unsafe fn build_codec_info_list(desc: &sys::mfxImplDescription) -> Vec<CodecInfo> {
     VideoCodecType::all()
         .iter()
@@ -244,7 +240,6 @@ unsafe fn build_codec_info_list(desc: &sys::mfxImplDescription) -> Vec<CodecInfo
 ///
 /// VPL はハードウェアセッション前提の API であるため、
 /// supported と hardware_accelerated は同じ値になる。
-#[cfg(target_os = "linux")]
 unsafe fn probe_decoding(dec: &sys::mfxDecoderDescription, codec: VideoCodecType) -> DecodingInfo {
     let target_id = codec.to_codec_id();
     let num_codecs = dec.NumCodecs as usize;
@@ -273,7 +268,6 @@ unsafe fn probe_decoding(dec: &sys::mfxDecoderDescription, codec: VideoCodecType
 }
 
 /// mfxEncoderDescription からエンコード情報を判定する
-#[cfg(target_os = "linux")]
 unsafe fn probe_encoding(enc: &sys::mfxEncoderDescription, codec: VideoCodecType) -> EncodingInfo {
     let target_id = codec.to_codec_id();
     let num_codecs = enc.NumCodecs as usize;
@@ -317,7 +311,6 @@ unsafe fn probe_encoding(enc: &sys::mfxEncoderDescription, codec: VideoCodecType
 }
 
 /// エンコーダのプロファイル一覧を照会する
-#[cfg(target_os = "linux")]
 unsafe fn query_encoding_profiles(
     codec: VideoCodecType,
     entry: &sys::mfxEncoderDescription_encoder,
@@ -379,7 +372,6 @@ unsafe fn query_encoding_profiles(
 }
 
 /// プロファイル ID の一覧から既知のプロファイルをマッチさせる
-#[cfg(target_os = "linux")]
 fn match_profiles<T: Copy>(profile_ids: &[u32], map: &[(u32, T)]) -> Vec<T> {
     let mut profiles = Vec::new();
     for &id in profile_ids {
