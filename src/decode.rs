@@ -14,7 +14,6 @@ const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 /// デコードするビットストリームのコーデックと使用するアダプタを指定する。
 /// 解像度やフレームレートはビットストリームのヘッダから自動的に検出される。
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct DecoderConfig {
     /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
     pub adapter: AdapterSelector,
