@@ -750,6 +750,15 @@ pub struct Encoder<H: EncodeHandler> {
 unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 impl<H: EncodeHandler> Encoder<H> {
+    /// テスト用に VPL セッションを返す
+    ///
+    /// `MFXMemory_GetSurfaceForEncode` はエンコーダー初期化後のセッションでのみ
+    /// サーフェスを返すため、`FrameSurface` のテストはこのセッションを使う。
+    #[cfg(test)]
+    pub(crate) fn session_for_test(&self) -> &Session {
+        &self.session
+    }
+
     /// エンコーダを作成する
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
