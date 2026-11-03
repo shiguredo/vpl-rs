@@ -30,7 +30,7 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
 - `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `CodecInfo` / `DecodingInfo` / `EncodingInfo` / `EncodingProfiles`
 - `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `VideoParam` / `ExtParams` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
 - `vpl::gop_opt_flag` (定数モジュール) — `CLOSED` / `STRICT`
@@ -261,6 +261,13 @@ encoder.reconfigure(ReconfigureParams {
 
 - `Encoder::write_ivf_headers() -> bool` は VP9 の IVF ヘッダー出力設定を返す。 `Vp9EncoderConfig::write_ivf_headers` の要求値そのもの。
 - 初期化時に `mfxExtVP9Param::WriteIVFHeaders` の実効値を GetVideoParam で読み戻し、 要求値と一致しない場合はエラーを返す。 非 VP9 コーデックでは常に `false`。
+
+### 実効パラメータの取得 (`get_video_param`)
+
+- `Encoder::get_video_param() -> Result<VideoParam, Error>` は、基本パラメータと、要求した拡張バッファの実効値を返す。
+- 基本パラメータは VPL の生の `mfxVideoParam`。共用体メンバの読み出しには `unsafe` が要る。
+- 拡張バッファは `ExtParams` に `mfxExtCodingOption2` / `mfxExtCodingOption3` / `mfxExtVP9Param` の生の構造体として入る。要求していないバッファは `None`。
+- 値は要求値ではなく VPL が報告した実効値。VPL が書き戻さなかった場合はゼロ初期化された値のままになる。
 
 ### `Encoder::query` / 統計
 
