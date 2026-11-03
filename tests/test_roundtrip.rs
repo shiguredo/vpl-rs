@@ -3,10 +3,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use shiguredo_vpl::{
-    AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderCodec,
-    DecoderConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler,
-    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
-    PictureType, RateControlMode, ReconfigureParams, Vp9EncoderConfig, Vp9Profile, frame_type,
+    AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderConfig,
+    EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler,
+    FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType,
+    RateControlMode, ReconfigureParams, VideoCodecType, Vp9EncoderConfig, Vp9Profile, frame_type,
     list_adapters,
 };
 
@@ -228,7 +228,7 @@ fn encode_with_encoder(
 }
 
 /// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
-fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
+fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
     let num_frames = bitstreams.len();
     let config = DecoderConfig::new(test_adapter(), decoder_codec);
     let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
@@ -271,7 +271,7 @@ fn decode(decoder_codec: DecoderCodec, bitstreams: &[Vec<u8>]) -> Vec<DecodedFra
 /// エンコード→デコードのラウンドトリップを検証するヘルパー
 fn roundtrip(
     encoder_config: EncoderConfig,
-    decoder_codec: DecoderCodec,
+    decoder_codec: VideoCodecType,
     input_frames: &[Vec<u8>],
 ) -> (Vec<EncodedFrame<usize>>, Vec<DecodedFrameInfo>) {
     let width = encoder_config.width as usize;
@@ -331,7 +331,7 @@ fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
 /// 元の Y プレーンとの PSNR が min_psnr_db 以上であることを確認する。
 fn roundtrip_colorbar(
     encoder_config: EncoderConfig,
-    decoder_codec: DecoderCodec,
+    decoder_codec: VideoCodecType,
     num_frames: usize,
     min_psnr_db: f64,
 ) {
@@ -367,7 +367,7 @@ fn roundtrip_colorbar(
 /// デコードする。デコード結果のフレーム一覧を返す。
 fn roundtrip_b_frames(
     encoder_config: EncoderConfig,
-    decoder_codec: DecoderCodec,
+    decoder_codec: VideoCodecType,
     input_frames: &[Vec<u8>],
 ) -> Vec<DecodedFrameInfo> {
     let num_frames = input_frames.len();
@@ -534,7 +534,7 @@ fn test_roundtrip_h264_cbr() {
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
 
-    roundtrip_colorbar(config, DecoderCodec::H264, 30, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::H264, 30, 25.0);
 }
 
 /// H.264 CQP カラーバーのラウンドトリップ（PSNR 検証）
@@ -557,7 +557,7 @@ fn test_roundtrip_h264_cqp() {
     config.qpb = Some(30);
     config.gop_pic_size = Some(10);
 
-    roundtrip_colorbar(config, DecoderCodec::H264, 10, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::H264, 10, 25.0);
 }
 
 /// H.264 で IDR フレームを強制してラウンドトリップする
@@ -628,7 +628,7 @@ fn test_roundtrip_h264_force_idr() {
     );
 
     // デコードで復号できることを確認する
-    let decoded_frames = decode(DecoderCodec::H264, &bitstreams);
+    let decoded_frames = decode(VideoCodecType::H264, &bitstreams);
     assert_eq!(decoded_frames.len(), 15);
 
     // デコード結果の user_data が集合 {0..14} と過不足なく一致することを検証する。
@@ -683,7 +683,7 @@ fn test_roundtrip_h264_b_frame_user_data() {
         .map(|i| generate_dummy_nv12(width, height, width, height, i))
         .collect();
 
-    let decoded_frames = roundtrip_b_frames(config, DecoderCodec::H264, &input_frames);
+    let decoded_frames = roundtrip_b_frames(config, VideoCodecType::H264, &input_frames);
 
     assert_user_data_matches_input(&decoded_frames, &input_for_psnr, width, height);
 }
@@ -774,7 +774,7 @@ fn test_decode_user_data_callback() {
         .collect();
     let (_, bitstreams) = encode(config, &input_frames);
 
-    let decoder_config = DecoderConfig::new(test_adapter(), DecoderCodec::H264);
+    let decoder_config = DecoderConfig::new(test_adapter(), VideoCodecType::H264);
     let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
     let mut decoder = Decoder::new(
         decoder_config,
@@ -982,7 +982,7 @@ fn test_roundtrip_hevc_cbr() {
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
 
-    roundtrip_colorbar(config, DecoderCodec::Hevc, 30, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::Hevc, 30, 25.0);
 }
 
 /// H.265 CQP カラーバーのラウンドトリップ（PSNR 検証）
@@ -1005,7 +1005,7 @@ fn test_roundtrip_hevc_cqp() {
     config.qpb = Some(30);
     config.gop_pic_size = Some(10);
 
-    roundtrip_colorbar(config, DecoderCodec::Hevc, 10, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::Hevc, 10, 25.0);
 }
 
 /// B フレーム（2 枚）有りの H.265 ラウンドトリップで user_data 対応付けを検証する
@@ -1040,7 +1040,7 @@ fn test_roundtrip_hevc_b_frame_user_data() {
         .map(|i| generate_dummy_nv12(width, height, width, height, i))
         .collect();
 
-    let decoded_frames = roundtrip_b_frames(config, DecoderCodec::Hevc, &input_frames);
+    let decoded_frames = roundtrip_b_frames(config, VideoCodecType::Hevc, &input_frames);
 
     assert_user_data_matches_input(&decoded_frames, &input_for_psnr, width, height);
 }
@@ -1065,7 +1065,7 @@ fn test_roundtrip_av1_cbr() {
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
 
-    roundtrip_colorbar(config, DecoderCodec::Av1, 30, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::Av1, 30, 25.0);
 }
 
 /// AV1 CQP カラーバーのラウンドトリップ（PSNR 検証）
@@ -1088,7 +1088,7 @@ fn test_roundtrip_av1_cqp() {
     config.qpb = Some(30);
     config.gop_pic_size = Some(10);
 
-    roundtrip_colorbar(config, DecoderCodec::Av1, 10, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::Av1, 10, 25.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,7 +1186,7 @@ fn generate_dummy_frame(
 /// フレーム数が一致することを検証する。
 fn roundtrip_format(
     codec_config: CodecConfig,
-    decoder_codec: DecoderCodec,
+    decoder_codec: VideoCodecType,
     format: FrameFormat,
     num_frames: usize,
 ) {
@@ -1196,7 +1196,7 @@ fn roundtrip_format(
 /// フォーマット指定のラウンドトリップテストを実行するヘルパー（任意サイズ）
 fn roundtrip_format_with_size(
     codec_config: CodecConfig,
-    decoder_codec: DecoderCodec,
+    decoder_codec: VideoCodecType,
     format: FrameFormat,
     num_frames: usize,
     width: u32,
@@ -1263,7 +1263,7 @@ fn test_roundtrip_h264_bgra() {
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
-        DecoderCodec::H264,
+        VideoCodecType::H264,
         FrameFormat::Bgra,
         10,
     );
@@ -1290,7 +1290,7 @@ fn test_roundtrip_h264_nv12_alignment_mismatch() {
     assert_ne!(coded_width, config.width as usize);
     assert_ne!(coded_height, config.height as usize);
 
-    roundtrip_colorbar(config, DecoderCodec::H264, 10, 25.0);
+    roundtrip_colorbar(config, VideoCodecType::H264, 10, 25.0);
 }
 
 /// BGRA 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
@@ -1300,7 +1300,7 @@ fn test_roundtrip_h264_bgra_alignment_mismatch() {
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
-        DecoderCodec::H264,
+        VideoCodecType::H264,
         FrameFormat::Bgra,
         10,
         318,
@@ -1420,9 +1420,9 @@ fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
             .iter()
             .map(|bs| strip_vp9_ivf_headers(bs))
             .collect();
-        decode(DecoderCodec::Vp9, &stripped)
+        decode(VideoCodecType::Vp9, &stripped)
     } else {
-        decode(DecoderCodec::Vp9, &bitstreams)
+        decode(VideoCodecType::Vp9, &bitstreams)
     };
     assert_eq!(
         decoded_frames.len(),

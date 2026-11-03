@@ -28,9 +28,9 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 `src/lib.rs` から再エクスポートされる API:
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
-- `codec_info` — `VideoCodecType` / `CodecInfo` / `DecodingInfo` / `EncodingInfo` / 各コーデックプロファイル一覧型
-- `decode` — `Decoder<H>` / `DecoderConfig` / `DecoderCodec` / `DecodedFrame<'_, T>` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>` / 各プロファイル enum
+- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `CodecInfo` / `DecodingInfo` / `EncodingInfo` / `EncodingProfiles`
+- `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecodeHandler` / `FnDecodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
 - `vpl::gop_opt_flag` (定数モジュール) — `CLOSED` / `STRICT`
@@ -273,13 +273,13 @@ encoder.reconfigure(ReconfigureParams {
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler,
-    list_adapters,
+    AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler,
+    VideoCodecType, list_adapters,
 };
 use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
-let config = DecoderConfig::new(adapter, DecoderCodec::H264);
+let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 
 // DecodedFrame は借用ベース。コールバック内で Vec にコピーしてから外へ渡す
 let (tx, rx) = mpsc::channel();
@@ -345,7 +345,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 
 - `VideoCodecType::all()` (内部) で H.264 / HEVC / VP9 / AV1 を順に問い合わせて `CodecInfo` を組み立てる API がある。
 - `CodecInfo` は `decoding: DecodingInfo` / `encoding: EncodingInfo` を持つ。
-- `EncodingInfo` には `supports_frame_reordering` (B フレーム) / `supports_multi_pass` / コーデック別 `profiles: EncodingProfiles` が入る。
+- `EncodingInfo` には `supports_frame_reordering` (B フレーム) / `supports_multi_pass` / コーデック別 `profiles: EncodingProfiles` が入る。 `EncodingProfiles` の各 variant が持つプロファイル一覧は、 エンコーダ設定で使う `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` と同じ型。
 - 「このマシンで実際に何が動くか」を起動時に確認する用途。 ハードコードしたサポート表ではなく必ず実行時に取る。
 
 ## エラー型 (`Error`)

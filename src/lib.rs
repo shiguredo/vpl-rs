@@ -64,11 +64,11 @@
 //! # デコードの例
 //!
 //! ```no_run
-//! use shiguredo_vpl::{AdapterSelector, Decoder, DecoderConfig, DecoderCodec, DecodedFrame, Error, FnDecodeHandler, list_adapters};
+//! use shiguredo_vpl::{AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler, VideoCodecType, list_adapters};
 //! use std::sync::mpsc;
 //!
 //! let adapter = list_adapters().unwrap().into_iter().next().unwrap();
-//! let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(adapter.drm_render_node), DecoderCodec::H264);
+//! let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(adapter.drm_render_node), VideoCodecType::H264);
 //! let (tx, rx) = mpsc::channel();
 //! let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, ()>, Error>| {
 //!     // DecodedFrame は借用データを含むため、コールバック内でコピーする
@@ -104,14 +104,11 @@ pub mod ffi {
 
 pub use adapter::{AdapterInfo, AdapterSelector, MediaAdapterType, PciAddress, list_adapters};
 pub use codec_info::*;
-pub use decode::{
-    DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, FnDecodeHandler,
-};
+pub use decode::{DecodeHandler, DecodedFrame, Decoder, DecoderConfig, FnDecodeHandler};
 pub use encode::{
-    Av1EncoderConfig, Av1Profile, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
-    EncoderConfig, EncoderStats, FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile,
-    HevcEncoderConfig, HevcProfile, PictureType, RateControlMode, ReconfigureParams,
-    Vp9EncoderConfig, Vp9Profile,
+    Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
+    EncoderConfig, EncoderStats, FnEncodeHandler, FrameFormat, H264EncoderConfig,
+    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, Vp9EncoderConfig,
 };
 pub use error::Error;
 pub use vpl::{frame_type, gop_opt_flag};
