@@ -18,6 +18,7 @@ use std::ffi::CStr;
 
 use crate::Error;
 use crate::sys;
+use crate::vpl::{VplLibrary, VplLoader};
 
 /// `Encoder` / `Decoder` のセッションを開くときの対象アダプタ
 ///
@@ -97,28 +98,13 @@ pub struct AdapterInfo {
 /// 同一 DRM render node に対する重複エントリは除去し、`drm_render_node` 昇順で返す。
 /// HW 実装が見つからないことはエラーではなく、空の `Vec` を返す。
 ///
-/// 呼び出しごとに `MFXLoad` + 列挙 + `MFXUnload` を行う重い処理なので、
+/// 呼び出しごとに VPL の初期化と列挙を行う重い処理なので、
 /// 利用側はアプリ起動時に 1 回だけ呼んで結果を保持することを想定する。
 pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
-    let loader = unsafe { sys::MFXLoad() };
-    if loader.is_null() {
-        return Err(Error::new_custom("MFXLoad", "returned null"));
-    }
-    let loader_guard = LoaderGuard { loader };
+    let loader = VplLoader::new(VplLibrary::load()?)?;
+    loader.require_hardware()?;
 
-    // ハードウェア実装のみに絞る
-    let cfg = unsafe { sys::MFXCreateConfig(loader) };
-    if cfg.is_null() {
-        return Err(Error::new_custom("MFXCreateConfig", "returned null"));
-    }
-    let name = b"mfxImplDescription.Impl\0";
-    let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
-    variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
-    variant.Data.U32 = sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE;
-    let status = unsafe { sys::MFXSetConfigFilterProperty(cfg, name.as_ptr(), variant) };
-    if status != sys::mfxStatus_MFX_ERR_NONE {
-        return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
-    }
+    let raw_loader = unsafe { loader.as_ptr() };
 
     let mut adapters: Vec<AdapterInfo> = Vec::new();
     let mut i: sys::mfxU32 = 0;
@@ -127,7 +113,7 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
         let mut hdl: sys::mfxHDL = std::ptr::null_mut();
         let status = unsafe {
             sys::MFXEnumImplementations(
-                loader,
+                raw_loader,
                 i,
                 sys::mfxImplCapsDeliveryFormat_MFX_IMPLCAPS_IMPLDESCSTRUCTURE,
                 &mut hdl,
@@ -145,13 +131,16 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
                 "returned null handle for IMPLDESCSTRUCTURE",
             ));
         }
-        let desc_guard = HdlGuard { loader, hdl };
+        let desc_guard = HdlGuard {
+            loader: raw_loader,
+            hdl,
+        };
 
         // mfxExtendedDeviceId（DRMRenderNodeNum / PCI 情報 等）を取る
         let mut hdl_ext: sys::mfxHDL = std::ptr::null_mut();
         let ext_status = unsafe {
             sys::MFXEnumImplementations(
-                loader,
+                raw_loader,
                 i,
                 sys::mfxImplCapsDeliveryFormat_MFX_IMPLCAPS_DEVICE_ID_EXTENDED,
                 &mut hdl_ext,
@@ -167,7 +156,7 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
             return Err(Error::from_mfx(ext_status, "MFXEnumImplementations"));
         }
         let ext_guard = HdlGuard {
-            loader,
+            loader: raw_loader,
             hdl: hdl_ext,
         };
 
@@ -205,8 +194,6 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
         i += 1;
     }
 
-    drop(loader_guard);
-
     adapters.sort_by_key(|a| a.drm_render_node);
     Ok(adapters)
 }
@@ -235,17 +222,6 @@ fn c_array_to_string(arr: &[sys::mfxChar]) -> String {
     match CStr::from_bytes_until_nul(bytes) {
         Ok(cstr) => cstr.to_str().unwrap_or("").to_string(),
         Err(_) => std::str::from_utf8(bytes).unwrap_or("").to_string(),
-    }
-}
-
-/// `MFXUnload` を Drop で呼ぶガード
-struct LoaderGuard {
-    loader: sys::mfxLoader,
-}
-
-impl Drop for LoaderGuard {
-    fn drop(&mut self) {
-        unsafe { sys::MFXUnload(self.loader) };
     }
 }
 

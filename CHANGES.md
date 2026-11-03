@@ -32,6 +32,10 @@
 
 ### misc
 
+- [UPDATE] VPL ローダーの初期化処理を `VplLoader` に集約する
+  - セッション生成・アダプタ列挙・コーデック照会で重複していたローダーの生成とフィルタ設定を共通化する
+  - ローダーの解放を `VplLoader` の Drop に統一する
+  - @melpon
 - [UPDATE] Rust ツールチェーンを rust-version と同じ 1.93 に固定する
   - CI と devcontainer のツールチェーンも 1.93 に合わせる
   - @voluntas

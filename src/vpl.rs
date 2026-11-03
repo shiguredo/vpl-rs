@@ -48,79 +48,18 @@ impl VplLibrary {
         Ok(Self)
     }
 
-    /// API 2.x フローでローダーを作成しセッションを生成する
+    /// 指定アダプタのセッションを生成する
     ///
-    /// MFXLoad → MFXCreateConfig × 2 → MFXSetConfigFilterProperty × 2 → MFXCreateSession の順に
-    /// 呼び出す。HW 実装フィルタと DRM render node フィルタを別々の `mfxConfig` ハンドルに設定
-    /// するのは libvpl の慣用（ヘッダ `mfxdispatcher.h` の `MFX_ADD_PROPERTY_U32` マクロが
-    /// 1 プロパティ 1 cfg で組み立てるスタイル）に合わせるため。
-    ///
-    /// 成功時は Session を返す。Session の Drop で MFXClose + MFXUnload が自動実行される。
-    /// 指定の DRM render node に対応する Intel HW 実装が見つからない場合は libvpl の
-    /// `MFXCreateSession` が `MFX_ERR_NOT_FOUND` を返すため、エラーメッセージにその render
-    /// node 番号を含めて返す。
+    /// 成功時は `Session` を返す。
+    /// 指定の DRM render node に対応する Intel HW 実装が見つからない場合は `Error` を返す。
     pub(crate) fn create_session(&self, adapter: AdapterSelector) -> Result<Session, Error> {
         adapter.validate()?;
         let AdapterSelector::DrmRenderNode(render_node) = adapter;
 
-        // ローダーを作成する
-        let loader = unsafe { sys::MFXLoad() };
-        if loader.is_null() {
-            return Err(Error::new_custom("MFXLoad", "returned null"));
-        }
-
-        // 1 つ目の cfg: HW 実装フィルタ
-        let cfg_impl = unsafe { sys::MFXCreateConfig(loader) };
-        if cfg_impl.is_null() {
-            unsafe { sys::MFXUnload(loader) };
-            return Err(Error::new_custom("MFXCreateConfig", "returned null"));
-        }
-        let name = b"mfxImplDescription.Impl\0";
-        let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
-        variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
-        variant.Data.U32 = sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE;
-        let status = unsafe { sys::MFXSetConfigFilterProperty(cfg_impl, name.as_ptr(), variant) };
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            unsafe { sys::MFXUnload(loader) };
-            return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
-        }
-
-        // 2 つ目の cfg: DRM render node フィルタ
-        let cfg_drm = unsafe { sys::MFXCreateConfig(loader) };
-        if cfg_drm.is_null() {
-            unsafe { sys::MFXUnload(loader) };
-            return Err(Error::new_custom("MFXCreateConfig", "returned null"));
-        }
-        let drm_name = b"mfxExtendedDeviceId.DRMRenderNodeNum\0";
-        let mut drm_variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
-        drm_variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
-        drm_variant.Data.U32 = render_node;
-        let status =
-            unsafe { sys::MFXSetConfigFilterProperty(cfg_drm, drm_name.as_ptr(), drm_variant) };
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            unsafe { sys::MFXUnload(loader) };
-            return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
-        }
-
-        // フィルタを通過した実装（インデックス 0）でセッションを作成する
-        let mut session: sys::mfxSession = std::ptr::null_mut();
-        let status = unsafe { sys::MFXCreateSession(loader, 0, &mut session) };
-        if status != sys::mfxStatus_MFX_ERR_NONE {
-            unsafe { sys::MFXUnload(loader) };
-            let err = Error::from_mfx(status, "MFXCreateSession");
-            if status == sys::mfxStatus_MFX_ERR_NOT_FOUND {
-                return Err(err.with_message(format!(
-                    "no Intel HW implementation found for DRM render node {render_node}"
-                )));
-            }
-            return Err(err);
-        }
-
-        Ok(Session {
-            lib: *self,
-            loader,
-            session,
-        })
+        let mut loader = VplLoader::new(*self)?;
+        loader.require_hardware()?;
+        loader.require_drm_render_node(render_node)?;
+        loader.create_session()
     }
 
     /// MFXUnload を呼び出してローダーを破棄する
@@ -402,6 +341,147 @@ impl Drop for FrameSurface {
             self.lib.mfx_frame_surface_release(self.as_ptr()),
             "mfxFrameSurfaceInterface::Release",
         );
+    }
+}
+
+/// VPL ローダーの RAII ラッパー
+///
+/// ローダーを作成し、HW 実装フィルタと DRM render node フィルタを設定できる。
+/// `create_session` でセッションを生成するか、`as_ptr` で生のローダーハンドルを取得する。
+/// この型は Drop で `MFXUnload` によりローダーを解放する（`create_session` で `Session` に
+/// 所有権を渡した場合はそちらが解放する）。
+pub(crate) struct VplLoader {
+    lib: VplLibrary,
+    loader: sys::mfxLoader,
+    /// `require_drm_render_node` で設定した render node
+    ///
+    /// `create_session` が `MFX_ERR_NOT_FOUND` を返したときのメッセージに使う。
+    render_node: Option<u32>,
+    /// `create_session` でローダーの所有権を `Session` に渡したか
+    ///
+    /// true のときは Drop で `MFXUnload` を呼ばない。
+    consumed: bool,
+}
+
+impl VplLoader {
+    /// ローダーを作成する
+    ///
+    /// 作成に失敗した場合は `MFXLoad` を function に持つ `Error` を返す。
+    pub(crate) fn new(lib: VplLibrary) -> Result<Self, Error> {
+        let loader = unsafe { sys::MFXLoad() };
+        if loader.is_null() {
+            return Err(Error::new_custom("MFXLoad", "returned null"));
+        }
+        Ok(Self {
+            lib,
+            loader,
+            render_node: None,
+            consumed: false,
+        })
+    }
+
+    /// HW 実装のみを選択するフィルタを設定する
+    ///
+    /// 1 つのローダーに対して 1 回だけ呼び出すこと。複数回呼ぶとフィルタが重複する。
+    /// 設定に失敗した場合は `MFXCreateConfig` または `MFXSetConfigFilterProperty` を
+    /// function に持つ `Error` を返す。
+    pub(crate) fn require_hardware(&self) -> Result<(), Error> {
+        let cfg = unsafe { sys::MFXCreateConfig(self.loader) };
+        if cfg.is_null() {
+            return Err(Error::new_custom("MFXCreateConfig", "returned null"));
+        }
+        // libvpl の慣用に合わせ、プロパティごとに別の mfxConfig に設定する
+        // （ヘッダ mfxdispatcher.h の MFX_ADD_PROPERTY_U32 マクロが 1 プロパティ 1 cfg で
+        // 組み立てるスタイル）。
+        let name = b"mfxImplDescription.Impl\0";
+        let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
+        variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
+        variant.Data.U32 = sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE;
+        let status = unsafe { sys::MFXSetConfigFilterProperty(cfg, name.as_ptr(), variant) };
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
+        }
+        Ok(())
+    }
+
+    /// DRM render node を選択するフィルタを設定する
+    ///
+    /// 1 つのローダーに対して 1 回だけ呼び出すこと。複数回呼ぶとフィルタが重複する。
+    /// 設定に失敗した場合は `MFXCreateConfig` または `MFXSetConfigFilterProperty` を
+    /// function に持つ `Error` を返す。
+    pub(crate) fn require_drm_render_node(&mut self, render_node: u32) -> Result<(), Error> {
+        let cfg = unsafe { sys::MFXCreateConfig(self.loader) };
+        if cfg.is_null() {
+            return Err(Error::new_custom("MFXCreateConfig", "returned null"));
+        }
+        let name = b"mfxExtendedDeviceId.DRMRenderNodeNum\0";
+        let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
+        variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
+        variant.Data.U32 = render_node;
+        let status = unsafe { sys::MFXSetConfigFilterProperty(cfg, name.as_ptr(), variant) };
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
+        }
+        self.render_node = Some(render_node);
+        Ok(())
+    }
+
+    /// 設定済みのフィルタに合致する先頭の実装のセッションを生成する
+    ///
+    /// 成功した場合はローダーの所有権を `Session` に移す。失敗した場合はローダーを
+    /// 解放して `Err` を返す。
+    ///
+    /// セッションの作成に失敗した場合は `MFXCreateSession` を function に持つ `Error` を返す。
+    /// `MFX_ERR_NOT_FOUND` の場合は、`require_drm_render_node` で設定した render node 番号を
+    /// 含むメッセージにする。render node が未設定の場合は、その旨のメッセージにする。
+    pub(crate) fn create_session(mut self) -> Result<Session, Error> {
+        let mut session: sys::mfxSession = std::ptr::null_mut();
+        let status = unsafe { sys::MFXCreateSession(self.loader, 0, &mut session) };
+        if status != sys::mfxStatus_MFX_ERR_NONE {
+            let err = Error::from_mfx(status, "MFXCreateSession");
+            if status == sys::mfxStatus_MFX_ERR_NOT_FOUND {
+                let message = match self.render_node {
+                    Some(render_node) => Self::not_found_message(render_node),
+                    None => {
+                        "no Intel HW implementation found (DRM render node not set)".to_string()
+                    }
+                };
+                return Err(err.with_message(message));
+            }
+            return Err(err);
+        }
+
+        // ローダーの所有権を Session に移す。これを true にしないと Drop で
+        // 二重に MFXUnload してしまう。
+        self.consumed = true;
+        Ok(Session {
+            lib: self.lib,
+            loader: self.loader,
+            session,
+        })
+    }
+
+    /// render node 番号を含む「Intel HW 実装が見つからない」エラーのメッセージを返す
+    pub(crate) fn not_found_message(render_node: u32) -> String {
+        format!("no Intel HW implementation found for DRM render node {render_node}")
+    }
+
+    /// 生のローダーハンドルを返す
+    ///
+    /// # Safety
+    ///
+    /// 戻り値はこの `VplLoader` の生存期間内でのみ使用すること。
+    /// `VplLoader` の破棄後はハンドルが無効になるため、使用すると未定義動作になる。
+    pub(crate) unsafe fn as_ptr(&self) -> sys::mfxLoader {
+        self.loader
+    }
+}
+
+impl Drop for VplLoader {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.lib.mfx_unload(self.loader);
+        }
     }
 }
 
