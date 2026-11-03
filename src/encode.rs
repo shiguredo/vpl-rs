@@ -211,7 +211,6 @@ impl RateControlMode {
 /// VPL の mfxVideoParam / mfxInfoMFX / mfxFrameInfo に対応する。
 /// フィールド名は VPL API の構造体メンバ名に準拠する。
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct EncoderConfig {
     // --- アダプタ選択 ---
     /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
