@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-08-02
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-03
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-get-video-param-ext-param
 - Polished: {YYYY-MM-DD}
@@ -33,8 +33,38 @@
 
 ## 解決方法
 
-- `src/encode.rs` の `get_video_param()` を拡張するか、新規メソッドを追加する。
-- 拡張パラメータを `ExtParam` として渡す際は、`mfxExtCodingOption2` / `mfxExtCodingOption3` の `Header` 設定（`MFX_EXTBUFF_CODING_OPTION2` / `MFX_EXTBUFF_CODING_OPTION3`）を正しく初期化する。
+`Encoder::get_video_param()` の戻り値を `VideoParam` に変更し、要求した拡張バッファの実効値を `ExtParams` として返すようにした。
+
+### 変更内容
+
+#### `src/encode.rs`
+
+- `VideoParam` を追加した。基本パラメータの `mfxVideoParam` と、拡張バッファの実効値を持つ `ExtParams` を保持する
+- `ExtParams` を追加した。`mfxExtCodingOption2` / `mfxExtCodingOption3` / `mfxExtVP9Param` を、要求した場合のみ `Some` で保持する
+- `get_video_param()` は、要求したバッファと同じ種類のゼロ初期化バッファを構築して `ExtParam` として attach し、`MFXVideoENCODE_GetVideoParam` を呼ぶようにした
+- 読み戻し用のバッファは、保持している要求値のバッファと分けた。要求値のバッファを読み戻し先に使うと、要求値が実効値で上書きされ、以降の `Reset` が要求値ではなくなる
+- `ExtParam` は VPL 呼び出しの直後に、成否にかかわらず必ずクリアする
+- `Header` の初期化を `coding_option2()` / `coding_option3()` / `vp9_param()` に切り出し、要求時と読み戻し時で共用するようにした
+
+#### テスト
+
+- `read_coding_option_ext_params()` から private フィールドへのアクセスを削除し、公開 API だけで読み戻すようにした
+- GPU を必要としない単体テストを 3 件追加した。読み戻し用バッファの `Header` と値、要求していないバッファを構築しないこと、`ExtParams` への取り出しを検証する
+
+#### ドキュメント
+
+- `CHANGES.md` の `## develop` に追記した。戻り値の型変更は後方互換がないため、完了条件の `[ADD]` ではなく `[CHANGE]` とした
+- `skills/shiguredo-vpl/SKILL.md` の公開 API 一覧と説明を更新した
+
+### 確認
+
+Intel GPU 実機で以下を実行し、すべて成功した。
+
+- `cargo fmt --all --check`
+- `INTEL_VPL=1 cargo clippy --workspace --all-targets -- -D warnings`
+- `INTEL_VPL=1 cargo test --workspace -- --test-threads=1 --nocapture`
+
+`reconfigure_preserves_coding_option_ext_params` が公開 API 経由で成功することを確認した。
 
 ## 参考
 
