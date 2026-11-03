@@ -83,6 +83,11 @@
 //! let (y, _pitch, _width, _height) = rx.recv().unwrap().unwrap();
 //! ```
 
+// Linux x86_64 以外では libvpl をビルド・リンクできないため、対応外のターゲットではコンパイル時点で拒否する。
+// 対応ターゲットの判定はこの compile_error! に集約し、モジュールや項目ごとの cfg は付けない。
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!("shiguredo_vpl requires Linux x86_64. Other targets are not supported.");
+
 mod adapter;
 mod codec_info;
 mod decode;

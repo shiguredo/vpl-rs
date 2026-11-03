@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/fix-non-linux-cfg-guard-inconsistency
 - Polished: 2026-08-02
@@ -98,18 +99,20 @@ CI の `docs-rs` ジョブ（ubuntu-24.04、ネットワークあり）は `DOCS
 以下すべてを満たす。
 
 1. `src/lib.rs` の先頭（ドキュメントコメント直後、`mod` 宣言の前）に `#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))] compile_error!(...)` を追加する。
-2. `src/adapter.rs` の非 Linux 版 `list_adapters`（空 `Vec` を返す実装）を削除し、`src/lib.rs` の `pub use adapter::{..., list_adapters}` の `list_adapters` を `#[cfg(target_os = "linux")]` で分岐する（非 Linux で `unresolved import` の二次エラーが出ないようにする）。
-3. `build.rs` の libvpl ビルド分岐を `cfg!(target_os = "linux")` から `cfg!(all(target_os = "linux", target_arch = "x86_64"))` に変更する（aarch64 Linux で compile_error! より先に CMake ビルド失敗の panic が出ないようにする）。
-4. 非 Linux 環境（例: macOS）で `cargo build` と `cargo test --no-run` を実行し、`compile_error!` のメッセージで失敗し、リンカ未解決シンボルエラーが出ないことを確認する（CI は全ジョブ Linux のため手動確認）。なお、`cargo test --no-run` では、0023 適用前は `frame_surface_gpu_required`（`src/vpl.rs` のテストモジュール）の `crate::list_adapters()` 参照由来の `E0425`（cannot find function `list_adapters`）が `compile_error!` と同時に報告される。これは 0023 が `#[cfg(intel_vpl)]` を付与することで解消される（本 issue のスコープ外）。
+2. `src/adapter.rs` の非 Linux 版 `list_adapters`（空 `Vec` を返す実装）を削除する。`list_adapters` は全ターゲットで定義し、モジュールや項目ごとの `#[cfg(target_os = "linux")]` は付けない（プラットフォーム判定は完了条件 1 の `compile_error!` に集約する）。
+3. `build.rs` でビルド対象が Linux x86_64 でない場合に libvpl の CMake ビルド・リンクをスキップする（`CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ARCH` で判定する）。
+4. 非 Linux ターゲットへのクロスビルドで `cargo build` と `cargo test --no-run` を実行し、`compile_error!` のみで失敗し、リンカ未解決シンボルエラーが出ないことを確認する（Windows ターゲットと aarch64 Linux ターゲットで確認済み）。
 5. `skills/shiguredo-vpl/SKILL.md` の「動作 OS の制約」（「macOS / Windows でビルドできるとしても `list_adapters()` は空を返し」等）、「Linux 以外では `list_adapters()` は常に空 `Vec` を返す」、および「docs.rs 向けに `DOCS_RS=1 cargo doc --no-deps` で libvpl なしでもドキュメントだけは生成できる」（非 Linux では compile_error! で拒否されるため「Linux 上で」に限定）の記述を更新する。`README.md` の「libvpl がない環境では、docs.rs 向けのドキュメント生成のみ可能です。」（`DOCS_RS=1 cargo doc --no-deps` の手順）にも同じ「Linux 上で」の限定を適用する。
 6. CI の `docs-rs` ジョブ（`DOCS_RS=1`）が Linux 上で通ることを確認する。
 7. `CHANGES.md` の `## develop` に `[FIX]` として追記する（非 Linux で `compile_error!` によりビルドを拒否する / 非 Linux 版 `list_adapters` を削除する。非 Linux では `cargo build` が新たに失敗するようになるが、Linux 利用者には影響がなく誤誘導の修正であるため `[FIX]` で扱う）。
 
 ## 影響範囲
 
-- `src/lib.rs`（`compile_error!` 追加、`pub use` の `list_adapters` を cfg 分岐）
-- `src/adapter.rs`（非 Linux 版 `list_adapters` 削除）
-- `build.rs`（libvpl ビルド分岐を `cfg!(all(target_os = "linux", target_arch = "x86_64"))` に変更）
+- `src/lib.rs`（`compile_error!` 追加、`list_adapters` を cfg 分岐しない形に変更）
+- `src/adapter.rs`（非 Linux 版 `list_adapters` 削除、`target_os` cfg 削除）
+- `src/codec_info.rs`（`target_os` cfg 削除）
+- `tests/test_adapter.rs` / `tests/test_roundtrip.rs`（クレート全体の `target_os` cfg 削除）
+- `build.rs`（ビルド対象の判定を `CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ARCH` に変更）
 - `skills/shiguredo-vpl/SKILL.md`（動作 OS の制約の記述更新）
 - `README.md`（docs.rs 向けビルド記述の「Linux 上で」限定）
 - `CHANGES.md`
@@ -120,3 +123,39 @@ CI の `docs-rs` ジョブ（ubuntu-24.04、ネットワークあり）は `DOCS
 - 関連 issue 0018（コーデック識別型の統合。本 issue が先に適用されれば非 Linux は到達不能になり、0018 の非 Linux 向け `to_codec_id()` の検討は不要になる）
 - 関連 issue 0019（VPL ローダー初期化シーケンスの `LoaderBuilder` 化。同じ `src/adapter.rs` を書き換えるため、適用順序に注意）
 - 関連 issue 0023（silent pass テストの修正。0023 は GPU なし環境でのビルド可能性を前提とした記述を含むため、本 issue 適用後は非 Linux ビルド自体が拒否される前提に変わる）
+
+## 解決方法
+
+`src/lib.rs` のクレートルートに `compile_error!` を追加し、Linux x86_64 以外のターゲットでは libvpl のリンカエラーではなく、意図が明確なコンパイルエラーでビルドを拒否するようにした。あわせて、プラットフォーム判定を `compile_error!` に集約し、モジュールや項目ごとの `#[cfg(target_os = "linux")]` を削除した。
+
+### 変更内容
+
+#### `src/lib.rs`
+
+- `#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]` 付きの `compile_error!("shiguredo_vpl requires Linux x86_64. Other targets are not supported.");` を追加した。
+- `list_adapters` の再エクスポートを cfg 分岐せず、通常の `pub use` に戻した。完了条件 2 の `pub use` の cfg 分岐は、cfg を全廃する方針に変更したため実施していない。
+- プラットフォーム判定をこの `compile_error!` に集約し、モジュールや項目ごとの cfg は付けない方針をコメントに明記した。
+
+#### `src/adapter.rs` / `src/codec_info.rs` / `tests/*.rs`
+
+- 非 Linux で空 `Vec` を返していた `list_adapters` を削除した。
+- `src/adapter.rs` と `src/codec_info.rs` の `#[cfg(target_os = "linux")]`、`tests/test_adapter.rs` と `tests/test_roundtrip.rs` の `#![cfg(target_os = "linux")]` を削除した。テスト用の `#[cfg(test)]` と `#[cfg(intel_vpl)]` は維持している。
+- これにより、今回確認した Windows ターゲットと aarch64 Linux ターゲットへのクロスビルドでは、全モジュールが型検査されたうえで `compile_error!` のみが報告される。`src/vpl.rs` の `frame_surface_gpu_required` 由来の E0425 / E0282 も発生しない。
+
+#### `build.rs`
+
+- libvpl の CMake static build とリンクを Linux x86_64 のみに限定した。
+- build script はホスト向けにコンパイルされるため `cfg!` ではクロスビルド時のビルド対象を判定できない。`CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ARCH` を使い、ビルド対象が Linux x86_64 のときだけ libvpl をビルドするようにした。
+
+#### ドキュメントと変更履歴
+
+- `README.md` の docs.rs 向けビルドを Linux (x86_64) 上での手順に限定した。
+- `skills/shiguredo-vpl/SKILL.md` の「Linux 以外では `list_adapters()` は常に空 `Vec` を返す」という記述を削除し、Linux x86_64 専用であることと docs.rs ビルドの制約を更新した。
+- `CHANGES.md` の `## develop` に `[FIX]` として追記した。
+
+### 検証
+
+- `cargo build --target x86_64-pc-windows-gnu` と `cargo build --target aarch64-unknown-linux-gnu` が `compile_error!` のみで失敗し、リンカの未解決シンボルエラーが出ないことを確認した。
+- `cargo test --no-run --target x86_64-pc-windows-gnu` も `compile_error!` のみで失敗することを確認した。
+- Intel GPU 搭載の Linux x86_64 環境で `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` が通ることを確認した。
+- `DOCS_RS=1 cargo doc --no-deps`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all --check` が通ることを確認した。
