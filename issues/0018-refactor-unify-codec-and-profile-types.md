@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/refactor-unify-codec-and-profile-types
 - Polished: 2026-08-02
@@ -150,3 +151,23 @@ variant は 7 個全て同一。同様に HEVC (5 variants) / VP9 (4 variants) /
 - 関連 issue: 0020（encode.rs のサブモジュール分割。**本 issue を先に適用し、その差分の上に 0020 の変更を重ねる**。0020 適用後はプロファイル型は `src/encode/config.rs` に置かれる）
 - 関連 issue: 0008（Decoder の user_data 対応付け変更。`DecoderCodec` 型自体には触れないが、同じ `src/decode.rs` の `Decoder` 構造体と `tests/test_roundtrip.rs` の `decode()` ヘルパーを編集する（0008 は `frame_count` 追加とヘルパー拡張、本 issue は `codec` フィールドの型変更と引数型変更）。編集箇所が異なるため実質的な衝突リスクは低い。**適用順序は本 issue (0018) を先に適用する**）
 - 関連 issue: 0019（VPL ローダーの `LoaderBuilder` 化。同じ `src/codec_info.rs` を編集する（0019 は `supported_codecs`、本 issue は `query_encoding_profiles` / `match_profiles`）ため、適用順序に注意）
+
+## 解決方法
+
+当初の設計方針ではプロファイル型を `src/encode.rs` に残すとしていたが、共通型をエンコーダーモジュールに置くと `codec_info` が `encode` に依存する形になり、責務と依存方向が逆転するため、`src/codec_info.rs` を定義元に変更した。本セクションが「プロファイル型の所属モジュール」の記述を置き換える。
+
+### 変更内容
+
+- `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` に統合した
+- プロファイル型と `MFX_PROFILE_*` の写像を `src/codec_info.rs` に置き、`to_mfx_profile()` / `from_mfx_profile()` として実装した
+- `codec_profile()` は `to_mfx_profile()` の戻り値を `u16` にキャストして返し、プロファイル未指定時は `MFX_PROFILE_UNKNOWN` を返す
+- `query_encoding_profiles()` は `from_mfx_profile()` と `filter_map` を使い、未知のプロファイル ID をスキップする
+- `DecoderCodec` を削除し、`DecoderConfig::codec` と `Decoder` のコーデックを `VideoCodecType` に変更した
+- `VideoCodecType::to_codec_id()` は `Decoder::initialize` から呼ぶため `pub(crate)` に変更した。非 Linux 向けゲートは、対応ターゲット外を `compile_error!` で拒否する方針により既に存在しない
+- `src/lib.rs` の再エクスポート、`tests/test_roundtrip.rs` / `tests/test_adapter.rs`、`README.md`、`skills/shiguredo-vpl/SKILL.md` を新型に追随させた
+- `CHANGES.md` の `## develop` に `[CHANGE]` として追記した
+
+### 検証
+
+- Intel GPU 搭載の Linux x86_64 環境 (GMKtec K9 / iHD 1.22) で `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` が成功した
+- 単体テスト 14 件、`tests/test_adapter.rs` 5 件、`tests/test_roundtrip.rs` 21 件、doctest 2 件がすべて pass した
