@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/fix-ci-run-cargo-test-in-non-gpu-job
 - Polished: 2026-08-02
@@ -137,3 +138,16 @@ Linux ホストで GPU なしでもコンパイル・実行できるテストは
 
 - CLAUDE.md「Don't live with broken windows」「If it hurts, do it more often」
 - 関連 issue: 0023（silent pass テスト）、0021（PBT/Fuzz と workspace 構成。`cargo test -p pbt` の CI 実行を本 issue へ依頼している）
+
+## 解決方法
+
+クローズする。GPU を必要としないテストを GPU 無しの `ci` ジョブで実行する前提を採らない。
+
+理由:
+
+- 実機ランナーが停止した場合、`test-intel-vpl` を required check にしていれば PR は赤になり、GitHub-hosted ランナーで GPU 非依存テストを回してもマージ可否は変わらない。required check にしていないなら、そもそも GPU ジョブが赤でもマージする運用であり、それは本 issue が解消しようとしていた「人力判断」そのものである。
+- GPU 非依存テストは VPL の実挙動を検証しない。Rust 側のロジック（pending store、worker の状態遷移、エラー整形など）のテストであり、VPL 統合の回帰検知にはならない。
+- 本 issue を適用しても `test-intel-vpl` は `cargo test --workspace` を実行し続けるため、実機ランナーの順番待ちは変わらない。
+- 以上から、cfg によるテスト分類と CI ステップの追加に見合う便益がないと判断した。テストは `test-intel-vpl` に一本化する。
+- silent pass を排除する issue 0023 は本 issue とは独立して必要である。
+- 段階 2 の issue 0024 も同じ理由でクローズする。
