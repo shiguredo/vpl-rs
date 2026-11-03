@@ -16,6 +16,9 @@
   - `EncodingProfiles` の各 variant が `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` の一覧を持つようになる
   - `DecoderCodec` を削除し、`DecoderConfig` のコーデックを `VideoCodecType` で指定するよう変更する
   - @melpon
+- [CHANGE] `Encoder::get_video_param` の戻り値を `VideoParam` に変更する
+  - 要求した拡張バッファの実効値を `ExtParams` として返す
+  - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon
