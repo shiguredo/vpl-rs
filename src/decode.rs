@@ -2,35 +2,12 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
+use crate::codec_info::VideoCodecType;
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
 
 /// デバイスビジー時の最大リトライ回数
 const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
-
-/// デコーダ用コーデック識別子
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecoderCodec {
-    /// H.264/AVC
-    H264,
-    /// H.265/HEVC
-    Hevc,
-    /// VP9
-    Vp9,
-    /// AV1
-    Av1,
-}
-
-impl DecoderCodec {
-    fn codec_id(self) -> u32 {
-        match self {
-            DecoderCodec::H264 => sys::MFX_CODEC_AVC,
-            DecoderCodec::Hevc => sys::MFX_CODEC_HEVC,
-            DecoderCodec::Vp9 => sys::MFX_CODEC_VP9,
-            DecoderCodec::Av1 => sys::MFX_CODEC_AV1,
-        }
-    }
-}
 
 /// デコーダの設定
 ///
@@ -42,7 +19,7 @@ pub struct DecoderConfig {
     /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
     pub adapter: AdapterSelector,
     /// コーデック識別子
-    pub codec: DecoderCodec,
+    pub codec: VideoCodecType,
     /// 非同期深度（mfxVideoParam.AsyncDepth）
     ///
     /// 1 = 最小メモリだが性能が低い。4 = 高スループット寄りの推奨値。
@@ -54,7 +31,7 @@ impl DecoderConfig {
     /// 必須パラメータのみ指定して DecoderConfig を作成する
     ///
     /// オプションパラメータはすべて None (デコーダのデフォルト) に設定される。
-    pub fn new(adapter: AdapterSelector, codec: DecoderCodec) -> Self {
+    pub fn new(adapter: AdapterSelector, codec: VideoCodecType) -> Self {
         Self {
             adapter,
             codec,
@@ -216,7 +193,7 @@ where
 /// `Send` のみ実装し、`Sync` は実装しない（生ポインタにより自動的に `!Sync`）。
 pub struct Decoder<H: DecodeHandler> {
     session: Session,
-    codec: DecoderCodec,
+    codec: VideoCodecType,
     /// mfxVideoParam.AsyncDepth に設定する値
     async_depth: u16,
     /// DecodeHeader + Init が完了しているか
@@ -336,7 +313,7 @@ impl<H: DecodeHandler> Decoder<H> {
     /// AsyncDepth は設定値またはデフォルト 4 を使用する。
     /// libvpl のガイドでは、1 は最小メモリだが性能が低く、4 は高スループット寄りの推奨値とされる。
     fn initialize(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
-        let codec_id = self.codec.codec_id();
+        let codec_id = self.codec.to_codec_id();
 
         // デコーダパラメータを設定する
         let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };

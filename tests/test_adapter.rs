@@ -1,7 +1,7 @@
 use shiguredo_vpl::{
-    AdapterSelector, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodedFrame, Encoder,
-    EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat, H264EncoderConfig,
-    RateControlMode, list_adapters, supported_codecs,
+    AdapterSelector, CodecConfig, Decoder, DecoderConfig, EncodedFrame, Encoder, EncoderConfig,
+    Error, FnDecodeHandler, FnEncodeHandler, FrameFormat, H264EncoderConfig, RateControlMode,
+    VideoCodecType, list_adapters, supported_codecs,
 };
 
 /// `Encoder` / `Decoder` は `Debug` を実装しないため、`expect_err` の代わりにこのヘルパーで
@@ -71,7 +71,7 @@ fn test_encoder_rejects_render_node_zero() {
 /// `AdapterSelector::DrmRenderNode(0)` を Decoder::new に渡すと Err になる
 #[test]
 fn test_decoder_rejects_render_node_zero() {
-    let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(0), DecoderCodec::H264);
+    let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(0), VideoCodecType::H264);
     let err = into_err(
         Decoder::new(
             config,
@@ -165,7 +165,7 @@ fn test_real_adapter_session() {
     };
 
     // Decoder を作って即破棄する
-    let decoder_config = DecoderConfig::new(adapter, DecoderCodec::H264);
+    let decoder_config = DecoderConfig::new(adapter, VideoCodecType::H264);
     let _decoder = match Decoder::new(
         decoder_config,
         FnDecodeHandler::new(|_: Result<shiguredo_vpl::DecodedFrame<()>, Error>| {}),
