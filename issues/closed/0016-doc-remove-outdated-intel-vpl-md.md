@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/update-remove-outdated-intel-vpl-md
 - Polished: 2026-08-02
@@ -83,3 +84,22 @@ Medium。以下による。
 - 代替: `skills/shiguredo-vpl/SKILL.md`
 - CHANGES.md の 2026.3.0 エントリ（リファクタ内容）
 - 関連 issue: 0017（README.md の入力フォーマット記述の齟齬修正。0017 は「docs/INTEL_VPL.md は別 issue（0016）で削除する」と本 issue を参照している。適用順序の競合はなく独立して適用可能）
+
+## 解決方法
+
+`docs/INTEL_VPL.md` を削除し、空になった `docs/` ディレクトリも削除した。実装の現状は `skills/shiguredo-vpl/SKILL.md` を正とする。
+
+### 変更内容
+
+- `docs/INTEL_VPL.md` を削除した。
+- `docs/` ディレクトリが空になったため、ディレクトリごと削除した。
+- `issues/` を除くリポジトリ全体で `docs/INTEL_VPL.md` への参照が残っていないことを確認した。残存する `INTEL_VPL` は環境変数 `INTEL_VPL=1` の使用箇所のみである。
+- `Cargo.toml` の `include` は `docs/` を含まないため変更していない。
+- Markdown ファイルの変更は変更履歴に反映しない規約に従い、`CHANGES.md` は変更していない。
+- `skills/shiguredo-vpl/SKILL.md` は既に実装に追随しているため変更していない。
+
+### 検証
+
+- `cargo fmt --all -- --check` が通ることを確認した。
+- `cargo clippy --workspace --all-targets -- -D warnings` が通ることを確認した。
+- `cargo test --workspace` は lib 14 件と adapter 5 件が成功した。`tests/test_roundtrip.rs` の 21 件は Intel HW アダプタが見つからないため失敗したが、この環境に Intel GPU がないことによるものであり、Markdown ファイルの削除とは無関係である。
