@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-08-02
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-03
 - Model: DeepSeek V4 Flash
 - Branch: feature/fix-ci-run-full-cargo-test-in-non-gpu-job
 - Polished: {YYYY-MM-DD}
@@ -33,11 +33,23 @@
 3. `tests/test_adapter.rs` の GPU 非依存テスト 4 件が `ci` ジョブで実行される。
 4. `CHANGES.md` の `## develop` の `### misc` サブセクションに `[ADD]` として追記する（CI の変更はライブラリ機能に直接影響しないため）。
 
-## 解決方法
+## 実装案（不採用）
 
 - `tests/test_roundtrip.rs` の全テスト関数に `#[cfg(intel_vpl)]` を付与する。
 - `ci` ジョブの `cargo test` 実行ステップを変更する。
 - `test-intel-vpl` ジョブの `cargo test --workspace -- --test-threads=1 --nocapture` は従来どおり実機テストを含めて実行する（変更不要）。
+
+## 解決方法
+
+クローズする。前提とする issue 0022 をクローズしたため、本 issue もクローズする。
+
+理由:
+
+- 本 issue は 0022 の段階 2 であり、`tests/` 込みの `cargo test` を GPU 無しの `ci` ジョブで実行する前提を採らない。
+- 実機ランナーが停止した場合、`test-intel-vpl` を required check にしていれば PR は赤になり、hosted の成否でマージ可否は変わらない。required check にしていないなら、GPU ジョブが赤でもマージする運用であり、それは 0022 が解消しようとしていた人力判断そのものである。
+- GPU 非依存テストは VPL の実挙動を検証しない。Rust 側ロジックのテストであり、VPL 統合の回帰検知にはならない。
+- 本 issue を適用しても `test-intel-vpl` は `cargo test --workspace` を実行し続けるため、実機ランナーの順番待ちは変わらない。
+- 以上から、テストは `test-intel-vpl` に一本化する。
 
 ## 参考
 
