@@ -8,7 +8,7 @@
 
 ## 目的
 
-以下 2 件のテストは、実機 GPU なし / アダプタ未検出 / API 失敗のいずれかで **silent に早期 return または空 `Vec` 自動パス** し、テスト成功扱いになる。テストとして機能しておらず、リグレッションを検知できない。実機必須テストと GPU 非依存テストを整理し、silent skip を排除する。
+以下 2 件のテストは、実機 GPU なし / アダプタ未検出 / API 失敗のいずれかで **silent に早期 return または空 `Vec` 自動パス** し、テスト成功扱いになる。テストとして機能しておらず、リグレッションを検知できない。silent skip を排除する。GPU 無し環境での pass は目的としない（GPU が無ければエラーでよい）。
 
 - `src/vpl.rs` の `frame_surface_gpu_required`
 - `tests/test_adapter.rs` の `test_list_adapters_sorted_and_deduped`
@@ -18,9 +18,9 @@
 High。以下による。
 
 - **テストが機能していない**: リグレッションを検知できない状態は「テストがある」以上に危険。「pass しているから安心」の錯覚を生む。
-- **偽陽性の温床**: issue 0022 で `ci` ジョブに `cargo test --lib` を追加すると、`frame_surface_gpu_required` が GPU なし Ubuntu で自動 pass しつつ「テストを走らせた」実績を作ってしまう。
+- **silent skip は方針に反する**: GPU が無ければエラーでよい方針なので、GPU なしで成功扱いになる early return は不要。
 - **CLAUDE.md 規約違反**: 「一切妥協しない」観点で、silent skip は妥協そのもの。
-- **修正コスト小**: cfg ガードの追加と assert の書き足し。
+- **修正コスト小**: silent return の削除と assert の書き足し。
 
 ## 現状
 
@@ -66,10 +66,9 @@ fn frame_surface_gpu_required() {
 
 問題:
 
-1. `#[cfg(intel_vpl)]` ガードなしでビルドされる（GPU なし環境でも実行される）
-2. `list_adapters` Err / 空 / `create_session` Err / `mfx_memory_get_surface_for_encode` Err のいずれでも silent return
-3. 5 個の検証シナリオを 1 個の `#[test]` に詰めており、途中でスキップされると残りが実行されない
-4. どこで止まったか / なぜ止まったかがログに残らない
+1. `list_adapters` Err / 空 / `create_session` Err / `mfx_memory_get_surface_for_encode` Err のいずれでも silent return し、テスト成功扱いになる
+2. どの前提が満たされなかったのかがログに残らない
+3. `MFXMemory_GetSurfaceForEncode` はエンコーダー初期化後のセッションでのみサーフェスを返すため、`create_session()` だけの現在のセットアップでは最初の surface 取得で `MFX_ERR_NOT_FOUND` になり、silent return していた（実機検証で確認）
 
 ### `test_list_adapters_sorted_and_deduped` の空 `Vec` 自動パス
 
@@ -102,39 +101,30 @@ fn test_list_adapters_sorted_and_deduped() {
 
 ### `frame_surface_gpu_required` の修正
 
-以下いずれか。
-
-#### 案 A: `#[cfg(intel_vpl)]` を付与し 5 シナリオに分割（推奨）
+#### 案 A: 1 テストのまま assert に置き換える（推奨）
 
 - `frame_surface_gpu_required` は `src/vpl.rs` 内に留める（`VplLibrary` / `FrameSurface` / `Session` は `pub(crate)` であり `tests/` からはアクセス不能）。
-- 5 個の分割後テスト関数 **それぞれ** に `#[cfg(intel_vpl)]` を付けて、`INTEL_VPL=1` のときのみコンパイル/実行されるようにする（`mod tests` 全体に付けると GPU 不要の `frame_surface_new_rejects_null` まで巻き込むため、関数単位で付与する）。共通セットアップヘルパーにも `#[cfg(intel_vpl)]` を付与する（無ガードだと GPU なしビルドで未使用になり `dead_code` 警告 → pre-commit の clippy `-D warnings` が失敗する。またヘルパーが `crate::list_adapters()` を呼ぶため、issue 0015 の E0425 解消の前提とも整合しない）。
-- 元の `frame_surface_gpu_required` 関数は削除し、5 個の検証シナリオを個別の `#[test]` 関数に分割する（各シナリオ独立）。
-- silent early-return を全て削除し、前提が満たされないなら `assert!` で明示失敗させる。分割後も `test-intel-vpl` ジョブが `--test-threads=1` で実行する事実は変わらないが、各テストが独立した `Session` を張るため直列実行に依存しない（共通セットアップヘルパーはアダプタ列挙 → 非空 assert → `Session` 作成までを行い、`Session` を返す形にする。`mfx_memory_get_surface_for_encode` による surface 取得は各テスト側で行う。`FrameSurface` は `Session` への参照を持たないため、ヘルパーが `FrameSurface` だけ返すと dangling になる。ヘルパー内の非空 assert のメッセージは日本語でアダプタ一覧を含める（`format_adapters` は `tests/test_adapter.rs` 内のヘルパーであり `src/vpl.rs` の `mod tests` からは使用不能なため、vpl.rs 側に同様のフォーマッタを置く））。
-- 既存の英語 assert メッセージ（`"second map_write should fail"` 等）は AGENTS.md の「テストのログメッセージは全て日本語にすること」に従い、分割時に日本語化する。
+- `MFXMemory_GetSurfaceForEncode` はエンコーダー初期化後のセッションでのみサーフェスを返すため、テスト用の `Encoder`（H.264 / 320x240 / NV12 / CQP）を作成し、`Encoder::session_for_test()` で `Session` を借りる。`Encoder` はテストの間ずっと保持する。
+- `src/encode.rs` の `Encoder` に `#[cfg(test)] pub(crate) fn session_for_test(&self) -> &Session` を追加する。テスト専用のアクセサーとする。
+- silent early-return を全て削除し、`list_adapters()` の Err / 空 Vec、`Encoder::new()` の Err、`mfx_memory_get_surface_for_encode()` の失敗を `expect` / `unwrap_or_else(panic!)` / `assert!` で明示失敗させる。
+- テストは 1 個のまま分割しない。5 シナリオはコメントで区切り、assert / expect メッセージにシナリオ名を含める（正常系、二重 map_write、二重 map_read、二重 unmap、未 map 状態の unmap）。アダプタ一覧や status もメッセージに含める。
+- 既存の英語 assert メッセージは日本語化する。
+- `#[cfg(intel_vpl)]` は付けない。GPU 実機でのみ実行する方針のため、GPU 無し環境で実行されれば失敗するのが正しい。
 
-分割後のテスト関数:
-1. `frame_surface_map_write_unmap_drop_succeeds` — 正常系
-2. `frame_surface_double_map_write_fails` — 二重 map_write
-3. `frame_surface_double_map_read_fails` — 二重 map_read
-4. `frame_surface_double_unmap_fails` — 二重 unmap
-5. `frame_surface_unmapped_unmap_fails` — unmapped での unmap
+#### 案 B: 5 シナリオに分割する（不採用）
 
-#### 案 B: 現状維持 + assert 追加
-
-silent return を全て assert に置き換える。
-
-- 短所: GPU なし環境で必ず失敗するため、GPU なし Linux（container 等）で失敗しっぱなしになる（macOS は `src/lib.rs` の `compile_error!` によりビルド自体が不能）。cfg ガードで分離するのが正しい。
-
-推奨は **案 A**。
+- シナリオごとにテスト結果が出る点は利点だが、テストごとに `Encoder` を初期化するコストとコード量が増える。
+- `test-intel-vpl` は `--test-threads=1` で実行するため、分割しても並列化されず実行時間だけ増える。
+- GPU が無い環境では 5 個とも同じ前提エラーで落ち、ノイズが増える。
+- シナリオが増えて 1 テストが長くなった場合に改めて検討する。
 
 ### `test_list_adapters_sorted_and_deduped` の修正
 
-以下いずれか。
+#### 案 A: 空 Vec 自動パスを防ぐ（推奨）
 
-#### 案 A: 実機テストとして分離（推奨）
-
-- `#[cfg(intel_vpl)]` を付ける
-- 空 Vec なら `assert!(!adapters.is_empty(), "Intel HW アダプタが列挙されない: {listing}")` で明示失敗させる（メッセージは既存の `test_real_adapter_session` と同形式）
+- `#[cfg(intel_vpl)]` は付けない。
+- 空 Vec なら `assert!(!adapters.is_empty(), "Intel HW アダプタが列挙されない: {listing}")` で明示失敗させる（メッセージは既存の `test_real_adapter_session` と同形式）。
+- `listing` は既存の `format_adapters` ヘルパーで作成する。`format_adapters` は現在 `#[cfg(intel_vpl)]` 付きなので、このテストから使えるよう cfg を外す。
 
 #### 案 B: PBT で「昇順 / 重複なし」プロパティを検証する（実装不能のため不採用）
 
@@ -148,20 +138,23 @@ silent return を全て assert に置き換える。
 
 以下すべてを満たす。
 
-1. `src/vpl.rs::frame_surface_gpu_required` を 5 個の個別 `#[test]` 関数に分割し、**それぞれに** `#[cfg(intel_vpl)]` を付与する（元の関数は削除。共通セットアップヘルパーにも `#[cfg(intel_vpl)]` を付与し、アダプタ列挙 → 非空 assert → `Session` 作成を行って `Session` を返す。返り値の `Session` はテスト関数側の変数で保持する（Drop による `MFXClose` を防ぐ）。`mfx_memory_get_surface_for_encode` による surface 取得は各テスト側で行う）。
-2. silent early-return を全て削除し、前提が満たされない場合は `assert!` で原因メッセージ付きで明示失敗させる。assert メッセージは日本語にする（既存の英語メッセージも分割時に日本語化する）。
-3. `tests/test_adapter.rs::test_list_adapters_sorted_and_deduped` に `#[cfg(intel_vpl)]` を付与し、既存の `format_adapters` ヘルパーで一覧化した `listing` 変数を用意したうえで `assert!(!adapters.is_empty(), "Intel HW アダプタが列挙されない: {listing}")` を追加して空 Vec での自動パスを防止する（設計方針の案 A に一致。メッセージ形式は既存の `test_real_adapter_session` と同形式）。
+1. `src/encode.rs` の `Encoder` に `#[cfg(test)] pub(crate) fn session_for_test(&self) -> &Session` を追加する。`src/vpl.rs::frame_surface_gpu_required` ではテスト用の `Encoder`（H.264 / 320x240 / NV12 / CQP）を作成し、そのセッションで surface を取得する（`Encoder` はテストの間ずっと保持する）。`list_adapters()` の Err / 空 Vec、`Encoder::new()` の Err、`mfx_memory_get_surface_for_encode()` の失敗を `expect` / `unwrap_or_else(panic!)` / `assert!` で明示失敗させる。テストは 1 個のまま分割せず、5 シナリオはコメントで区切る。`#[cfg(intel_vpl)]` は付けない。
+2. assert / expect / panic メッセージは日本語にし、シナリオ名（正常系、二重 map_write、二重 map_read、二重 unmap、未 map 状態の unmap）を含める。既存の英語メッセージも日本語化する。
+3. `tests/test_adapter.rs::test_list_adapters_sorted_and_deduped` に `format_adapters` で一覧化した `listing` を用意し、`assert!(!adapters.is_empty(), "Intel HW アダプタが列挙されない: {listing}")` を追加して空 Vec での自動パスを防止する。`format_adapters` の `#[cfg(intel_vpl)]` は外す。
 4. `CHANGES.md` の `## develop` の `### misc` サブセクションに `[ADD]` として追記する（テストの修正はライブラリ機能に直接影響しないため）。
-5. 実装後に `test-intel-vpl` ジョブ（`INTEL_VPL=1`）で全テストが pass することを確認する。加えて、`INTEL_VPL` 未設定（GPU なし）環境で `cargo test --lib` と `cargo clippy --workspace --all-targets -- -D warnings` が pass することも確認する（cfg 付与による dead_code / E0425 が生じていないことの検証）。
+5. `test-intel-vpl` ジョブで全テストが pass し、`cargo clippy --workspace --all-targets -- -D warnings` も pass することを確認する。GPU なし環境で `cargo test --lib` が pass することは確認しない（方針上不要）。
 
 ## 影響範囲
 
-- `src/vpl.rs`（`frame_surface_gpu_required` の分割 + cfg 付与）
-- `tests/test_adapter.rs`（`test_list_adapters_sorted_and_deduped` に cfg 付与 + 空チェック assert 追加）
+- `src/vpl.rs`（`frame_surface_gpu_required` の silent return 削除 + assert 追加 + テスト用 `Encoder` の作成）
+- `src/encode.rs`（`#[cfg(test)]` の `session_for_test` 追加）
+- `tests/test_adapter.rs`（`test_list_adapters_sorted_and_deduped` の空チェック assert 追加 + `format_adapters` の cfg 解除）
 - `CHANGES.md`
 
 注: `tests/test_vpl.rs` は作成不要（`VplLibrary` / `FrameSurface` / `Session` は `pub(crate)` のため `tests/` からはアクセス不能。詳細は「設計方針」参照）。
 
 ## 参考
 
-- 関連 issue: 0022（ci ジョブが cargo test 未実行。本 issue の `#[cfg(intel_vpl)]` 付与を完了条件の前提としている）、0014（`FrameSurface::Drop` のエラー報告。0023 適用後の分割テストを前提にしている）、0015（非 Linux の `compile_error!` ガード。0023 の cfg 付与で E0425 が解消される）
+- 関連 issue: 0014（`FrameSurface::Drop` のエラー報告。0023 適用後の `frame_surface_gpu_required` を前提にしている。0014 内の `#[cfg(intel_vpl)]` 付き分割テストという記述は別途更新が必要）
+- 0022 はクローズ済み（GPU 無しでテストを回す前提を採らない）
+- 0015 は非 Linux の `compile_error!` ガード。cfg を付けない方針のため本 issue との依存はない
