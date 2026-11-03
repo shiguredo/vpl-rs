@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/update-readme-input-format-mismatch
 - Polished: 2026-08-02
@@ -94,3 +95,15 @@ Nv12 / Yuy2 / Bgra の 3 種のみ。
 
 - 関連 issue: 0016（`docs/INTEL_VPL.md` の同じ齟齬。本 issue では触れず 0016 の削除に委ねる）
 - 関連 issue: 0015（`README.md` の docs.rs 向けビルド記述を「Linux 上で」に限定する。同じファイルを触るが修正箇所が異なるため独立して適用可能）
+
+## 解決方法
+
+`README.md` の「特徴」セクションの「エンコード入力フォーマット選択」は、2026-08-23 のコミット `65ddb10`「整備」で既に `NV12 / YUY2 / BGRA` に修正されていた。そのため本 issue での追加のコード変更はない。
+
+### 確認内容
+
+- `README.md` の「特徴」セクションの該当行が `NV12 / YUY2 / BGRA` になっていることを確認した。
+- 「サポートフォーマット」のエンコード入力フォーマット表が `src/encode.rs` の `FrameFormat` (`Nv12` / `Yuy2` / `Bgra`) と一致することを確認した。
+- 「デコード出力フォーマット」表が `src/decode.rs` の初期化で設定する `MFX_FOURCC_NV12` と一致することを確認した。
+- `issues/` と `target/` を除くリポジトリ全体に `I420` / `YV12` / `P010` の記述が残っていないことを確認した。
+- `CHANGES.md` には追記していない。Markdown ファイルの変更は変更履歴に反映しない規約による。
