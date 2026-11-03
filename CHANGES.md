@@ -46,6 +46,9 @@
 - [UPDATE] Rust ツールチェーンを rust-version と同じ 1.93 に固定する
   - CI と devcontainer のツールチェーンも 1.93 に合わせる
   - @voluntas
+- [FIX] docs.rs のビルドでネットワークに接続できないためドキュメント生成に失敗する問題を修正する
+  - `DOCS_RS` 設定時は libvpl の取得と bindgen をスキップし、ドキュメント生成に必要な最小限のダミー定義を出力する
+  - @melpon
 
 ## 2026.4.0
 
