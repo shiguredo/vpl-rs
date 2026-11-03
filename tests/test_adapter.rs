@@ -14,7 +14,6 @@ fn into_err<T>(result: Result<T, Error>, message: &str) -> Error {
 }
 
 /// AdapterInfo の Debug 出力を 1 行ずつ整形した文字列で返す（assert メッセージ用）
-#[cfg(intel_vpl)]
 fn format_adapters(adapters: &[shiguredo_vpl::AdapterInfo]) -> String {
     let mut s = String::from("[");
     for (i, a) in adapters.iter().enumerate() {
@@ -34,6 +33,11 @@ fn format_adapters(adapters: &[shiguredo_vpl::AdapterInfo]) -> String {
 #[test]
 fn test_list_adapters_sorted_and_deduped() {
     let adapters = list_adapters().expect("list_adapters に失敗");
+    let listing = format_adapters(&adapters);
+    assert!(
+        !adapters.is_empty(),
+        "Intel HW アダプタが列挙されない: {listing}"
+    );
 
     let mut nodes: Vec<u32> = adapters.iter().map(|a| a.drm_render_node).collect();
     let original = nodes.clone();
