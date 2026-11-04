@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use crate::codec_info::VideoCodecType;
+use crate::stats::{Counter, Gauge};
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
 
@@ -104,6 +105,37 @@ impl<'a, T> DecodedFrame<'a, T> {
     }
 }
 
+/// デコーダーの統計値
+///
+/// [`Decoder::stats`] が返す統計値である。値はデコード処理の進行に伴って
+/// 更新される。
+///
+/// `Clone` は各フィールドの現在値を個別にコピーするスナップショットを返すため、
+/// フィールド間の一貫性は保証されない。
+#[derive(Debug, Clone, Default)]
+pub struct DecoderStats {
+    /// [`Decoder::decode`] が受理した通算回数
+    ///
+    /// 入力データの長さ検証やデコーダーの初期化に失敗した呼び出しは計上しない。
+    pub total_decode_count: Counter,
+
+    /// [`DecodeHandler::on_decoded`] に `Ok` を渡した通算回数
+    pub total_output_frame_count: Counter,
+
+    /// [`DecodeHandler::on_decoded`] に `Err` を渡した通算回数
+    ///
+    /// [`Decoder::finish`] が残留フレームをエラー通知した場合も含む。
+    pub total_error_count: Counter,
+
+    /// 受理したが、まだ結果を通知していないフレーム数の現在値
+    ///
+    /// [`Decoder::decode`] がフレームを受理した時点で増え、対応する結果を
+    /// [`DecodeHandler::on_decoded`] に通知する直前に減る。[`Decoder::finish`] の
+    /// 処理が完了した時点で 0 になる。処理の途中でエラーになった場合は残留する
+    /// ことがある。`Drop` 時に中断したフレームを通知した場合も減る。
+    pub in_flight_frames: Gauge,
+}
+
 /// デコード用サーフェスの同期情報
 ///
 /// Worker スレッドに渡される。
@@ -203,6 +235,8 @@ pub struct Decoder<H: DecodeHandler> {
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     /// Worker スレッドの join ハンドル
     worker_handle: Option<thread::JoinHandle<()>>,
+    /// ワーカースレッドと共有する統計値
+    stats: Arc<DecoderStats>,
 }
 
 // Safety: デコード完了通知は専用スレッドで行い、メインスレッドは DecodeFrameAsync のみ実行する。
@@ -280,10 +314,12 @@ impl<H: DecodeHandler> Decoder<H> {
         let (worker_tx, worker_rx) = mpsc::channel();
         let lib = session.lib();
         let session_handle = session.as_ptr() as usize;
+        let stats = Arc::new(DecoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker_handle = thread::Builder::new()
             .name("vpl-decoder-sync".to_owned())
             .spawn(move || {
-                run_sync_worker(lib, session_handle, worker_rx, handler);
+                run_sync_worker(lib, session_handle, worker_rx, handler, worker_stats);
             })
             .map_err(|error| {
                 Error::new_custom_owned(
@@ -300,7 +336,13 @@ impl<H: DecodeHandler> Decoder<H> {
             frame_count: 0,
             worker_tx,
             worker_handle: Some(worker_handle),
+            stats,
         })
+    }
+
+    /// デコーダーの統計値を取得する
+    pub fn stats(&self) -> &DecoderStats {
+        &self.stats
     }
 
     /// ビットストリームからヘッダを解析してデコーダを初期化する
@@ -377,13 +419,20 @@ impl<H: DecodeHandler> Decoder<H> {
 
         // QueueFrame を送信してからデコードを開始する。
         // これにより Worker 内で user_data と出力フレームが frame_seq の一致で対応付けられる。
-        self.send_worker_command(
+        // pending の登録と in-flight の加算を同じタイミングで行い、
+        // ワーカーが対応する結果を通知する直前に減算する。
+        self.stats.in_flight_frames.inc();
+        if let Err(error) = self.send_worker_command(
             "Decoder::decode",
             WorkerCommand::QueueFrame {
                 frame_seq,
                 user_data,
             },
-        )?;
+        ) {
+            // pending を登録できなかったため、加算した in-flight を戻す
+            self.stats.in_flight_frames.dec();
+            return Err(error);
+        }
 
         // frame_seq を進める。デコード開始前に進めることで、decode_bitstream がエラーを返しても
         // 同じ frame_seq が再利用されることが無いようにする。
@@ -392,7 +441,12 @@ impl<H: DecodeHandler> Decoder<H> {
             .checked_add(1)
             .ok_or_else(|| Error::new_custom("Decoder::decode", "frame sequence overflowed"))?;
 
-        self.decode_bitstream(&mut bs)
+        // VPL が受理した時点で通算回数を計上する
+        let result = self.decode_bitstream(&mut bs);
+        if result.is_ok() {
+            self.stats.total_decode_count.inc();
+        }
+        result
     }
 
     /// ビットストリームをデコードしてフレームを収集する
@@ -536,6 +590,7 @@ fn run_sync_worker<H: DecodeHandler>(
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
     mut handler: H,
+    stats: Arc<DecoderStats>,
 ) {
     let mut pending_map: HashMap<u64, H::UserData> = HashMap::new();
     while let Ok(command) = worker_rx.recv() {
@@ -547,11 +602,17 @@ fn run_sync_worker<H: DecodeHandler>(
                 // 入力フレームの frame_seq で user_data を登録する。
                 // 同一 frame_seq が二度使われると誤対応付けになるため、重複を検出する。
                 if pending_map.insert(frame_seq, user_data).is_some() {
-                    handler.on_decoded(Err(Error::new_custom_owned(
-                        "Decoder::sync_worker",
-                        format!("duplicate frame sequence in pending frames: {frame_seq}"),
-                    )
-                    .into()));
+                    // 同じ frame_seq で置き換えた user_data は結果を通知できないため、
+                    // in-flight から取り除く
+                    stats.in_flight_frames.dec();
+                    notify_decoded(
+                        &mut handler,
+                        &stats,
+                        Err(Error::new_custom_owned(
+                            "Decoder::sync_worker",
+                            format!("duplicate frame sequence in pending frames: {frame_seq}"),
+                        )),
+                    );
                 }
             }
             WorkerCommand::Sync { sync_data } => {
@@ -561,8 +622,9 @@ fn run_sync_worker<H: DecodeHandler>(
                     sync_data,
                     &mut pending_map,
                     &mut handler,
+                    &stats,
                 ) {
-                    handler.on_decoded(Err(error.into()));
+                    notify_decoded(&mut handler, &stats, Err(error));
                 }
             }
             WorkerCommand::WaitIdle(reply_tx) => {
@@ -576,13 +638,17 @@ fn run_sync_worker<H: DecodeHandler>(
                 // もし出力されなかった入力フレームが残留しているなら、異常系のためエラーとして通知する。
                 let remaining_count = pending_map.len();
                 for (frame_seq, _user_data) in pending_map.drain() {
-                    handler.on_decoded(Err(Error::new_custom_owned(
-                        "Decoder::finish",
-                        format!(
-                            "decode pending frame seq={frame_seq} (pending count: {remaining_count})"
-                        ),
-                    )
-                    .into()));
+                    stats.in_flight_frames.dec();
+                    notify_decoded(
+                        &mut handler,
+                        &stats,
+                        Err(Error::new_custom_owned(
+                            "Decoder::finish",
+                            format!(
+                                "decode pending frame seq={frame_seq} (pending count: {remaining_count})"
+                            ),
+                        )),
+                    );
                 }
                 let _ = reply_tx.send(Err(Error::new_custom_owned(
                     "Decoder::finish",
@@ -592,16 +658,35 @@ fn run_sync_worker<H: DecodeHandler>(
             WorkerCommand::Stop => {
                 // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
                 for (_frame_seq, _user_data) in pending_map.drain() {
-                    handler.on_decoded(Err(Error::from_mfx(
-                        sys::mfxStatus_MFX_ERR_ABORTED,
-                        "Decoder::drop",
-                    )
-                    .into()));
+                    stats.in_flight_frames.dec();
+                    notify_decoded(
+                        &mut handler,
+                        &stats,
+                        Err(Error::from_mfx(
+                            sys::mfxStatus_MFX_ERR_ABORTED,
+                            "Decoder::drop",
+                        )),
+                    );
                 }
                 break;
             }
         }
     }
+}
+
+/// デコード結果をハンドラーへ通知し、通知内容に応じて統計を更新する
+///
+/// `Ok` は出力フレーム数に、`Err` はエラー数に計上する。
+fn notify_decoded<H: DecodeHandler>(
+    handler: &mut H,
+    stats: &DecoderStats,
+    result: Result<DecodedFrame<'_, H::UserData>, Error>,
+) {
+    match &result {
+        Ok(_) => stats.total_output_frame_count.inc(),
+        Err(_) => stats.total_error_count.inc(),
+    }
+    handler.on_decoded(result.map_err(Into::into));
 }
 
 /// `SyncOperation` 完了後の `out_surface` から Map でデータを読み取り、
@@ -619,6 +704,7 @@ fn sync_and_callback<H: DecodeHandler>(
     sync_data: DecodeSyncData,
     pending_map: &mut HashMap<u64, H::UserData>,
     handler: &mut H,
+    stats: &DecoderStats,
 ) -> Result<(), crate::Error> {
     let DecodeSyncData {
         syncp,
@@ -648,9 +734,12 @@ fn sync_and_callback<H: DecodeHandler>(
         return Ok(());
     };
 
+    // pending を消費して結果を通知できる状態になった
+    stats.in_flight_frames.dec();
+
     // デコードされたフレームデータを読み取る
     let frame = read_decoded_surface(&frame_surface, user_data)?;
-    handler.on_decoded(Ok(frame));
+    notify_decoded(handler, stats, Ok(frame));
     Ok(())
 }
 
@@ -729,29 +818,45 @@ mod tests {
     /// VPL を一切呼ばないため、ダミーの [VplLibrary] と `session_handle = 0` でテストできる。
     /// TimeStamp 引き当て失敗ドレイン（[sync_and_callback] 内）は roundtrip 統合テストで
     /// 間接的にカバーされる。
-    fn spawn_worker<F>(callback: F) -> (mpsc::Sender<WorkerCommand<u32>>, thread::JoinHandle<()>)
+    fn spawn_worker<F>(
+        callback: F,
+    ) -> (
+        mpsc::Sender<WorkerCommand<u32>>,
+        thread::JoinHandle<()>,
+        Arc<DecoderStats>,
+    )
     where
         F: FnMut(Result<DecodedFrame<'_, u32>, Error>) + Send + 'static,
     {
         let (command_tx, command_rx) = mpsc::channel();
+        let stats = Arc::new(DecoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let handle = thread::Builder::new()
             .name("vpl-decoder-sync".to_owned())
             .spawn(move || {
-                run_sync_worker(VplLibrary, 0, command_rx, FnDecodeHandler::new(callback));
+                run_sync_worker(
+                    VplLibrary,
+                    0,
+                    command_rx,
+                    FnDecodeHandler::new(callback),
+                    worker_stats,
+                );
             })
             .expect("sync worker thread の起動に失敗した");
-        (command_tx, handle)
+        (command_tx, handle, stats)
     }
 
     #[test]
     fn worker_wait_idle_returns_error_when_pending_remains() {
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
-        let (command_tx, handle) = spawn_worker(move |result| {
+        let (command_tx, handle, stats) = spawn_worker(move |result| {
             callback_tx
                 .send(result.map(|_| ()))
                 .expect("デコード結果の送信に失敗した");
         });
 
+        // decode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 77,
@@ -785,6 +890,24 @@ mod tests {
             "frame_seq と残留件数を含むエラーメッセージであること"
         );
 
+        // 残留 pending はエラー通知のたびにエラー数へ計上し、
+        // 通知を終えた時点で in-flight から取り除かれること
+        assert_eq!(
+            stats.total_error_count.get(),
+            1,
+            "残留 pending のエラー通知がエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.total_output_frame_count.get(),
+            0,
+            "エラー通知は出力フレーム数に計上されないこと"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "残留 pending の通知後に in-flight が 0 であること"
+        );
+
         command_tx
             .send(WorkerCommand::Stop)
             .expect("Stop の送信に失敗した");
@@ -794,18 +917,21 @@ mod tests {
     #[test]
     fn worker_stop_returns_aborted_for_all_pending() {
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
-        let (command_tx, handle) = spawn_worker(move |result| {
+        let (command_tx, handle, stats) = spawn_worker(move |result| {
             callback_tx
                 .send(result.map(|_| ()))
                 .expect("デコード結果の送信に失敗した");
         });
 
+        // decode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 1,
                 user_data: 10,
             })
             .expect("QueueFrame の送信に失敗した");
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 2,
@@ -831,17 +957,31 @@ mod tests {
             callback_count, 2,
             "全ての残留 pending 分のコールバックが通知されること"
         );
+
+        // 中断通知でもエラー数を増やし、in-flight を 0 に戻すこと
+        assert_eq!(
+            stats.total_error_count.get(),
+            2,
+            "中断した全フレームがエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "中断通知の後に in-flight が 0 であること"
+        );
     }
 
     #[test]
     fn worker_reports_duplicate_frame_sequence() {
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
-        let (command_tx, handle) = spawn_worker(move |result| {
+        let (command_tx, handle, stats) = spawn_worker(move |result| {
             callback_tx
                 .send(result.map(|_| ()))
                 .expect("デコード結果の送信に失敗した");
         });
 
+        // decode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         // 同一 frame_seq の QueueFrame を 2 回送信する
         command_tx
             .send(WorkerCommand::QueueFrame {
@@ -849,6 +989,7 @@ mod tests {
                 user_data: 1,
             })
             .expect("QueueFrame の送信に失敗した");
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 42,
@@ -889,6 +1030,19 @@ mod tests {
                 .recv_timeout(Duration::from_millis(200))
                 .is_err(),
             "通知は 2 回だけであること"
+        );
+
+        // 置き換えられた pending と残留 pending の両方が in-flight から取り除かれ、
+        // 2 件のエラー通知がエラー数に計上されること
+        assert_eq!(
+            stats.total_error_count.get(),
+            2,
+            "重複エラーと中断エラーがエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "重複と中断の通知後に in-flight が 0 であること"
         );
     }
 }

@@ -29,9 +29,10 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
 - `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `CodecInfo` / `DecodingInfo` / `EncodingInfo` / `EncodingProfiles`
-- `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecodeHandler` / `FnDecodeHandler<T, E>`
+- `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
 - `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `VideoParam` / `ExtParams` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
+- `stats` — `Counter` / `Gauge`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
 - `vpl::gop_opt_flag` (定数モジュール) — `CLOSED` / `STRICT`
 - `BUILD_VERSION` — ビルド時参照した libvpl のバージョン文字列
@@ -272,7 +273,9 @@ encoder.reconfigure(ReconfigureParams {
 ### `Encoder::query` / 統計
 
 - `query` で `MFXVideoENCODE_Query` を叩いてパラメータのサポート可否を検証できる (どこまで通るかを確認したいとき)。
-- `EncoderStats` (`num_frame` / `num_bit` / `num_cached_frame`) は `MFXVideoENCODE_GetEncodeStat` の結果。
+- `Encoder::stats() -> &EncoderStats` は統計値への参照を返す。統計値はエンコード処理の進行に伴って更新される。 `EncoderStats` は `total_encode_count` (VPL に受理させた回数) / `total_output_frame_count` (`Ok` 通知回数) / `total_error_count` (`Err` 通知回数) / `total_reconfigure_count` (reconfigure 成功回数) / `total_output_bit_count` (出力ビットストリームの総ビット数) / `in_flight_frames` (`Gauge`) を持つ。
+- `in_flight_frames` は `encode()` がフレームを受理した時点で増え、対応する結果を `on_encoded` に通知する直前に減る。 `finish()` と `reconfigure()` の処理が完了した時点で 0 になる。処理の途中でエラーになった場合は残留することがある。
+- `Counter` / `Gauge` は `new()` / `get()` が公開され、増減 (`inc()` / `dec()` / `add()`) は crate 内専用。 `clone()` は各フィールドの現在値を個別にコピーするスナップショットを返すため、フィールド間の一貫性は保証されない。
 
 ## デコーダ (`Decoder<H>`)
 
@@ -324,6 +327,7 @@ while let Ok(result) = rx.try_recv() {
 - worker スレッド名は `vpl-decoder-sync`。 `user_data` は入力ビットストリームの `TimeStamp` に載せた連番と、 出力フレームの `TimeStamp` の**完全一致**で対応付く (Encoder と同じ方式)。 B フレームの表示順並び替えがあっても正しい入力フレームに戻る。 なお、 1 フレームが複数の `decode()` 呼び出しに分割して供給されるケースでは、 出力フレームの TimeStamp がどの呼び出しの連番になるかが VPL 実装依存のため、 user_data の対応付けは保証されない (分割入力で未消費の連番が残留した場合、 `finish()` が残留チェックエラーを返す)。
 - `decode` 呼び出しごとに `user_data` を 1 つ供給する。 VPL が内部蓄積でフレームを出さないターンでは消費されず、 出力フレーム数より供給数が多い場合の残余は `finish()` の残留チェックでエラーになる (エラーが通知され、 `finish()` が `Err` を返す)。 `decode` がエラーを返した場合も `frame_seq` は消費済みで、 失敗フレームの `user_data` は出力に紐付かず `finish()` の残留チェック (または `Drop` 時の `MFX_ERR_ABORTED` 通知) でエラーとして通知される。
 - `finish(&mut self) -> Result<(), Error>` はエンコーダと同じくバリア。 null bitstream でドレインを呼び切り、worker の `WaitIdle` が応答するまでブロックする。 `decode` を一度も呼んでいない (未初期化) 場合は即 `Ok(())` を返す。
+- `Decoder::stats() -> &DecoderStats` は `total_decode_count` (`decode()` が受理した回数) / `total_output_frame_count` (`Ok` 通知回数) / `total_error_count` (`Err` 通知回数) / `in_flight_frames` (`Gauge`) を持つ。 `finish()` が残留 pending をエラー通知した場合も `total_error_count` が増え、 `in_flight_frames` は 0 に戻る。
 - `Decoder` を `Drop` すると worker スレッドへ `Stop` が送られ、未消費の `user_data` は `MFX_ERR_ABORTED` のエラー結果として `on_decoded` に通知される。
 
 ### `DecodedFrame<'_, T>` の使い方

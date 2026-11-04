@@ -3,11 +3,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use shiguredo_vpl::{
-    AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, Decoder, DecoderConfig,
-    EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler,
-    FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType,
-    RateControlMode, ReconfigureParams, VideoCodecType, Vp9EncoderConfig, Vp9Profile, frame_type,
-    list_adapters,
+    AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder,
+    DecoderConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler,
+    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
+    PictureType, RateControlMode, ReconfigureParams, VideoCodecType, Vp9EncoderConfig, Vp9Profile,
+    frame_type, list_adapters,
 };
 
 /// テスト用アダプタを返す
@@ -923,6 +923,19 @@ fn test_reconfigure_drains_pending_frames() {
         })
         .expect("reconfigure に失敗した");
 
+    // reconfigure は pending を drain してから Reset するため、戻った時点で
+    // in-flight は 0 に戻り、成功回数が計上されている
+    assert_eq!(
+        encoder.stats().in_flight_frames.get(),
+        0,
+        "reconfigure の drain 完了後に in-flight が 0 であること"
+    );
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        1,
+        "reconfigure の成功回数が計上されること"
+    );
+
     for i in before_count..before_count + after_count {
         let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
         encoder
@@ -933,6 +946,11 @@ fn test_reconfigure_drains_pending_frames() {
     // finish() は残留した pending をエラーにする。この呼び出しが Ok であることで、
     // reconfigure が pending を残していないことを確認できる。
     encoder.finish().expect("finish に失敗した");
+    assert_eq!(
+        encoder.stats().in_flight_frames.get(),
+        0,
+        "finish 完了後に in-flight が 0 であること"
+    );
 
     let mut ok_user_data = Vec::new();
     let mut errors = Vec::new();
@@ -1504,5 +1522,349 @@ fn test_write_ivf_headers_getter_false_for_non_vp9() {
     assert!(
         !encoder.write_ivf_headers(),
         "非 VP9 コーデックの getter は false を返すこと"
+    );
+}
+
+// --- 統計 ---
+
+/// 統計テスト用の H.264 エンコーダ設定を返す
+fn stats_encoder_config() -> EncoderConfig {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    config
+}
+
+/// エンコーダーの統計値が finish 完了後の通知結果と一致することを検証する
+#[test]
+fn test_encoder_stats() {
+    let (tx, rx) = mpsc::channel::<Result<EncodedFrame<usize>, Error>>();
+    let mut encoder = Encoder::new(
+        stats_encoder_config(),
+        FnEncodeHandler::new(move |result| {
+            tx.send(result)
+                .expect("エンコード結果コールバックの送信に失敗した");
+        }),
+    )
+    .expect("エンコーダの生成に失敗した");
+    let (coded_width, coded_height) = encoder.coded_size();
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    let num_frames = 8;
+
+    for i in 0..num_frames {
+        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        encoder
+            .encode(&frame_data, i, &options)
+            .expect("エンコードに失敗した");
+    }
+
+    // finish はバリアなので、戻った時点で全通知と統計の更新が済んでいる
+    encoder.finish().expect("finish に失敗した");
+
+    let mut total_bits = 0u64;
+    for _ in 0..num_frames {
+        let encoded = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("エンコード結果コールバックの受信がタイムアウトした")
+            .expect("エンコードに失敗した");
+        total_bits += encoded.data().len() as u64 * 8;
+    }
+
+    let stats = encoder.stats();
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "finish 完了後に in-flight が 0 であること"
+    );
+    assert_eq!(
+        stats.total_encode_count.get(),
+        num_frames as u64,
+        "encode() が受理した回数が計上されること"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        num_frames as u64,
+        "通知された出力フレーム数が計上されること"
+    );
+    assert_eq!(
+        stats.total_error_count.get(),
+        0,
+        "正常に完了したエンコードでエラー数が増えないこと"
+    );
+    assert_eq!(
+        stats.total_output_bit_count.get(),
+        total_bits,
+        "出力ビット数の合計が通知されたビットストリーム長と一致すること"
+    );
+    assert_eq!(
+        stats.total_reconfigure_count.get(),
+        0,
+        "reconfigure を呼んでいないため成功回数が 0 であること"
+    );
+}
+
+/// reconfigure の成功だけが統計に計上されることを検証する
+#[test]
+fn test_encoder_stats_reconfigure_count() {
+    let mut encoder: Encoder<FnEncodeHandler<()>> = Encoder::new(
+        stats_encoder_config(),
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )
+    .expect("エンコーダの生成に失敗した");
+
+    // パラメータ検証で拒否された reconfigure は成功回数に計上しない
+    let rejected = encoder.reconfigure(ReconfigureParams {
+        framerate_den: Some(0),
+        ..Default::default()
+    });
+    assert!(
+        rejected.is_err(),
+        "framerate_den が 0 の reconfigure は拒否されること"
+    );
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        0,
+        "拒否された reconfigure は成功回数に計上されないこと"
+    );
+
+    encoder
+        .reconfigure(ReconfigureParams {
+            target_kbps: Some(1200),
+            ..Default::default()
+        })
+        .expect("reconfigure に失敗した");
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        1,
+        "成功した reconfigure が 1 回計上されること"
+    );
+
+    encoder
+        .reconfigure(ReconfigureParams {
+            target_kbps: Some(1400),
+            ..Default::default()
+        })
+        .expect("reconfigure に失敗した");
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        2,
+        "成功した reconfigure が 2 回計上されること"
+    );
+}
+
+/// 入力検証で拒否したフレームがエンコーダーの統計に計上されないことを検証する
+#[test]
+fn test_encoder_stats_ignores_rejected_frame() {
+    let mut encoder: Encoder<FnEncodeHandler<()>> = Encoder::new(
+        stats_encoder_config(),
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )
+    .expect("エンコーダの生成に失敗した");
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+
+    // coded_size() から求まる必要サイズより小さいデータは入力検証で拒否される
+    let result = encoder.encode(&[0u8; 16], (), &options);
+    assert!(
+        result.is_err(),
+        "coded サイズに満たないフレームデータは拒否されること"
+    );
+
+    let stats = encoder.stats();
+    assert_eq!(
+        stats.total_encode_count.get(),
+        0,
+        "拒否されたフレームは受理回数に計上されないこと"
+    );
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "拒否されたフレームは in-flight に残らないこと"
+    );
+}
+
+/// デコーダーの統計値が finish 完了後の通知結果と一致することを検証する
+#[test]
+fn test_decoder_stats() {
+    let num_frames = 8;
+    let (coded_width, coded_height) = coded_size_for(&stats_encoder_config());
+    let input_frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(320, 240, coded_width, coded_height, i))
+        .collect();
+    let (_, bitstreams) = encode(stats_encoder_config(), &input_frames);
+
+    let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
+    let mut decoder = Decoder::new(
+        DecoderConfig::new(test_adapter(), VideoCodecType::H264),
+        FnDecodeHandler::new(move |result| {
+            tx.send(result.map(|frame| *frame.user_data()))
+                .expect("デコード結果コールバックの送信に失敗した");
+        }),
+    )
+    .expect("デコーダの生成に失敗した");
+
+    for (i, bs) in bitstreams.iter().enumerate() {
+        decoder.decode(bs, i).expect("デコードに失敗した");
+    }
+    decoder.finish().expect("finish に失敗した");
+
+    let mut output_count = 0usize;
+    while let Ok(result) = rx.recv_timeout(Duration::from_millis(200)) {
+        result.expect("デコードに失敗した");
+        output_count += 1;
+    }
+    assert_eq!(
+        output_count, num_frames,
+        "全ての入力フレームが Ok で通知されること"
+    );
+
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "finish 完了後に in-flight が 0 であること"
+    );
+    assert_eq!(
+        stats.total_decode_count.get(),
+        num_frames as u64,
+        "decode() が受理した回数が計上されること"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        num_frames as u64,
+        "通知された出力フレーム数が計上されること"
+    );
+    assert_eq!(
+        stats.total_error_count.get(),
+        0,
+        "正常に完了したデコードでエラー数が増えないこと"
+    );
+}
+
+/// 初期化に失敗したデコードが受理回数に計上されないことを検証する
+#[test]
+fn test_decoder_stats_ignores_rejected_bitstream() {
+    let mut decoder: Decoder<FnDecodeHandler<()>> = Decoder::new(
+        DecoderConfig::new(test_adapter(), VideoCodecType::H264),
+        FnDecodeHandler::new(|_: Result<DecodedFrame<'_, ()>, Error>| {}),
+    )
+    .expect("デコーダの生成に失敗した");
+
+    // 空のビットストリームはヘッダ解析に失敗し、初期化エラーとして拒否される
+    let result = decoder.decode(&[], ());
+    assert!(
+        result.is_err(),
+        "空のビットストリームは初期化エラーで拒否されること"
+    );
+
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.total_decode_count.get(),
+        0,
+        "拒否されたデコードは受理回数に計上されないこと"
+    );
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "拒否されたデコードは in-flight に残らないこと"
+    );
+}
+
+/// 残留 pending のエラー通知でエラー数が増え、in-flight が 0 に戻ることを検証する
+#[test]
+fn test_decoder_stats_error_notification() {
+    let num_frames = 4;
+    let (coded_width, coded_height) = coded_size_for(&stats_encoder_config());
+    let input_frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|i| generate_dummy_nv12(320, 240, coded_width, coded_height, i))
+        .collect();
+    let (_, bitstreams) = encode(stats_encoder_config(), &input_frames);
+
+    let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
+    let mut decoder = Decoder::new(
+        DecoderConfig::new(test_adapter(), VideoCodecType::H264),
+        FnDecodeHandler::new(move |result| {
+            tx.send(result.map(|frame| *frame.user_data()))
+                .expect("デコード結果コールバックの送信に失敗した");
+        }),
+    )
+    .expect("デコーダの生成に失敗した");
+
+    for (i, bs) in bitstreams.iter().enumerate() {
+        decoder.decode(bs, i).expect("デコードに失敗した");
+    }
+
+    // 空の入力は VPL を呼ばずに pending だけを登録するため、
+    // finish() の残留チェックで必ずエラーとして通知される
+    decoder
+        .decode(&[], num_frames)
+        .expect("空のビットストリームは受理されること");
+    let finish_error = decoder
+        .finish()
+        .expect_err("残留 pending がある finish はエラーを返すこと");
+    assert_eq!(
+        finish_error.function(),
+        "Decoder::finish",
+        "finish のエラーは Decoder::finish のコンテキストを持つこと"
+    );
+
+    let mut ok_count = 0usize;
+    let mut error_count = 0usize;
+    while let Ok(result) = rx.recv_timeout(Duration::from_millis(200)) {
+        match result {
+            Ok(_) => ok_count += 1,
+            Err(error) => {
+                assert_eq!(
+                    error.function(),
+                    "Decoder::finish",
+                    "残留 pending のエラーは finish のコンテキストを持つこと"
+                );
+                error_count += 1;
+            }
+        }
+    }
+    assert_eq!(
+        ok_count, num_frames,
+        "有効な入力の出力フレームはエラーにならないこと"
+    );
+    assert_eq!(
+        error_count, 1,
+        "残留した pending 1 件だけがエラー通知されること"
+    );
+
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "残留 pending の通知後に in-flight が 0 であること"
+    );
+    assert_eq!(
+        stats.total_decode_count.get(),
+        (num_frames + 1) as u64,
+        "有効な入力と空の入力を合わせて受理回数に計上されること"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        num_frames as u64,
+        "出力フレーム数は有効な入力の分だけ計上されること"
+    );
+    assert_eq!(
+        stats.total_error_count.get(),
+        1,
+        "残留 pending のエラー通知がエラー数に計上されること"
     );
 }

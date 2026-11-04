@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use crate::codec_info::{Av1Profile, H264Profile, HevcProfile, Vp9Profile};
+use crate::stats::{Counter, Gauge};
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
 
@@ -580,15 +581,43 @@ pub enum PictureType {
     Unknown,
 }
 
-/// エンコード統計情報
-#[derive(Debug, Clone)]
+/// エンコーダーの統計値
+///
+/// [`Encoder::stats`] が返す統計値である。値はエンコード処理の進行に伴って
+/// 更新される。
+///
+/// `Clone` は各フィールドの現在値を個別にコピーするスナップショットを返すため、
+/// フィールド間の一貫性は保証されない。
+#[derive(Debug, Clone, Default)]
 pub struct EncoderStats {
-    /// エンコード済みフレーム数
-    pub num_frame: u32,
-    /// エンコード済みビット数
-    pub num_bit: u64,
-    /// キャッシュ済みフレーム数
-    pub num_cached_frame: u32,
+    /// [`Encoder::encode`] が VPL に受理させたフレームの通算回数
+    ///
+    /// フレームサイズの検証など、VPL に渡す前に拒否した呼び出しは計上しない。
+    pub total_encode_count: Counter,
+
+    /// [`EncodeHandler::on_encoded`] に `Ok` を渡した通算回数
+    pub total_output_frame_count: Counter,
+
+    /// [`EncodeHandler::on_encoded`] に `Err` を渡した通算回数
+    ///
+    /// [`Encoder::finish`] と [`Encoder::reconfigure`] が残留フレームを
+    /// エラー通知した場合も含む。
+    pub total_error_count: Counter,
+
+    /// [`Encoder::reconfigure`] が成功した通算回数
+    pub total_reconfigure_count: Counter,
+
+    /// [`EncodeHandler::on_encoded`] に渡した出力ビットストリームの総ビット数
+    pub total_output_bit_count: Counter,
+
+    /// 受理したが、まだ結果を通知していないフレーム数の現在値
+    ///
+    /// [`Encoder::encode`] がフレームを受理した時点で増え、対応する結果を
+    /// [`EncodeHandler::on_encoded`] に通知する直前に減る。[`Encoder::finish`] と
+    /// [`Encoder::reconfigure`] の処理が完了した時点で 0 になる。処理の途中で
+    /// エラーになった場合は残留することがある。`Drop` 時に中断したフレームを
+    /// 通知した場合も減る。
+    pub in_flight_frames: Gauge,
 }
 
 /// エンコード済みフレーム
@@ -793,6 +822,8 @@ pub struct Encoder<H: EncodeHandler> {
     worker_handle: Option<thread::JoinHandle<()>>,
     frame_count: u64,
     framerate_den: u64,
+    /// ワーカースレッドと共有する統計値
+    stats: Arc<EncoderStats>,
 }
 
 // Safety: エンコード完了通知は専用スレッドで行い、メインスレッドは EncodeFrameAsync のみ実行する。
@@ -1091,10 +1122,12 @@ impl<H: EncodeHandler> Encoder<H> {
         let bitstream_buffer_size = (buffer_size_in_kb as usize) * 1024;
         let (worker_tx, worker_rx) = mpsc::channel();
         let session_handle = session_ptr as usize;
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker_handle = thread::Builder::new()
             .name("vpl-encoder-sync".to_owned())
             .spawn(move || {
-                run_sync_worker(lib, session_handle, worker_rx, handler);
+                run_sync_worker(lib, session_handle, worker_rx, handler, worker_stats);
             })
             .map_err(|error| {
                 // スレッド生成失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
@@ -1118,6 +1151,7 @@ impl<H: EncodeHandler> Encoder<H> {
             worker_handle: Some(worker_handle),
             frame_count: 0,
             framerate_den: config.framerate_den as u64,
+            stats,
         })
     }
 
@@ -1222,6 +1256,10 @@ impl<H: EncodeHandler> Encoder<H> {
         // Reset の成否にかかわらず ExtParam をクリアする
         clear_ext_param(&mut self.video_param);
 
+        // 成功した Reset だけを reconfigure の回数として計上する
+        if result.is_ok() {
+            self.stats.total_reconfigure_count.inc();
+        }
         result
     }
 
@@ -1276,17 +1314,9 @@ impl<H: EncodeHandler> Encoder<H> {
         self.write_ivf_headers
     }
 
-    /// エンコード統計情報を取得する
-    pub fn get_encode_stat(&self) -> Result<EncoderStats, Error> {
-        let mut stat: sys::mfxEncodeStat = unsafe { std::mem::zeroed() };
-        self.session
-            .lib()
-            .mfx_video_encode_get_encode_stat(self.session.as_ptr(), &mut stat)?;
-        Ok(EncoderStats {
-            num_frame: stat.NumFrame,
-            num_bit: stat.NumBit,
-            num_cached_frame: stat.NumCachedFrame,
-        })
+    /// エンコーダーの統計値を取得する
+    pub fn stats(&self) -> &EncoderStats {
+        &self.stats
     }
 
     /// フレームをエンコードする
@@ -1363,8 +1393,14 @@ impl<H: EncodeHandler> Encoder<H> {
         let (mut bitstream, bitstream_buffer) = self.create_bitstream();
         let syncp = self.encode_frame_async(ctrl_ptr, Some(&frame_surface), bitstream.as_mut())?;
 
+        // VPL が受理した時点で通算回数を計上する
+        self.stats.total_encode_count.inc();
+
         // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
-        self.send_worker_command(
+        // pending の登録と in-flight の加算を同じタイミングで行い、
+        // ワーカーが対応する結果を通知する直前に減算する。
+        self.stats.in_flight_frames.inc();
+        if let Err(error) = self.send_worker_command(
             "Encoder::encode",
             WorkerCommand::QueueFrame {
                 frame_seq,
@@ -1373,7 +1409,11 @@ impl<H: EncodeHandler> Encoder<H> {
                     user_data,
                 },
             },
-        )?;
+        ) {
+            // pending を登録できなかったため、加算した in-flight を戻す
+            self.stats.in_flight_frames.dec();
+            return Err(error);
+        }
 
         if let Some(syncp) = syncp {
             self.send_worker_command(
@@ -1529,6 +1569,7 @@ fn run_sync_worker<H: EncodeHandler>(
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
     mut handler: H,
+    stats: Arc<EncoderStats>,
 ) {
     let mut pending_store = PendingFrameStore::new();
     while let Ok(command) = worker_rx.recv() {
@@ -1540,19 +1581,27 @@ fn run_sync_worker<H: EncodeHandler>(
                 // encode 呼び出し単位の pending frame を frame_seq で登録する。
                 // syncp == None の入力も必ずここで保持し、後続出力との一致で回収する。
                 if pending_store.insert(frame_seq, pending_frame).is_some() {
-                    handler.on_encoded(Err(Error::new_custom_owned(
-                        "Encoder::sync_worker",
-                        format!("duplicate frame sequence in pending frames: {frame_seq}"),
-                    )
-                    .into()));
+                    // 同じ frame_seq で置き換えた pending は結果を通知できないため、
+                    // in-flight から取り除く
+                    stats.in_flight_frames.dec();
+                    notify_encoded(
+                        &mut handler,
+                        &stats,
+                        Err(Error::new_custom_owned(
+                            "Encoder::sync_worker",
+                            format!("duplicate frame sequence in pending frames: {frame_seq}"),
+                        )),
+                    );
                 }
             }
             WorkerCommand::Sync(sync) => {
                 // 通常入力の sync 完了を待ち、bitstream.TimeStamp と frame_seq を完全一致で対応付ける。
-                handler.on_encoded(
-                    sync_and_build_frame(lib, session_handle, sync, &mut pending_store)
-                        .map_err(Into::into),
-                );
+                let result = sync_and_build_frame(lib, session_handle, sync, &mut pending_store);
+                if result.is_ok() {
+                    // pending を消費して結果を通知できる状態になった
+                    stats.in_flight_frames.dec();
+                }
+                notify_encoded(&mut handler, &stats, result);
             }
             WorkerCommand::WaitIdle { reply_tx, function } => {
                 // finish / reconfigure 側のバリア。ここに到達した時点で、それ以前に
@@ -1567,12 +1616,12 @@ fn run_sync_worker<H: EncodeHandler>(
                 let pending = pending_store.drain_all();
                 let remaining_count = pending.len();
                 for (frame_seq, _meta) in pending {
-                    handler.on_encoded(Err(pending_frame_error(
-                        frame_seq,
-                        remaining_count,
-                        function,
-                    )
-                    .into()));
+                    stats.in_flight_frames.dec();
+                    notify_encoded(
+                        &mut handler,
+                        &stats,
+                        Err(pending_frame_error(frame_seq, remaining_count, function)),
+                    );
                 }
                 let _ = reply_tx.send(Err(Error::new_custom_owned(
                     function,
@@ -1582,10 +1631,34 @@ fn run_sync_worker<H: EncodeHandler>(
             WorkerCommand::Stop => {
                 // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
                 for (_frame_seq, _pending) in pending_store.drain_all() {
-                    handler.on_encoded(Err(canceled_error().into()));
+                    stats.in_flight_frames.dec();
+                    notify_encoded(&mut handler, &stats, Err(canceled_error()));
                 }
                 break;
             }
+        }
+    }
+}
+
+/// エンコード結果をハンドラーへ通知し、通知内容に応じて統計を更新する
+///
+/// `Ok` は出力フレーム数と出力ビット数に、`Err` はエラー数に計上する。
+fn notify_encoded<H: EncodeHandler>(
+    handler: &mut H,
+    stats: &EncoderStats,
+    result: Result<EncodedFrame<H::UserData>, Error>,
+) {
+    match result {
+        Ok(frame) => {
+            stats.total_output_frame_count.inc();
+            stats
+                .total_output_bit_count
+                .add(frame.data().len() as u64 * 8);
+            handler.on_encoded(Ok(frame));
+        }
+        Err(error) => {
+            stats.total_error_count.inc();
+            handler.on_encoded(Err(error.into()));
         }
     }
 }
@@ -1819,6 +1892,8 @@ mod tests {
         // コンテキストをエラーに付けることを確認する。
         let (command_tx, command_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker = thread::spawn(move || {
             run_sync_worker(
                 VplLibrary,
@@ -1829,9 +1904,12 @@ mod tests {
                         .send(result.map(|_| ()))
                         .expect("コールバック結果の送信に失敗した");
                 }),
+                worker_stats,
             );
         });
 
+        // encode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 77,
@@ -1870,6 +1948,24 @@ mod tests {
             "残留 pending のエラーは渡したコンテキストを持つこと"
         );
 
+        // 残留 pending はエラー通知のたびにエラー数へ計上し、
+        // 通知を終えた時点で in-flight から取り除かれること
+        assert_eq!(
+            stats.total_error_count.get(),
+            1,
+            "残留 pending のエラー通知がエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.total_output_frame_count.get(),
+            0,
+            "エラー通知は出力フレーム数に計上されないこと"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "残留 pending の通知後に in-flight が 0 であること"
+        );
+
         command_tx
             .send(WorkerCommand::Stop)
             .expect("Stop の送信に失敗した");
@@ -1880,6 +1976,8 @@ mod tests {
     fn worker_stop_returns_aborted_for_all_pending() {
         let (command_tx, command_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker = thread::spawn(move || {
             run_sync_worker(
                 VplLibrary,
@@ -1890,15 +1988,19 @@ mod tests {
                         .send(result.map(|_| ()))
                         .expect("failed to forward callback result");
                 }),
+                worker_stats,
             );
         });
 
+        // encode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 1,
                 pending_frame: make_pending(100, 10),
             })
             .expect("failed to send QueueFrame");
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 2,
@@ -1923,6 +2025,18 @@ mod tests {
         assert_eq!(
             callback_count, 2,
             "expected callbacks for all pending frames"
+        );
+
+        // 中断通知でもエラー数を増やし、in-flight を 0 に戻すこと
+        assert_eq!(
+            stats.total_error_count.get(),
+            2,
+            "中断した全フレームがエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "中断通知の後に in-flight が 0 であること"
         );
     }
 
