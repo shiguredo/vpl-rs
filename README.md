@@ -157,7 +157,7 @@ if let Some(params) = params {
 - AV1 は `sps` に Sequence Header OBU を返し、`vps` と `pps` は `None`
 - VP9 はパラメータセットを持たないため `Ok(None)` を返す
 - `Encoder::encode` と同じスレッドで、`Encoder::encode` と直列になるように呼ぶ
-- `Encoder::reconfigure` でフレームレートや解像度を変えるとパラメータセットの内容が変わるため、必要に応じて `get_sequence_params()` で取得し直す
+- `Encoder::reconfigure` でフレームレートを変えるとパラメータセットの内容が変わるため、必要に応じて `get_sequence_params()` で取得し直す
 - MP4 の `avc1` / `hvc1` は SampleEntry を途中で差し替えられないため、SPS が変わる変更を行う場合は `avc3` / `hev1` を使う
 
 ### デコード

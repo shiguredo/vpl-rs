@@ -535,36 +535,46 @@ const SEQUENCE_PARAM_BUFFER_SIZE: usize = 1024;
 struct SequenceParamBuffers {
     /// mfxExtCodingOptionSPSPPS（SPS / PPS の書き込み先を保持する）
     spspps: Box<sys::mfxExtCodingOptionSPSPPS>,
-    /// mfxExtCodingOptionVPS（HEVC のみ）
+    /// mfxExtCodingOptionVPS（要求した場合のみ）
     vps_ext: Option<Box<sys::mfxExtCodingOptionVPS>>,
     /// SPS の書き込み先
     sps: Vec<u8>,
-    /// PPS の書き込み先
+    /// PPS の書き込み先（要求しない場合は空）
     pps: Vec<u8>,
-    /// VPS の書き込み先
+    /// VPS の書き込み先（要求しない場合は空）
     vps: Vec<u8>,
 }
 
 impl SequenceParamBuffers {
     /// 読み戻し用バッファ一式を構築する
     ///
-    /// `with_vps` は HEVC の場合だけ true にする。
-    fn new(with_vps: bool) -> Self {
+    /// `with_vps` が true の場合は VPS 用バッファを、`with_pps` が true の場合は
+    /// PPS 用バッファを構築する。
+    fn new(with_vps: bool, with_pps: bool) -> Self {
         let mut sps = vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE];
-        let mut pps = vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE];
-        let mut vps = vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE];
+        // PPS を要求しない場合は読み戻し用の領域を確保しない
+        let mut pps = if with_pps {
+            vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE]
+        } else {
+            Vec::new()
+        };
+        // VPS を要求しない場合は読み戻し用の領域を確保しない
+        let mut vps = if with_vps {
+            vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE]
+        } else {
+            Vec::new()
+        };
 
         let mut spspps: sys::mfxExtCodingOptionSPSPPS = unsafe { std::mem::zeroed() };
         spspps.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION_SPSPPS;
         spspps.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOptionSPSPPS>() as u32;
         spspps.SPSBuffer = sps.as_mut_ptr();
-        spspps.PPSBuffer = pps.as_mut_ptr();
         spspps.SPSBufSize = SEQUENCE_PARAM_BUFFER_SIZE as u16;
-        spspps.PPSBufSize = SEQUENCE_PARAM_BUFFER_SIZE as u16;
+        if with_pps {
+            spspps.PPSBuffer = pps.as_mut_ptr();
+            spspps.PPSBufSize = SEQUENCE_PARAM_BUFFER_SIZE as u16;
+        }
 
-        // H.264 / AV1 に mfxExtCodingOptionVPS を attach すると
-        // MFXVideoENCODE_GetVideoParam が MFX_ERR_UNSUPPORTED を返すため、
-        // VPS を持つ HEVC の場合だけ構築する。
         let vps_ext = if with_vps {
             let mut vps_ext: sys::mfxExtCodingOptionVPS = unsafe { std::mem::zeroed() };
             vps_ext.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION_VPS;
@@ -623,18 +633,24 @@ fn clear_ext_param(video_param: &mut sys::mfxVideoParam) {
 ///
 /// 先頭のスタートコード (`00 00 00 01` / `00 00 01`) を除去したバイト列を返す。
 /// VPL が報告したサイズが 0 の場合、確保したバッファの容量を超える場合、
-/// スタートコードを除いた結果が空になる場合は `Err` を返す。
-fn read_sequence_param(buffer: &[u8], size: u16, name: &str) -> Result<Vec<u8>, Error> {
+/// スタートコードを除いた結果が空になる場合は `Err` を返す。`function` は
+/// エラーに付ける呼び出し元の関数名である。
+fn read_sequence_param(
+    buffer: &[u8],
+    size: u16,
+    name: &str,
+    function: &'static str,
+) -> Result<Vec<u8>, Error> {
     let size = usize::from(size);
     if size == 0 {
         return Err(Error::new_custom_owned(
-            "Encoder::get_sequence_params",
+            function,
             format!("{name} is not available"),
         ));
     }
     let data = buffer.get(..size).ok_or_else(|| {
         Error::new_custom_owned(
-            "Encoder::get_sequence_params",
+            function,
             format!(
                 "{name} size {size} exceeds the readback buffer size {}",
                 buffer.len()
@@ -644,7 +660,7 @@ fn read_sequence_param(buffer: &[u8], size: u16, name: &str) -> Result<Vec<u8>, 
     let data = strip_start_code(data);
     if data.is_empty() {
         return Err(Error::new_custom_owned(
-            "Encoder::get_sequence_params",
+            function,
             format!("{name} is empty after removing the start code"),
         ));
     }
@@ -1407,6 +1423,30 @@ impl<H: EncodeHandler> Encoder<H> {
         result
     }
 
+    /// 現在の作業パラメータを読み戻す
+    ///
+    /// `ext_bufs` は VPL に attach する拡張バッファのポインタ配列である。
+    /// VPL の呼び出し後に `mfxVideoParam` の ExtParam をクリアして返す。
+    fn read_video_param(
+        &self,
+        ext_bufs: &mut [*mut sys::mfxExtBuffer],
+    ) -> Result<sys::mfxVideoParam, Error> {
+        let mut param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
+        param.IOPattern = self.video_param.IOPattern;
+
+        attach_ext_param(&mut param, ext_bufs);
+        let result = self
+            .session
+            .lib()
+            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param);
+
+        // 成功・失敗にかかわらず、拡張バッファのポインタを残さない
+        clear_ext_param(&mut param);
+        result?;
+
+        Ok(param)
+    }
+
     /// エンコーダが現在使用しているパラメータを取得する
     ///
     /// 基本パラメータと、要求した拡張バッファの実効値を返す。拡張バッファの値は
@@ -1415,25 +1455,12 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 拡張バッファを要求していない場合、対応する [`ExtParams`] のフィールドは
     /// `None` になる。
     pub fn get_video_param(&self) -> Result<VideoParam, Error> {
-        let mut param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
-        // 出力先の mfxVideoParam にも Init 時の IOPattern を設定する
-        param.IOPattern = self.video_param.IOPattern;
-
         // 読み戻し用のバッファは毎回新しく構築する。
         // 保持している要求値のバッファを読み戻し先に使うと、要求値が実効値で
         // 上書きされ、以降の Reset が要求値ではなくなる。
         let mut readback = self.ext_buffers.zeroed_copy();
         let mut ext_bufs = readback.ext_param();
-        attach_ext_param(&mut param, &mut ext_bufs);
-
-        let result = self
-            .session
-            .lib()
-            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param);
-
-        // 成功・失敗にかかわらず、返す mfxVideoParam に拡張バッファのポインタを残さない
-        clear_ext_param(&mut param);
-        result?;
+        let param = self.read_video_param(&mut ext_bufs)?;
 
         Ok(VideoParam {
             param,
@@ -1443,7 +1470,7 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// 現在の作業パラメータセット (SPS / PPS / VPS) を取得する
     ///
-    /// H.264, HEVC, AV1 以外のコーデックはパラメータセットを持たないため `Ok(None)` を返す。
+    /// H.264 / HEVC / AV1 以外のコーデックはパラメータセットを持たないため `Ok(None)` を返す。
     ///
     /// 返るのは現在の作業パラメータセットであり、次にエンコードするフレームに
     /// 適用される。エンコード済みで出力待ちのフレームに適用されたものではない。
@@ -1465,6 +1492,9 @@ impl<H: EncodeHandler> Encoder<H> {
     pub fn get_sequence_params(&self) -> Result<Option<SequenceParams>, Error> {
         // コーデックごとに取得するパラメータセットを明示する
         // タプルは左から (VPS を取得するか, PPS を取得するか) を表す
+        // H.264 / AV1 に mfxExtCodingOptionVPS を attach すると
+        // MFXVideoENCODE_GetVideoParam が MFX_ERR_UNSUPPORTED を返すため、
+        // VPS は HEVC の場合だけ要求する
         let (with_vps, with_pps) = match self.codec {
             VideoCodecType::H264 => (false, true),
             VideoCodecType::Hevc => (true, true),
@@ -1474,49 +1504,29 @@ impl<H: EncodeHandler> Encoder<H> {
             VideoCodecType::Av1 => (false, false),
         };
 
-        let mut param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
-        param.IOPattern = self.video_param.IOPattern;
-
-        let mut buffers = SequenceParamBuffers::new(with_vps);
+        let mut buffers = SequenceParamBuffers::new(with_vps, with_pps);
         let mut ext_bufs = buffers.ext_param();
-        attach_ext_param(&mut param, &mut ext_bufs);
+        self.read_video_param(&mut ext_bufs)?;
 
-        let result = self
-            .session
-            .lib()
-            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param);
-
-        // 成功・失敗にかかわらず、拡張バッファのポインタを残さないよう ExtParam をクリアする
-        clear_ext_param(&mut param);
-        result?;
-
-        let sps = read_sequence_param(&buffers.sps, buffers.spspps.SPSBufSize, "SPS")?;
+        let function = "Encoder::get_sequence_params";
+        let sps = read_sequence_param(&buffers.sps, buffers.spspps.SPSBufSize, "SPS", function)?;
 
         let pps = if with_pps {
             Some(read_sequence_param(
                 &buffers.pps,
                 buffers.spspps.PPSBufSize,
                 "PPS",
+                function,
             )?)
         } else {
             None
         };
 
-        let vps = if with_vps {
-            let vps_ext = buffers.vps_ext.as_ref().ok_or_else(|| {
-                Error::new_custom(
-                    "Encoder::get_sequence_params",
-                    "mfxExtCodingOptionVPS is not attached",
-                )
-            })?;
-            Some(read_sequence_param(
-                &buffers.vps,
-                vps_ext.VPSBufSize,
-                "VPS",
-            )?)
-        } else {
-            None
-        };
+        let vps = buffers
+            .vps_ext
+            .as_ref()
+            .map(|vps_ext| read_sequence_param(&buffers.vps, vps_ext.VPSBufSize, "VPS", function))
+            .transpose()?;
 
         Ok(Some(SequenceParams { vps, sps, pps }))
     }
@@ -2551,7 +2561,7 @@ mod tests {
     #[test]
     fn read_sequence_param_rejects_zero_size() {
         // サイズ 0 は「パラメータセットが存在しない」ではなく「取得できなかった」を表す
-        let error = read_sequence_param(&[0u8; 8], 0, "SPS")
+        let error = read_sequence_param(&[0u8; 8], 0, "SPS", "Encoder::get_sequence_params")
             .expect_err("サイズ 0 のパラメータセットはエラーになること");
         assert_eq!(error.function(), "Encoder::get_sequence_params");
         assert_eq!(
@@ -2564,7 +2574,7 @@ mod tests {
     #[test]
     fn read_sequence_param_rejects_size_larger_than_buffer() {
         // VPL が確保した容量を超えるサイズを報告した場合は、範囲外アクセスせずエラーにする
-        let error = read_sequence_param(&[0u8; 8], 9, "SPS")
+        let error = read_sequence_param(&[0u8; 8], 9, "SPS", "Encoder::get_sequence_params")
             .expect_err("バッファ容量を超えるサイズはエラーになること");
         assert_eq!(error.function(), "Encoder::get_sequence_params");
         assert_eq!(
@@ -2578,25 +2588,41 @@ mod tests {
     fn read_sequence_param_returns_bytes_without_start_code() {
         // サイズで切り詰めたうえでスタートコードを除去したバイト列を返す
         let buffer = [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xFF, 0xFF];
-        let data = read_sequence_param(&buffer, 6, "SPS")
+        let data = read_sequence_param(&buffer, 6, "SPS", "Encoder::get_sequence_params")
             .expect("スタートコード付きのパラメータセットを取得できること");
         assert_eq!(data, vec![0x67, 0x42]);
     }
 
     #[test]
-    fn sequence_param_buffers_attach_vps_only_when_requested() {
-        // HEVC 以外では mfxExtCodingOptionVPS を attach しない
-        // （attach すると MFXVideoENCODE_GetVideoParam が MFX_ERR_UNSUPPORTED を返す）
-        let mut without_vps = SequenceParamBuffers::new(false);
-        assert_eq!(without_vps.ext_param().len(), 1);
+    fn sequence_param_buffers_attach_requested_params() {
+        // H.264 は SPS / PPS を要求し、VPS は要求しない
+        let mut h264 = SequenceParamBuffers::new(false, true);
+        assert_eq!(h264.ext_param().len(), 1);
         assert!(
-            without_vps.vps_ext.is_none(),
+            h264.vps_ext.is_none(),
             "VPS を要求していない場合は mfxExtCodingOptionVPS を構築しないこと"
         );
+        assert!(
+            h264.vps.is_empty(),
+            "VPS を要求していない場合は VPS の読み戻し領域を確保しないこと"
+        );
+        assert!(
+            !h264.pps.is_empty(),
+            "PPS を要求した場合は PPS の読み戻し領域を確保すること"
+        );
+        assert!(
+            !h264.spspps.PPSBuffer.is_null(),
+            "PPS を要求した場合は PPSBuffer を設定すること"
+        );
+        assert_eq!(
+            h264.spspps.PPSBufSize, SEQUENCE_PARAM_BUFFER_SIZE as u16,
+            "PPS の書き込み先容量が設定されること"
+        );
 
-        let mut with_vps = SequenceParamBuffers::new(true);
-        assert_eq!(with_vps.ext_param().len(), 2);
-        let vps_ext = with_vps
+        // HEVC は VPS / SPS / PPS を要求する
+        let mut hevc = SequenceParamBuffers::new(true, true);
+        assert_eq!(hevc.ext_param().len(), 2);
+        let vps_ext = hevc
             .vps_ext
             .as_ref()
             .expect("VPS を要求した場合は mfxExtCodingOptionVPS を構築すること");
@@ -2608,6 +2634,34 @@ mod tests {
         assert_eq!(
             vps_ext.VPSBufSize, SEQUENCE_PARAM_BUFFER_SIZE as u16,
             "VPS の書き込み先容量が設定されること"
+        );
+        assert!(
+            !hevc.pps.is_empty(),
+            "PPS を要求した場合は PPS の読み戻し領域を確保すること"
+        );
+
+        // AV1 は Sequence Header OBU だけを要求し、VPS / PPS は要求しない
+        let mut av1 = SequenceParamBuffers::new(false, false);
+        assert_eq!(av1.ext_param().len(), 1);
+        assert!(
+            av1.vps_ext.is_none(),
+            "VPS を要求していない場合は mfxExtCodingOptionVPS を構築しないこと"
+        );
+        assert!(
+            av1.vps.is_empty(),
+            "VPS を要求していない場合は VPS の読み戻し領域を確保しないこと"
+        );
+        assert!(
+            av1.pps.is_empty(),
+            "PPS を要求していない場合は PPS の読み戻し領域を確保しないこと"
+        );
+        assert!(
+            av1.spspps.PPSBuffer.is_null(),
+            "PPS を要求していない場合は PPSBuffer を設定しないこと"
+        );
+        assert_eq!(
+            av1.spspps.PPSBufSize, 0,
+            "PPS を要求していない場合は PPSBufSize を 0 のままにすること"
         );
     }
 }

@@ -253,6 +253,7 @@ encoder.reconfigure(ReconfigureParams {
 
 警告ステータス (`MFX_WRN_*`) は内部で許容される (`check_mfx_allow_warn`)。 リセット自体は成功している。
 
+- 変更できるのはビットレートとフレームレートだけであり、解像度を変更する場合は `Encoder` を作り直す。
 - reconfigure が `Ok` を返した場合、呼び出し時点で未出力だったフレームはすべて `on_encoded` に `Ok` で通知されている。 `Err` を返した場合は、一部が `Err` で通知されるか、通知されないまま残ることがある。
 - frame_seq は reconfigure 後も継続し、リセットされない。
 - reconfigure は、呼び出し時点までに送信したフレームの Sync 完了と、すべてのコールバックの完了までブロックする。
