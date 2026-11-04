@@ -2041,6 +2041,98 @@ mod tests {
     }
 
     #[test]
+    fn worker_reports_duplicate_frame_sequence() {
+        // decode 側と対称に、同一 frame_seq の QueueFrame を 2 回送信する。
+        // 置き換えられた pending と残留 pending の両方が in-flight から
+        // 取り除かれ、2 件のエラー通知がエラー数に計上されることを確認する。
+        let (command_tx, command_rx) = mpsc::channel();
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<u32, Error>>();
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
+        let worker = thread::spawn(move || {
+            run_sync_worker(
+                VplLibrary,
+                0,
+                command_rx,
+                FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
+                    callback_tx
+                        .send(result.map(|frame| *frame.user_data()))
+                        .expect("コールバック結果の送信に失敗した");
+                }),
+                worker_stats,
+            );
+        });
+
+        // encode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 42,
+                pending_frame: make_pending(100, 1),
+            })
+            .expect("QueueFrame の送信に失敗した");
+        stats.in_flight_frames.inc();
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 42,
+                pending_frame: make_pending(200, 2),
+            })
+            .expect("QueueFrame の送信に失敗した");
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("Stop の送信に失敗した");
+        worker.join().expect("worker スレッドがパニックした");
+
+        // 1 つ目のコールバックが重複 frame_seq のエラー通知であること
+        let callback_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("重複通知コールバックの受信に失敗した");
+        let error = callback_result.expect_err("重複 frame_seq はエラー通知されること");
+        assert_eq!(error.function(), "Encoder::sync_worker");
+        assert_eq!(
+            error.status_message(),
+            Some("duplicate frame sequence in pending frames: 42"),
+            "重複した frame_seq を含むエラーメッセージであること"
+        );
+
+        // 置き換えられた pending は通知済みで、Stop では新しく登録された
+        // pending が残留分として ABORTED 通知されること
+        let stop_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("残留 pending の ABORTED 通知の受信に失敗した");
+        let stop_error = stop_result.expect_err("Stop 時のコールバックはエラーであること");
+        assert_eq!(
+            stop_error.status_code(),
+            Some(sys::mfxStatus_MFX_ERR_ABORTED),
+            "残留 pending は MFX_ERR_ABORTED で通知されること"
+        );
+
+        // 通知は重複エラーと残留 ABORTED の 2 回だけであること
+        assert!(
+            callback_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "通知は 2 回だけであること"
+        );
+
+        assert_eq!(
+            stats.total_error_count.get(),
+            2,
+            "重複エラーと中断エラーがエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.total_output_frame_count.get(),
+            0,
+            "出力フレーム数は増えないこと"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "重複と中断の通知後に in-flight が 0 であること"
+        );
+    }
+
+    #[test]
     fn ext_buffers_zeroed_copy_keeps_header_and_clears_values() {
         // 読み戻し用のバッファは Header を維持したまま値だけを 0 にする。
         // 値が残っていると、VPL が書き戻さなかった場合に要求値がそのまま見えてしまう。

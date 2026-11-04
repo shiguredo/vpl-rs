@@ -114,9 +114,11 @@ impl<'a, T> DecodedFrame<'a, T> {
 /// フィールド間の一貫性は保証されない。
 #[derive(Debug, Clone, Default)]
 pub struct DecoderStats {
-    /// [`Decoder::decode`] が受理した通算回数
+    /// [`Decoder::decode`] が入力を pending に登録した通算回数
     ///
-    /// 入力データの長さ検証やデコーダーの初期化に失敗した呼び出しは計上しない。
+    /// 入力データの長さ検証、デコーダーの初期化、pending の登録に失敗した
+    /// 呼び出しは計上しない。pending の登録後にデコードが失敗した場合と、
+    /// ビットストリームが空の場合も計上する。
     pub total_decode_count: Counter,
 
     /// [`DecodeHandler::on_decoded`] に `Ok` を渡した通算回数
@@ -433,6 +435,8 @@ impl<H: DecodeHandler> Decoder<H> {
             self.stats.in_flight_frames.dec();
             return Err(error);
         }
+        // pending に登録できた時点で通算回数を計上する
+        self.stats.total_decode_count.inc();
 
         // frame_seq を進める。デコード開始前に進めることで、decode_bitstream がエラーを返しても
         // 同じ frame_seq が再利用されることが無いようにする。
@@ -441,12 +445,7 @@ impl<H: DecodeHandler> Decoder<H> {
             .checked_add(1)
             .ok_or_else(|| Error::new_custom("Decoder::decode", "frame sequence overflowed"))?;
 
-        // VPL が受理した時点で通算回数を計上する
-        let result = self.decode_bitstream(&mut bs);
-        if result.is_ok() {
-            self.stats.total_decode_count.inc();
-        }
-        result
+        self.decode_bitstream(&mut bs)
     }
 
     /// ビットストリームをデコードしてフレームを収集する
