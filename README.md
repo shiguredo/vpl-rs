@@ -34,6 +34,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - CBR / VBR / CQP / ICQ / QVBR / LA / AVBR / VCM / LA_ICQ / LA_HRD レート制御モード
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
 - パラメータのサポート可否検証 (MFXVideoENCODE_Query)
+- エンコーダーからの SPS / PPS / VPS 取得 (MP4 / RTP 用のパラメータセット)
 
 ## 動作要件
 
@@ -135,6 +136,29 @@ for _ in 0..2 {
     println!("user_data: {:?}", encoded.user_data());
 }
 ```
+
+### シーケンスパラメータの取得
+
+エンコーダーが現在使用している SPS / PPS / VPS は `Encoder::get_sequence_params()` で取得できます。
+MP4 の SampleEntry (`avcC` / `hvcC` / `av1C`) や RTP の `fmtp` の組み立てに利用できます。
+
+```rust
+let params = encoder.get_sequence_params()?;
+if let Some(params) = params {
+    println!("SPS: {} bytes", params.sps.len());
+    println!("PPS: {:?}", params.pps.as_ref().map(|pps| pps.len()));
+    println!("VPS: {:?}", params.vps.as_ref().map(|vps| vps.len()));
+}
+```
+
+- 返るバイト列はスタートコード (`00 00 00 01` / `00 00 01`) を含まない
+- H.264 は `sps` に SPS、`pps` に PPS を返す
+- HEVC は `vps` に VPS、`sps` に SPS、`pps` に PPS を返す
+- AV1 は `sps` に Sequence Header OBU を返し、`vps` と `pps` は `None`
+- VP9 はパラメータセットを持たないため `Ok(None)` を返す
+- `Encoder::encode` と同じスレッドで、`Encoder::encode` と直列になるように呼ぶ
+- `Encoder::reconfigure` でフレームレートや解像度を変えるとパラメータセットの内容が変わるため、必要に応じて `get_sequence_params()` で取得し直す
+- MP4 の `avc1` / `hvc1` は SampleEntry を途中で差し替えられないため、SPS が変わる変更を行う場合は `avc3` / `hev1` を使う
 
 ### デコード
 
