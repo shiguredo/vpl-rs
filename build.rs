@@ -194,8 +194,6 @@ pub struct mfxBitstream;
 #[derive(Copy, Clone)]
 pub struct mfxEncodeCtrl;
 #[derive(Copy, Clone)]
-pub struct mfxEncodeStat;
-#[derive(Copy, Clone)]
 pub struct mfxExtBuffer;
 #[derive(Copy, Clone)]
 pub struct mfxExtCodingOption2;
