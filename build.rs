@@ -184,6 +184,7 @@ pub type mfxLoader = *mut _mfxLoader;
 pub type mfxSession = *mut _mfxSession;
 pub type mfxSyncPoint = *mut _mfxSyncPoint;
 pub type mfxStatus = ::std::os::raw::c_int;
+pub type mfxResourceType = ::std::os::raw::c_uint;
 
 pub struct _mfxLoader;
 pub struct _mfxSession;
@@ -218,9 +219,13 @@ pub struct mfxImplDescription;
 #[derive(Copy, Clone)]
 pub struct mfxDecoderDescription;
 #[derive(Copy, Clone)]
+pub struct mfxDecoderDescription_decoder;
+#[derive(Copy, Clone)]
 pub struct mfxEncoderDescription;
 #[derive(Copy, Clone)]
 pub struct mfxEncoderDescription_encoder;
+#[derive(Copy, Clone)]
+pub struct mfxRange32U;
 
 pub const mfxStatus_MFX_ERR_NONE: mfxStatus = 0;
 pub const mfxStatus_MFX_ERR_UNKNOWN: mfxStatus = -1;

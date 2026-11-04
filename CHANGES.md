@@ -23,6 +23,14 @@
   - `EncoderStats` を共有統計型として定義し直し、`num_frame` / `num_bit` / `num_cached_frame` を廃止する
   - VPL の生統計 (`mfxEncodeStat`) を返す API はなくなり、`Encoder::stats` で統計を取得する
   - @melpon
+- [CHANGE] `supported_codecs` が返すコーデック情報を VPL の実装記述に合わせて拡充する
+  - `CodecInfo::decoding` / `CodecInfo::encoding` を `Option` に変更し、非対応コーデックでは `None` を返す
+  - `DecodingInfo` / `EncodingInfo` から `supported` / `hardware_accelerated` / `supports_multi_pass` を削除する
+  - プロファイルごとの `ProfileCapabilities` と、メモリタイプごとの `MemoryTypeCapabilities` を追加する
+  - `MemoryTypeCapabilities` は幅・高さの範囲 (`Range`) と色形式をメモリタイプ別に返し、プロファイルやメモリタイプをまたいだ集約はしない
+  - `VideoProfile` / `MemoryType` / `Range` を公開し、未知のプロファイルとメモリタイプは `Unknown(u32)` で保持する
+  - `EncodingProfiles` を削除する
+  - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する
   - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・出力ビット数・in-flight フレーム数を取得できる
   - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する

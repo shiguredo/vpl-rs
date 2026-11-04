@@ -52,7 +52,9 @@ pub enum CodecConfig {
     Av1(Av1EncoderConfig),
 }
 
-/// 入力フレームフォーマット
+/// フレームの色形式
+///
+/// エンコーダーの入力形式として指定する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
     /// Semi-Planar YUV 4:2:0 8bit [Y plane + interleaved UV plane]
@@ -64,6 +66,18 @@ pub enum FrameFormat {
 }
 
 impl FrameFormat {
+    /// MFX_FOURCC_* の値から変換する
+    ///
+    /// 本クレートが表現できない FourCC の場合は `None` を返す。
+    pub(crate) fn from_fourcc(fourcc: u32) -> Option<Self> {
+        match fourcc {
+            sys::MFX_FOURCC_NV12 => Some(Self::Nv12),
+            sys::MFX_FOURCC_YUY2 => Some(Self::Yuy2),
+            sys::MFX_FOURCC_RGB4 => Some(Self::Bgra),
+            _ => None,
+        }
+    }
+
     fn fourcc(self) -> u32 {
         match self {
             FrameFormat::Nv12 => sys::MFX_FOURCC_NV12,
@@ -2093,6 +2107,18 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    /// すべての FrameFormat が FourCC との相互変換で往復すること
+    #[test]
+    fn frame_format_fourcc_roundtrip() {
+        for format in [FrameFormat::Nv12, FrameFormat::Yuy2, FrameFormat::Bgra] {
+            assert_eq!(
+                FrameFormat::from_fourcc(format.fourcc()),
+                Some(format),
+                "{format:?} の FourCC 変換が往復しない"
+            );
+        }
+    }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {
         PendingFrame {
