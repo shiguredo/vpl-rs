@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-04
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-encoder-decoder-stats-api
 - Polished: {YYYY-MM-DD}
@@ -51,3 +51,32 @@ nvcodec-rs は `Encoder::stats()` / `Decoder::stats()` で共有カウンタ (`C
 8. `total_output_bit_count` が出力ビットストリームの総ビット数と一致することをテストで固定する。
 9. `CHANGES.md` の `## develop` に `[ADD]` (統計 API) と `[CHANGE]` (`get_encode_stat` と旧 `EncoderStats` の削除) を追記する。
 10. `skills/shiguredo-vpl/SKILL.md` の公開 API 一覧を更新する。
+
+## 解決方法
+
+`Counter` / `Gauge` と共有統計型 `EncoderStats` / `DecoderStats` を追加し、`Encoder::stats()` / `Decoder::stats()` から統計を取得できるようにした。`Encoder::get_encode_stat()` と VPL の生統計を返す `EncoderStats` は削除した。
+
+### 変更内容
+
+- `src/stats.rs` に `Counter` / `Gauge` を追加した
+- `Encoder::stats()` / `Decoder::stats()` と `EncoderStats` / `DecoderStats` を追加した
+- `Encoder::get_encode_stat()` を削除し、VPL の生統計を返す `EncoderStats` を共有統計型に置き換えた
+- in-flight・エラー・reconfigure 成功・出力ビット数の計上を実装した
+- `total_decode_count` は pending 登録時点で計上し、登録後のデコード失敗と空入力も計上するようにした
+- 統計の単体テストと実機テストを追加した
+- `CHANGES.md` と `skills/shiguredo-vpl/SKILL.md` を更新した
+
+### 確認
+
+`shiguredo-gmktec-k9` の `~/melpon/vpl-rs` で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `INTEL_VPL=1 cargo test --workspace` | pass（lib 27 件、adapter 6 件、roundtrip 30 件、doctest 2 件） |
+| `DOCS_RS=1 cargo doc --no-deps` | pass |
+
+### 参考
+
+- PR: https://github.com/shiguredo/vpl-rs/pull/20
