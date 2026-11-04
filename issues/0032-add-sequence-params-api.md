@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-05
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-sequence-params-api
 - Polished: {YYYY-MM-DD}
@@ -90,3 +90,27 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) で `MFXVideoENCODE_GetVideoParam` �
 - VPL の仕様: `MFXVideoENCODE_GetVideoParam` の説明 (`api/vpl/mfxvideo.h`)
 - Intel 実装: vpl-gpu-rt の H.264 / HEVC / AV1 エンコーダー実装
 - 同種の API: nvcodec-rs の `Encoder::get_sequence_params()`、video-toolbox-rs の `EncodedFrame::sps_list` / `pps_list` / `vps_list`
+
+## 解決方法
+
+`SequenceParams` と `Encoder::get_sequence_params()` を追加し、エンコーダーが現在使用している SPS / PPS / VPS を取得できるようにした。H.264 / HEVC はスタートコードを除去した NAL、AV1 は Sequence Header OBU をそのまま返し、VP9 は `Ok(None)` を返す。
+
+### 変更内容
+
+- `SequenceParams` と `Encoder::get_sequence_params()` を追加した
+- H.264 / HEVC / AV1 / VP9 のパラメータセット取得とエラー条件を実装した
+- パラメータセットの型・スタートコード除去・reconfigure のテストを追加した
+- `CHANGES.md` / README.md / `skills/shiguredo-vpl/SKILL.md` を更新した
+- docs.rs 向けのダミーバインドに必要な型を追加した
+- VPS / PPS の不要な読み戻しバッファを削減し、GetVideoParam の読み戻し処理を共通化した
+
+### 確認
+
+`shiguredo-gmktec-k9` の `~/melpon/vpl-rs` で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `INTEL_VPL=1 cargo test --workspace` | pass（lib 34 件、adapter 6 件、roundtrip 36 件、doctest 2 件） |
+| `DOCS_RS=1 cargo doc --no-deps` | pass |
