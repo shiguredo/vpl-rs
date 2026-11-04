@@ -19,6 +19,15 @@
 - [CHANGE] `Encoder::get_video_param` の戻り値を `VideoParam` に変更する
   - 要求した拡張バッファの実効値を `ExtParams` として返す
   - @melpon
+- [CHANGE] `Encoder::get_encode_stat` と旧 `EncoderStats` を削除する
+  - `EncoderStats` を共有統計型として定義し直し、`num_frame` / `num_bit` / `num_cached_frame` を廃止する
+  - VPL の生統計 (`mfxEncodeStat`) を返す API はなくなり、`Encoder::stats` で統計を取得する
+  - @melpon
+- [ADD] エンコーダーとデコーダーの統計 API を追加する
+  - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・出力ビット数・in-flight フレーム数を取得できる
+  - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する
+  - 統計の型として `Counter` / `Gauge` を公開する
+  - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon

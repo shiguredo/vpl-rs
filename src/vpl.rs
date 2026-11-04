@@ -148,16 +148,6 @@ impl VplLibrary {
         Error::check_mfx(status, "MFXVideoENCODE_GetVideoParam")
     }
 
-    /// MFXVideoENCODE_GetEncodeStat を呼び出してエンコード統計情報を取得する
-    pub(crate) fn mfx_video_encode_get_encode_stat(
-        &self,
-        session: sys::mfxSession,
-        stat: *mut sys::mfxEncodeStat,
-    ) -> Result<(), Error> {
-        let status = unsafe { sys::MFXVideoENCODE_GetEncodeStat(session, stat) };
-        Error::check_mfx(status, "MFXVideoENCODE_GetEncodeStat")
-    }
-
     /// MFXVideoDECODE_DecodeHeader を呼び出してビットストリームからパラメータを読み取る
     pub(crate) fn mfx_video_decode_decode_header(
         &self,

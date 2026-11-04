@@ -93,6 +93,7 @@ mod codec_info;
 mod decode;
 mod encode;
 mod error;
+mod stats;
 mod sys;
 mod vpl;
 
@@ -104,7 +105,9 @@ pub mod ffi {
 
 pub use adapter::{AdapterInfo, AdapterSelector, MediaAdapterType, PciAddress, list_adapters};
 pub use codec_info::*;
-pub use decode::{DecodeHandler, DecodedFrame, Decoder, DecoderConfig, FnDecodeHandler};
+pub use decode::{
+    DecodeHandler, DecodedFrame, Decoder, DecoderConfig, DecoderStats, FnDecodeHandler,
+};
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
     EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, FrameFormat, H264EncoderConfig,
@@ -112,6 +115,7 @@ pub use encode::{
     Vp9EncoderConfig,
 };
 pub use error::Error;
+pub use stats::{Counter, Gauge};
 pub use vpl::{frame_type, gop_opt_flag};
 
 /// ビルド時に参照したバージョン
