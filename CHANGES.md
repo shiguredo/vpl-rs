@@ -28,6 +28,10 @@
   - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する
   - 統計の型として `Counter` / `Gauge` を公開する
   - @melpon
+- [ADD] エンコーダーから SPS / PPS / VPS を取得する API を追加する
+  - `Encoder::get_sequence_params` でスタートコードを含まない NAL / OBU を取得できる
+  - `SequenceParams` を公開し、AV1 は Sequence Header OBU、VP9 は `None` を返す
+  - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon

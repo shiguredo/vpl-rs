@@ -1504,6 +1504,247 @@ fn test_write_ivf_headers_getter_false_for_non_vp9() {
     );
 }
 
+// --- シーケンスパラメータ ---
+
+/// シーケンスパラメータ取得用のエンコーダ設定を返す
+///
+/// パラメータセットの内容だけを検証するため、小さい解像度と CQP を使う。
+fn sequence_params_config(codec: CodecConfig) -> EncoderConfig {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        codec,
+        320,
+        240,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cqp,
+    );
+    config.qpi = Some(26);
+    config.qpp = Some(28);
+    config.qpb = Some(30);
+    config
+}
+
+/// シーケンスパラメータ取得用のエンコーダを生成する
+fn create_sequence_params_encoder(config: EncoderConfig) -> Encoder<FnEncodeHandler<()>> {
+    Encoder::new(
+        config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )
+    .expect("エンコーダーの生成に失敗した")
+}
+
+/// バイト列の先頭にスタートコードが含まれないことを検証する
+fn assert_no_start_code(name: &str, data: &[u8]) {
+    assert!(
+        !data.starts_with(&[0x00, 0x00, 0x01]),
+        "{name} の先頭に 3 バイトのスタートコードが含まれている"
+    );
+    assert!(
+        !data.starts_with(&[0x00, 0x00, 0x00, 0x01]),
+        "{name} の先頭に 4 バイトのスタートコードが含まれている"
+    );
+}
+
+/// H.264 の SPS / PPS を Init 直後に取得できることを検証する
+#[test]
+fn test_sequence_params_h264() {
+    let encoder = create_sequence_params_encoder(sequence_params_config(CodecConfig::H264(
+        H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        },
+    )));
+
+    // フレームを 1 枚もエンコードしていない状態でも取得できること
+    let params = encoder
+        .get_sequence_params()
+        .expect("シーケンスパラメータの取得に失敗した")
+        .expect("H.264 はシーケンスパラメータを返すこと");
+
+    // H.264 の NAL ヘッダは下位 5 ビットが nal_unit_type である
+    assert_eq!(
+        params.sps[0] & 0x1F,
+        7,
+        "SPS の NAL タイプが 7 (sequence parameter set) であること"
+    );
+    let pps = params.pps.as_ref().expect("H.264 は PPS を返すこと");
+    assert_eq!(
+        pps[0] & 0x1F,
+        8,
+        "PPS の NAL タイプが 8 (picture parameter set) であること"
+    );
+    assert!(params.vps.is_none(), "H.264 は VPS を返さないこと");
+    assert_no_start_code("SPS", &params.sps);
+    assert_no_start_code("PPS", pps);
+}
+
+/// HEVC の VPS / SPS / PPS を Init 直後に取得できることを検証する
+#[test]
+fn test_sequence_params_hevc() {
+    let encoder = create_sequence_params_encoder(sequence_params_config(CodecConfig::Hevc(
+        HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        },
+    )));
+
+    let params = encoder
+        .get_sequence_params()
+        .expect("シーケンスパラメータの取得に失敗した")
+        .expect("HEVC はシーケンスパラメータを返すこと");
+
+    // HEVC の NAL ヘッダは先頭 1 バイトのビット 1-6 が nal_unit_type である
+    let nal_unit_type = |data: &[u8]| (data[0] >> 1) & 0x3F;
+    let vps = params.vps.as_ref().expect("HEVC は VPS を返すこと");
+    assert_eq!(nal_unit_type(vps), 32, "VPS の NAL タイプが 32 であること");
+    assert_eq!(
+        nal_unit_type(&params.sps),
+        33,
+        "SPS の NAL タイプが 33 であること"
+    );
+    let pps = params.pps.as_ref().expect("HEVC は PPS を返すこと");
+    assert_eq!(nal_unit_type(pps), 34, "PPS の NAL タイプが 34 であること");
+    assert_no_start_code("VPS", vps);
+    assert_no_start_code("SPS", &params.sps);
+    assert_no_start_code("PPS", pps);
+}
+
+/// AV1 の Sequence Header OBU を Init 直後に取得できることを検証する
+#[test]
+fn test_sequence_params_av1() {
+    let encoder = create_sequence_params_encoder(sequence_params_config(CodecConfig::Av1(
+        Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        },
+    )));
+
+    let params = encoder
+        .get_sequence_params()
+        .expect("シーケンスパラメータの取得に失敗した")
+        .expect("AV1 はシーケンスパラメータを返すこと");
+
+    // AV1 の OBU ヘッダは forbidden bit の次の 4 ビットが obu_type である
+    let obu = &params.sps;
+    assert_eq!(obu[0] & 0x80, 0, "OBU の forbidden bit が 0 であること");
+    assert_eq!(
+        (obu[0] >> 3) & 0x0F,
+        1,
+        "Sequence Header OBU (OBU タイプ 1) であること"
+    );
+    assert!(params.vps.is_none(), "AV1 は VPS を返さないこと");
+    assert!(params.pps.is_none(), "AV1 は PPS を返さないこと");
+    assert_no_start_code("Sequence Header OBU", obu);
+}
+
+/// VP9 はパラメータセットを持たず `Ok(None)` を返すことを検証する
+#[test]
+fn test_sequence_params_vp9_returns_none() {
+    let encoder = create_sequence_params_encoder(sequence_params_config(CodecConfig::Vp9(
+        Vp9EncoderConfig {
+            profile: Some(Vp9Profile::Profile0),
+            write_ivf_headers: false,
+        },
+    )));
+
+    let params = encoder
+        .get_sequence_params()
+        .expect("VP9 のシーケンスパラメータ取得に失敗した");
+    assert!(params.is_none(), "VP9 は Ok(None) を返すこと");
+}
+
+/// encode の前後でシーケンスパラメータが変わらないことを検証する
+#[test]
+fn test_sequence_params_unchanged_by_encode() {
+    let codecs = [
+        (
+            CodecConfig::H264(H264EncoderConfig {
+                profile: Some(H264Profile::High),
+            }),
+            "H.264",
+        ),
+        (
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(HevcProfile::Main),
+            }),
+            "HEVC",
+        ),
+        (
+            CodecConfig::Av1(Av1EncoderConfig {
+                profile: Some(Av1Profile::Main),
+            }),
+            "AV1",
+        ),
+    ];
+
+    for (codec, codec_name) in codecs {
+        let mut encoder = create_sequence_params_encoder(sequence_params_config(codec));
+        let before = encoder
+            .get_sequence_params()
+            .expect("シーケンスパラメータの取得に失敗した");
+
+        let (coded_width, coded_height) = encoder.coded_size();
+        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, 0);
+        encoder
+            .encode(
+                &frame_data,
+                (),
+                &EncodeOptions {
+                    frame_type: frame_type::UNKNOWN,
+                },
+            )
+            .expect("エンコードに失敗した");
+        encoder.finish().expect("finish に失敗した");
+
+        let after = encoder
+            .get_sequence_params()
+            .expect("シーケンスパラメータの取得に失敗した");
+        assert_eq!(
+            before, after,
+            "{codec_name} で encode の前後でシーケンスパラメータが変わらないこと"
+        );
+    }
+}
+
+/// reconfigure でフレームレートを変えると SPS が変わり、その後も取得できることを検証する
+#[test]
+fn test_sequence_params_change_after_reconfigure() {
+    let mut encoder = create_sequence_params_encoder(sequence_params_config(CodecConfig::H264(
+        H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        },
+    )));
+
+    let before = encoder
+        .get_sequence_params()
+        .expect("シーケンスパラメータの取得に失敗した")
+        .expect("H.264 はシーケンスパラメータを返すこと");
+
+    // H.264 の SPS の VUI にはフレームレートが timing info として入る
+    encoder
+        .reconfigure(ReconfigureParams {
+            framerate_num: Some(60),
+            framerate_den: Some(1),
+            ..Default::default()
+        })
+        .expect("reconfigure に失敗した");
+
+    // reconfigure 後も取得でき、SPS の内容が変わっていること
+    let after = encoder
+        .get_sequence_params()
+        .expect("reconfigure 後のシーケンスパラメータ取得に失敗した")
+        .expect("H.264 は reconfigure 後もシーケンスパラメータを返すこと");
+    assert_ne!(
+        before.sps, after.sps,
+        "reconfigure でフレームレートを変えると SPS の内容が変わること"
+    );
+    assert_eq!(
+        after.sps[0] & 0x1F,
+        7,
+        "reconfigure 後の SPS の NAL タイプが 7 であること"
+    );
+    assert_no_start_code("SPS", &after.sps);
+}
+
 // --- 統計 ---
 
 /// 指定した設定でフレームをエンコードし、フレームごとのビットストリームを返す

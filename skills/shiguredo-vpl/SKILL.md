@@ -30,7 +30,7 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
 - `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `CodecInfo` / `DecodingInfo` / `EncodingInfo` / `EncodingProfiles`
 - `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `VideoParam` / `ExtParams` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `SequenceParams` / `VideoParam` / `ExtParams` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `stats` — `Counter` / `Gauge`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
@@ -253,6 +253,7 @@ encoder.reconfigure(ReconfigureParams {
 
 警告ステータス (`MFX_WRN_*`) は内部で許容される (`check_mfx_allow_warn`)。 リセット自体は成功している。
 
+- 変更できるのはビットレートとフレームレートだけであり、解像度を変更する場合は `Encoder` を作り直す。
 - reconfigure が `Ok` を返した場合、呼び出し時点で未出力だったフレームはすべて `on_encoded` に `Ok` で通知されている。 `Err` を返した場合は、一部が `Err` で通知されるか、通知されないまま残ることがある。
 - frame_seq は reconfigure 後も継続し、リセットされない。
 - reconfigure は、呼び出し時点までに送信したフレームの Sync 完了と、すべてのコールバックの完了までブロックする。
@@ -269,6 +270,33 @@ encoder.reconfigure(ReconfigureParams {
 - 基本パラメータは VPL の生の `mfxVideoParam`。共用体メンバの読み出しには `unsafe` が要る。
 - 拡張バッファは `ExtParams` に `mfxExtCodingOption2` / `mfxExtCodingOption3` / `mfxExtVP9Param` の生の構造体として入る。要求していないバッファは `None`。
 - 値は要求値ではなく VPL が報告した実効値。VPL が書き戻さなかった場合はゼロ初期化された値のままになる。
+
+### シーケンスパラメータの取得 (`get_sequence_params`)
+
+- `Encoder::get_sequence_params() -> Result<Option<SequenceParams>, Error>` は、現在の作業パラメータセットを返す。
+- `SequenceParams` は `vps: Option<Vec<u8>>` / `sps: Vec<u8>` / `pps: Option<Vec<u8>>` を持つ。
+  H.264 は `sps` に SPS、`pps` に PPS を入れ、`vps` は `None`。
+  HEVC は `vps` に VPS、`sps` に SPS、`pps` に PPS を入れる。
+  AV1 は `sps` に Sequence Header OBU を入れ、`vps` と `pps` は `None`。
+- VP9 はパラメータセットを持たないため `Ok(None)` を返す。
+- 返るバイト列は、先頭のスタートコード (`00 00 00 01` / `00 00 01`) を除いた NAL / OBU。
+  AV1 の OBU はスタートコードを持たないためそのまま返る。
+- 返るのは次にエンコードするフレームに適用されるパラメータセットであり、出力待ちのフレームに適用されたものではない。
+  内容が変わるのは `Encoder::new` と `Encoder::reconfigure` だけで、`encode()` や IDR の強制では変わらない。
+- `encode()` と同じスレッドで直列に呼ぶ。`on_encoded` コールバックの中から呼んではならない。
+- `reconfigure()` 後に新しいパラメータセットが必要な場合は `get_sequence_params()` を呼び直す。
+- MP4 の `avc1` / `hvc1` は SampleEntry を途中で差し替えられないため、SPS が変わる変更を行う場合は `avc3` / `hev1` を使う。
+
+```rust
+let params = encoder.get_sequence_params()?;
+if let Some(params) = params {
+    // H.264 / HEVC は sps / pps、HEVC はさらに vps を持つ
+    // AV1 の sps は Sequence Header OBU で、vps / pps は None
+    let _sps: &[u8] = &params.sps;
+    let _pps = params.pps.as_deref();
+    let _vps = params.vps.as_deref();
+}
+```
 
 ### `Encoder::query` / 統計
 

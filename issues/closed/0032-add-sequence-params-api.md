@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-05
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-sequence-params-api
 - Polished: {YYYY-MM-DD}
@@ -68,7 +68,7 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) で `MFXVideoENCODE_GetVideoParam` �
   - in-flight のフレームに適用されたものではない
   - SPS / PPS / VPS の内容が変わるのは `Encoder::new` (Init) と `Encoder::reconfigure` (Reset) だけで、`encode()` では変わらない。`EncodeOptions::frame_type` で IDR を強制しても、その時点の SPS / PPS が挿入されるだけで内容は変わらない。この契約は現在の公開 API の範囲でのもので、実行時にシーケンスを変えられる拡張バッファを公開する場合は見直す
   - `reconfigure()` は未出力フレームを drain してから `Reset` するため、`Ok` を返した後にエンコードするフレームは新しいパラメータセットを使う。パラメータセットの切り替えはコールバックの順序で判別できる
-  - `reconfigure()` でフレームレートや解像度を変えた場合は、戻り値を待ってから `get_sequence_params()` を呼び直すこと
+  - `reconfigure()` でフレームレートを変えた場合は `get_sequence_params()` を呼び直すこと。解像度を変更する場合は `Encoder` を作り直す
   - MP4 の `avc1` / `hvc1` は SampleEntry を途中で差し替えられないため、SPS が変わる変更を行う場合は `avc3` / `hev1` にするか、変更しない運用にすること
 - SPS / PPS の挿入制御 (`mfxExtInsertHeaders` / `mfxExtCodingOption2.RepeatPPS`) は本 issue の対象外とする。VPL の既定で SPS は I フレーム、PPS は AVC なら毎フレーム、HEVC なら IDR に付く。`mfxExtInsertHeaders` は Intel 実装では未実装で無視され、`RepeatPPS` が制御できるのは PPS の繰り返しだけであり、取得 API とは独立している。
 
@@ -90,3 +90,27 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) で `MFXVideoENCODE_GetVideoParam` �
 - VPL の仕様: `MFXVideoENCODE_GetVideoParam` の説明 (`api/vpl/mfxvideo.h`)
 - Intel 実装: vpl-gpu-rt の H.264 / HEVC / AV1 エンコーダー実装
 - 同種の API: nvcodec-rs の `Encoder::get_sequence_params()`、video-toolbox-rs の `EncodedFrame::sps_list` / `pps_list` / `vps_list`
+
+## 解決方法
+
+`SequenceParams` と `Encoder::get_sequence_params()` を追加し、エンコーダーが現在使用している SPS / PPS / VPS を取得できるようにした。H.264 / HEVC はスタートコードを除去した NAL、AV1 は Sequence Header OBU をそのまま返し、VP9 は `Ok(None)` を返す。
+
+### 変更内容
+
+- `SequenceParams` と `Encoder::get_sequence_params()` を追加した
+- H.264 / HEVC / AV1 / VP9 のパラメータセット取得とエラー条件を実装した
+- パラメータセットの型・スタートコード除去・reconfigure のテストを追加した
+- `CHANGES.md` / README.md / `skills/shiguredo-vpl/SKILL.md` を更新した
+- docs.rs 向けのダミーバインドに必要な型を追加した
+- VPS / PPS の不要な読み戻しバッファを削減し、GetVideoParam の読み戻し処理を共通化した
+
+### 確認
+
+`shiguredo-gmktec-k9` の `~/melpon/vpl-rs` で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `INTEL_VPL=1 cargo test --workspace` | pass（lib 34 件、adapter 6 件、roundtrip 36 件、doctest 2 件） |
+| `DOCS_RS=1 cargo doc --no-deps` | pass |
