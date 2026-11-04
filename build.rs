@@ -200,6 +200,10 @@ pub struct mfxExtCodingOption2;
 #[derive(Copy, Clone)]
 pub struct mfxExtCodingOption3;
 #[derive(Copy, Clone)]
+pub struct mfxExtCodingOptionSPSPPS;
+#[derive(Copy, Clone)]
+pub struct mfxExtCodingOptionVPS;
+#[derive(Copy, Clone)]
 pub struct mfxExtVP9Param;
 #[derive(Copy, Clone)]
 pub struct mfxFrameData;
