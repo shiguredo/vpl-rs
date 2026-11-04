@@ -111,7 +111,7 @@ pub use decode::{
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
     EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, FrameFormat, H264EncoderConfig,
-    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, VideoParam,
+    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam,
     Vp9EncoderConfig,
 };
 pub use error::Error;
