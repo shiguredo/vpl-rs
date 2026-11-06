@@ -7,8 +7,9 @@ use helpers::test_adapter;
 use shiguredo_vpl::{
     Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder, DecoderConfig, EncodeOptions,
     EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat,
-    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, RateControlMode,
-    ReconfigureParams, VideoCodecType, Vp9EncoderConfig, Vp9Profile, frame_type,
+    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, MemoryType, PictureType,
+    RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile, Vp9EncoderConfig, Vp9Profile,
+    frame_type, supported_codecs,
 };
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
@@ -1112,6 +1113,112 @@ fn generate_dummy_yuy2(
     data
 }
 
+/// ダミー P010 フレームを生成する
+///
+/// 1 サンプル 2 バイトで、10bit の値は 16bit ワードの上位ビットに格納する。
+/// Y プレーンはフレーム番号に応じたグラデーション、UV プレーンは 10bit の中間値 (512) 固定。
+fn generate_dummy_p010(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    frame_index: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
+    let row_bytes = coded_width * 2;
+    let y_size = row_bytes * coded_height;
+    let uv_height = coded_height.div_ceil(2);
+    let mut data = vec![0u8; y_size + row_bytes * uv_height];
+    for y in 0..height {
+        for x in 0..width {
+            let luma = (64 + (x + y + frame_index * 7) % 900) as u16;
+            let offset = y * row_bytes + x * 2;
+            data[offset..offset + 2].copy_from_slice(&(luma << 6).to_le_bytes());
+        }
+    }
+    // UV は 2 画素につき 1 組をインターリーブする (NV12 と同じ並び)
+    let uv = (512u16 << 6).to_le_bytes();
+    for row in 0..uv_height {
+        for x in (0..coded_width).step_by(2) {
+            let offset = y_size + row * row_bytes + x * 2;
+            data[offset..offset + 2].copy_from_slice(&uv);
+            data[offset + 2..offset + 4].copy_from_slice(&uv);
+        }
+    }
+    data
+}
+
+/// ダミー AYUV フレームを生成する
+///
+/// 1 画素を 4 バイト (V, U, Y, A) で格納する。
+/// Y はフレーム番号に応じたグラデーション、U/V は中間値、A は最大値。
+fn generate_dummy_ayuv(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    frame_index: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
+    let mut data = vec![0u8; coded_width * coded_height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * coded_width + x) * 4;
+            data[offset] = 128; // V
+            data[offset + 1] = 128; // U
+            data[offset + 2] = (16 + (x + y + frame_index * 7) % 220) as u8; // Y
+            data[offset + 3] = 255; // A
+        }
+    }
+    data
+}
+
+/// ダミー Y410 フレームを生成する
+///
+/// 1 画素を 4 バイトの 32bit ワードで格納する。
+/// ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に入れる。
+/// Y はフレーム番号に応じたグラデーション、U/V は 10bit の中間値 (512)、A は最大値。
+fn generate_dummy_y410(
+    width: usize,
+    height: usize,
+    coded_width: usize,
+    coded_height: usize,
+    frame_index: usize,
+) -> Vec<u8> {
+    assert!(
+        width <= coded_width && height <= coded_height,
+        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
+        width,
+        height,
+        coded_width,
+        coded_height,
+    );
+    let mut data = vec![0u8; coded_width * coded_height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * coded_width + x) * 4;
+            let luma = (64 + (x + y + frame_index * 7) % 900) as u32;
+            let word = 512u32 | (luma << 10) | (512u32 << 20) | (3u32 << 30);
+            data[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    data
+}
+
 /// ダミー BGRA フレームを生成する
 fn generate_dummy_bgra(
     width: usize,
@@ -1160,6 +1267,15 @@ fn generate_dummy_frame(
         }
         FrameFormat::Bgra => {
             generate_dummy_bgra(width, height, coded_width, coded_height, frame_index)
+        }
+        FrameFormat::P010 => {
+            generate_dummy_p010(width, height, coded_width, coded_height, frame_index)
+        }
+        FrameFormat::Ayuv => {
+            generate_dummy_ayuv(width, height, coded_width, coded_height, frame_index)
+        }
+        FrameFormat::Y410 => {
+            generate_dummy_y410(width, height, coded_width, coded_height, frame_index)
         }
     }
 }
@@ -1251,6 +1367,323 @@ fn test_roundtrip_h264_bgra() {
         FrameFormat::Bgra,
         10,
     );
+}
+
+/// エンコーダーが指定の色形式に対応していない場合のスキップ理由を返す
+///
+/// `supported_codecs()` のエンコード情報から、指定コーデック・プロファイル・
+/// システムメモリの組み合わせで色形式が列挙されているかを確認する。
+/// 対応している場合は `None` を返す。
+fn encoder_format_skip_reason(
+    codec: VideoCodecType,
+    profile: VideoProfile,
+    format: FrameFormat,
+) -> Option<String> {
+    let codecs = supported_codecs(test_adapter()).expect("supported_codecs に失敗した");
+    let Some(info) = codecs.iter().find(|info| info.codec == codec) else {
+        return Some(format!("{codec:?} がケーパビリティ照会に含まれていない"));
+    };
+    let Some(encoding) = &info.encoding else {
+        return Some(format!(
+            "{codec:?} のエンコード情報がケーパビリティ照会に含まれていない"
+        ));
+    };
+    let Some(profile_info) = encoding.profiles.iter().find(|p| p.profile == profile) else {
+        return Some(format!(
+            "{codec:?} の {profile:?} がケーパビリティ照会に含まれていない"
+        ));
+    };
+    let supported = profile_info
+        .memory_types
+        .iter()
+        .filter(|m| m.memory_type == MemoryType::System)
+        .any(|m| m.color_formats.contains(&format));
+    if supported {
+        None
+    } else {
+        Some(format!(
+            "{codec:?} の {profile:?} はシステムメモリで {format:?} に対応していない"
+        ))
+    }
+}
+
+/// ケーパビリティ照会で非対応の場合はスキップ理由を出力して true を返す
+///
+/// 非対応環境でテストを黙って通さないよう、理由を必ず出力する。
+fn skip_if_encoder_format_unsupported(
+    codec: VideoCodecType,
+    profile: VideoProfile,
+    format: FrameFormat,
+) -> bool {
+    match encoder_format_skip_reason(codec, profile, format) {
+        Some(reason) => {
+            eprintln!("スキップ: {reason}");
+            true
+        }
+        None => false,
+    }
+}
+
+/// AYUV 入力のラウンドトリップと Y プレーンの画質検証
+///
+/// 入力の輝度パターンとデコード結果の Y プレーンが一致することを確認する。
+/// これにより AYUV のバイト順 (V, U, Y, A) がエンコーダーに正しく伝わることが検証できる。
+#[test]
+fn test_roundtrip_hevc_ayuv_luma() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Ayuv,
+        30,
+        1,
+        RateControlMode::Cqp,
+    );
+    config.qpi = Some(10);
+    config.gop_pic_size = Some(30);
+    let (coded_width, coded_height) = coded_size_for(&config);
+
+    let frame = generate_dummy_ayuv(width, height, coded_width, coded_height, 0);
+    // generate_dummy_ayuv と同じパターンの 8bit 輝度を期待値にする
+    let expected: Vec<u8> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (16 + (x + y) % 220) as u8))
+        .collect();
+
+    let (_, decoded) = roundtrip(config, codec, &[frame]);
+    let psnr = psnr_y(
+        &expected,
+        &decoded[0].y_data,
+        decoded[0].pitch,
+        width,
+        height,
+    );
+    assert!(
+        psnr >= 30.0,
+        "AYUV 入力の Y プレーンの PSNR が低すぎる: {psnr} dB"
+    );
+}
+
+/// P010 (10bit 4:2:0) 入力の HEVC Main10 ラウンドトリップ
+#[test]
+fn test_roundtrip_hevc_main10_p010() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main10);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::P010) {
+        return;
+    }
+    roundtrip_format(
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        codec,
+        FrameFormat::P010,
+        10,
+    );
+}
+
+/// Y410 (10bit 4:4:4) 入力の HEVC Main10 ラウンドトリップ
+#[test]
+fn test_roundtrip_hevc_main10_y410() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main10);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Y410) {
+        return;
+    }
+    roundtrip_format(
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        codec,
+        FrameFormat::Y410,
+        10,
+    );
+}
+
+/// AYUV (8bit 4:4:4) 入力の HEVC Main ラウンドトリップ
+#[test]
+fn test_roundtrip_hevc_ayuv() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
+        return;
+    }
+    roundtrip_format(
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        }),
+        codec,
+        FrameFormat::Ayuv,
+        10,
+    );
+}
+
+/// AYUV (8bit 4:4:4) 入力の H.264 High ラウンドトリップ
+#[test]
+fn test_roundtrip_h264_ayuv() {
+    let codec = VideoCodecType::H264;
+    let profile = VideoProfile::H264(H264Profile::High);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
+        return;
+    }
+    roundtrip_format(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        codec,
+        FrameFormat::Ayuv,
+        10,
+    );
+}
+
+/// P010 (10bit 4:2:0) 入力の AV1 Main ラウンドトリップ
+#[test]
+fn test_roundtrip_av1_p010() {
+    let codec = VideoCodecType::Av1;
+    let profile = VideoProfile::Av1(Av1Profile::Main);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::P010) {
+        return;
+    }
+    roundtrip_format(
+        CodecConfig::Av1(Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        }),
+        codec,
+        FrameFormat::P010,
+        10,
+    );
+}
+
+/// ケーパビリティ照会で非対応の形式は Encoder::new がエラーを返すこと
+///
+/// AV1 + AYUV のように、ケーパビリティ照会で AYUV が非対応と判定される
+/// 組み合わせを対象にし、初期化が成功してしまわないことを確認する。
+#[test]
+fn test_encoder_new_rejects_unsupported_format() {
+    let codec = VideoCodecType::Av1;
+    let profile = VideoProfile::Av1(Av1Profile::Main);
+    let format = FrameFormat::Ayuv;
+    let Some(reason) = encoder_format_skip_reason(codec, profile, format) else {
+        eprintln!("スキップ: AV1 が AYUV に対応しているため非対応形式のエラーを確認できない");
+        return;
+    };
+    eprintln!("非対応の確認: {reason}");
+
+    let config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::Av1(Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        }),
+        320,
+        240,
+        format,
+        30,
+        1,
+        RateControlMode::Cqp,
+    );
+    let result = Encoder::new(
+        config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    );
+    let error = result
+        .err()
+        .expect("ケーパビリティ照会で非対応の形式なのに Encoder::new が成功した");
+    assert_eq!(error.function(), "MFXVideoENCODE_Init");
+}
+
+/// Init 後の実効パラメータが要求した色形式と一致すること
+///
+/// FourCC / ビット深度 / `mfxFrameInfo.Shift` が Init の前後で変わらないことを確認する。
+/// 10bit 入力のサンプル配置は Shift で指定するため、実効値が要求値と一致しない場合は
+/// エンコーダーが意図したデータ配置で解釈しないことを意味する。
+#[test]
+fn test_encoder_keeps_requested_frame_format() {
+    let cases = [
+        (
+            VideoCodecType::Hevc,
+            VideoProfile::Hevc(HevcProfile::Main10),
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(HevcProfile::Main10),
+            }),
+            FrameFormat::P010,
+            shiguredo_vpl::ffi::MFX_FOURCC_P010,
+            10,
+            // P010 は 16bit ワードの上位 10bit に有効データを置く
+            1,
+        ),
+        (
+            VideoCodecType::Hevc,
+            VideoProfile::Hevc(HevcProfile::Main10),
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(HevcProfile::Main10),
+            }),
+            FrameFormat::Y410,
+            shiguredo_vpl::ffi::MFX_FOURCC_Y410,
+            10,
+            // Y410 は 10bit 幅のフィールドにそのまま格納する
+            0,
+        ),
+        (
+            VideoCodecType::Hevc,
+            VideoProfile::Hevc(HevcProfile::Main),
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(HevcProfile::Main),
+            }),
+            FrameFormat::Ayuv,
+            shiguredo_vpl::ffi::MFX_FOURCC_AYUV,
+            8,
+            0,
+        ),
+    ];
+    for (codec, profile, codec_config, format, fourcc, bit_depth, shift) in cases {
+        if skip_if_encoder_format_unsupported(codec, profile, format) {
+            continue;
+        }
+        let config = EncoderConfig::new(
+            test_adapter(),
+            codec_config,
+            320,
+            240,
+            format,
+            30,
+            1,
+            RateControlMode::Cqp,
+        );
+        let encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+        )
+        .unwrap_or_else(|error| panic!("{format:?} のエンコーダー初期化に失敗した: {error}"));
+
+        let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+        let frame_info = unsafe { param.param.__bindgen_anon_1.mfx.FrameInfo };
+        assert_eq!(
+            frame_info.FourCC, fourcc,
+            "{format:?} の FourCC が Init 後に変わった"
+        );
+        assert_eq!(
+            frame_info.BitDepthLuma, bit_depth,
+            "{format:?} の BitDepthLuma が Init 後に変わった"
+        );
+        assert_eq!(
+            frame_info.BitDepthChroma, bit_depth,
+            "{format:?} の BitDepthChroma が Init 後に変わった"
+        );
+        assert_eq!(
+            frame_info.Shift, shift,
+            "{format:?} の Shift が Init 後に変わった"
+        );
+    }
 }
 
 /// NV12 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ

@@ -302,25 +302,54 @@ impl ValueRange {
 }
 
 /// フレームの色形式
+///
+/// エンコーダーの入力と、エンコード・デコードのケーパビリティ照会で使う。
+/// 各バリアントのバイト配置は [`FrameFormat::frame_size`] の項で説明する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
     /// Semi-Planar YUV 4:2:0 8bit [Y プレーン + インターリーブ UV プレーン]
     Nv12,
+    /// Semi-Planar YUV 4:2:0 10bit [Y プレーン + インターリーブ UV プレーン]
+    ///
+    /// 各サンプルは 16bit ワードの上位 10bit に格納する (P010)。
+    P010,
     /// Packed YUV 4:2:2 8bit [YUYV インターリーブ]
     Yuy2,
     /// Packed BGRA 8bit
     Bgra,
+    /// Packed YUV 4:4:4 8bit [メモリ上のバイト順は V, U, Y, A]
+    Ayuv,
+    /// Packed YUV 4:4:4 10bit
+    ///
+    /// 各サンプルは 32bit ワードで、下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に格納する (Y410)。
+    Y410,
 }
 
 impl FrameFormat {
+    /// すべての色形式を返す
+    #[cfg(test)]
+    pub(crate) fn all() -> &'static [Self] {
+        &[
+            Self::Nv12,
+            Self::P010,
+            Self::Yuy2,
+            Self::Bgra,
+            Self::Ayuv,
+            Self::Y410,
+        ]
+    }
+
     /// MFX_FOURCC_* の値から変換する
     ///
     /// 本クレートが表現できない FourCC の場合は `None` を返す。
     pub(crate) fn from_fourcc(fourcc: u32) -> Option<Self> {
         match fourcc {
             sys::MFX_FOURCC_NV12 => Some(Self::Nv12),
+            sys::MFX_FOURCC_P010 => Some(Self::P010),
             sys::MFX_FOURCC_YUY2 => Some(Self::Yuy2),
             sys::MFX_FOURCC_RGB4 => Some(Self::Bgra),
+            sys::MFX_FOURCC_AYUV => Some(Self::Ayuv),
+            sys::MFX_FOURCC_Y410 => Some(Self::Y410),
             _ => None,
         }
     }
@@ -328,35 +357,96 @@ impl FrameFormat {
     pub(crate) fn fourcc(self) -> u32 {
         match self {
             FrameFormat::Nv12 => sys::MFX_FOURCC_NV12,
+            FrameFormat::P010 => sys::MFX_FOURCC_P010,
             FrameFormat::Yuy2 => sys::MFX_FOURCC_YUY2,
             FrameFormat::Bgra => sys::MFX_FOURCC_RGB4,
+            FrameFormat::Ayuv => sys::MFX_FOURCC_AYUV,
+            FrameFormat::Y410 => sys::MFX_FOURCC_Y410,
         }
     }
 
     pub(crate) fn chroma_format(self) -> u16 {
         match self {
-            FrameFormat::Nv12 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
+            FrameFormat::Nv12 | FrameFormat::P010 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
             FrameFormat::Yuy2 => sys::MFX_CHROMAFORMAT_YUV422 as u16,
-            FrameFormat::Bgra => sys::MFX_CHROMAFORMAT_YUV444 as u16,
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => {
+                sys::MFX_CHROMAFORMAT_YUV444 as u16
+            }
         }
     }
 
+    /// フレームを構成する各サンプルのビット深度を返す
     pub(crate) fn bit_depth(self) -> u16 {
-        8
+        match self {
+            FrameFormat::P010 | FrameFormat::Y410 => 10,
+            FrameFormat::Nv12 | FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv => 8,
+        }
+    }
+
+    /// 指定幅のフレームで 1 行あたりに必要な最小バイト数を返す
+    ///
+    /// VPL の `mfxFrameData` のピッチはこの値以上になる。
+    /// オーバーフロー時は `None` を返す。
+    pub(crate) fn min_pitch(self, width: usize) -> Option<usize> {
+        match self {
+            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
+            FrameFormat::Nv12 => Some(width),
+            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
+            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
+            // 1 画素 4 バイト
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
+        }
+    }
+
+    /// `mfxFrameInfo.Shift` に設定する値を返す
+    ///
+    /// VPL の仕様では、10bit サンプルを 16bit ワードに格納する形式について、Shift が 0 の場合は
+    /// 有効データが下位 10bit に、0 以外の場合は上位 10bit にあることを表す。
+    /// 10bit サンプルを 16bit ワードの上位ビットに格納する P010 だけ 1 を返す。
+    /// 10bit サンプルが 10bit 幅のフィールドにそのまま入る Y410 と、8bit の各形式は 0 を返す。
+    ///
+    /// ref: libvpl api/vpl/mfxstructures.h (mfxFrameInfo::Shift)
+    pub(crate) fn frame_info_shift(self) -> u16 {
+        match self {
+            FrameFormat::P010 => 1,
+            FrameFormat::Nv12
+            | FrameFormat::Yuy2
+            | FrameFormat::Bgra
+            | FrameFormat::Ayuv
+            | FrameFormat::Y410 => 0,
+        }
     }
 
     /// フレームデータのバイトサイズを返す
     ///
+    /// `height` が偶数の場合のレイアウトを前提とする。
+    ///
+    /// 各形式のデータは次のように並んでいるものとして扱う。
+    ///
+    /// - [`FrameFormat::Nv12`]: Y プレーン (`width * height` バイト) の後ろに、
+    ///   2 画素につき 1 組の UV をインターリーブしたプレーン (`width * height / 2` バイト)
+    /// - [`FrameFormat::P010`]: [`FrameFormat::Nv12`] と同じ並びを 1 サンプル 2 バイトで格納する。
+    ///   10bit の値は 16bit ワードの上位ビットに入れる
+    /// - [`FrameFormat::Yuy2`]: 2 画素を 4 バイト (Y0, U, Y1, V) で格納する
+    /// - [`FrameFormat::Bgra`]: 1 画素を 4 バイト (B, G, R, A) で格納する
+    /// - [`FrameFormat::Ayuv`]: 1 画素を 4 バイト (V, U, Y, A) で格納する
+    /// - [`FrameFormat::Y410`]: 1 画素を 4 バイトの 32bit ワードで格納する。
+    ///   ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に入れる
+    ///
     /// オーバーフロー時は `None` を返す。
+    ///
+    /// ref: libvpl api/vpl/mfxstructures.h (MFX_FOURCC_P010 / MFX_FOURCC_AYUV / MFX_FOURCC_Y410 / mfxY410)
     pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
         let pixels = width.checked_mul(height)?;
         match self {
             // YUV 4:2:0 8bit: Y + UV/2 = 画素 * 3 / 2
             FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
+            // YUV 4:2:0 10bit: 1 サンプル 2 バイトで Y + UV/2 = 画素 * 3
+            FrameFormat::P010 => pixels.checked_mul(3),
             // YUY2: 2 バイト/画素 (YUYV パック)
             FrameFormat::Yuy2 => pixels.checked_mul(2),
-            // BGRA: 4 バイト/画素
-            FrameFormat::Bgra => pixels.checked_mul(4),
+            // BGRA / AYUV / Y410: 4 バイト/画素
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => pixels.checked_mul(4),
         }
     }
 }
@@ -838,7 +928,7 @@ mod tests {
     /// デコーダのプロファイル・メモリタイプごとの値が VPL の記述どおりに返ること
     #[test]
     fn test_probe_decoding_returns_per_profile_capabilities() {
-        // P010 / AYUV / 未知の FourCC は FrameFormat で表現できないため無視される
+        // 未知の FourCC だけが FrameFormat で表現できないため無視される
         let mut formats0 = [
             sys::MFX_FOURCC_NV12,
             sys::MFX_FOURCC_P010,
@@ -929,7 +1019,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].color_formats,
-            vec![FrameFormat::Nv12],
+            vec![FrameFormat::Nv12, FrameFormat::P010, FrameFormat::Ayuv],
             "色形式が正しくない: {info:?}"
         );
         assert_eq!(
@@ -1160,7 +1250,7 @@ mod tests {
     /// エンコーダのプロファイル・メモリタイプごとの値が VPL の記述どおりに返ること
     #[test]
     fn test_probe_encoding_returns_per_profile_capabilities() {
-        // P010 / AYUV / 未知の FourCC は FrameFormat で表現できないため無視される
+        // 未知の FourCC だけが FrameFormat で表現できないため無視される
         let mut formats0 = [
             sys::MFX_FOURCC_NV12,
             sys::MFX_FOURCC_P010,
@@ -1249,7 +1339,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].color_formats,
-            vec![FrameFormat::Nv12],
+            vec![FrameFormat::Nv12, FrameFormat::P010, FrameFormat::Ayuv],
             "色形式が正しくない: {info:?}"
         );
         assert_eq!(
@@ -1257,9 +1347,10 @@ mod tests {
             MemoryType::VaSurface,
             "メモリタイプが正しくない: {info:?}"
         );
-        assert!(
-            info.profiles[0].memory_types[1].color_formats.is_empty(),
-            "表現できない色形式が入っている: {info:?}"
+        assert_eq!(
+            info.profiles[0].memory_types[1].color_formats,
+            vec![FrameFormat::Ayuv],
+            "色形式が正しくない: {info:?}"
         );
         assert_eq!(
             info.profiles[1].profile,

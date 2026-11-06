@@ -69,54 +69,79 @@ impl FrameFormat {
         coded_height: usize,
     ) {
         unsafe {
-            let pitch = data.__bindgen_anon_2.Pitch as usize;
+            let pitch = frame_data_pitch(data);
+            // coded_width は u16 に収まるため、1 行あたりのバイト数は必ず usize に収まる
+            let row_bytes = self
+                .min_pitch(coded_width)
+                .expect("row bytes must fit in usize because the coded width fits in u16");
             match self {
-                FrameFormat::Nv12 => {
+                FrameFormat::Nv12 | FrameFormat::P010 => {
                     let y_ptr = data.__bindgen_anon_3.Y;
                     let uv_ptr = data.__bindgen_anon_4.UV;
-                    let luma_size = coded_width * coded_height;
+                    let luma_size = row_bytes * coded_height;
                     // Y プレーンをコピーする
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * coded_width),
-                            y_ptr.add(row * pitch),
-                            coded_width,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), y_ptr, row_bytes, coded_height, pitch);
                     // UV プレーンをコピーする
-                    let uv_src = src.as_ptr().add(luma_size);
-                    let uv_height = coded_height / 2;
-                    for row in 0..uv_height {
-                        std::ptr::copy_nonoverlapping(
-                            uv_src.add(row * coded_width),
-                            uv_ptr.add(row * pitch),
-                            coded_width,
-                        );
-                    }
+                    copy_rows(
+                        src.as_ptr().add(luma_size),
+                        uv_ptr,
+                        row_bytes,
+                        coded_height / 2,
+                        pitch,
+                    );
                 }
                 FrameFormat::Yuy2 => {
                     let y_ptr = data.__bindgen_anon_3.Y;
-                    let row_bytes = coded_width * 2;
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * row_bytes),
-                            y_ptr.add(row * pitch),
-                            row_bytes,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), y_ptr, row_bytes, coded_height, pitch);
                 }
                 FrameFormat::Bgra => {
                     let b_ptr = data.__bindgen_anon_5.B;
-                    let row_bytes = coded_width * 4;
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * row_bytes),
-                            b_ptr.add(row * pitch),
-                            row_bytes,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), b_ptr, row_bytes, coded_height, pitch);
+                }
+                FrameFormat::Ayuv => {
+                    // AYUV の各チャネルポインタは、パックされた 1 画素の各バイトを指す。
+                    // メモリ上のバイト順は V, U, Y, A なので、行の先頭は V になる。
+                    let v_ptr = data.__bindgen_anon_5.V;
+                    copy_rows(src.as_ptr(), v_ptr, row_bytes, coded_height, pitch);
+                }
+                FrameFormat::Y410 => {
+                    let y410_ptr = data.__bindgen_anon_4.Y410 as *mut u8;
+                    copy_rows(src.as_ptr(), y410_ptr, row_bytes, coded_height, pitch);
                 }
             }
+        }
+    }
+}
+
+/// mfxFrameData から 1 行あたりのバイト数 (ピッチ) を取り出す
+///
+/// VPL はピッチを `PitchHigh` と `PitchLow` の 2 つの 16bit 値に分けて保持する。
+/// finalPitch = (PitchHigh << 16) + PitchLow
+///
+/// ref: libvpl api/vpl/mfxstructures.h (mfxFrameData::PitchHigh / PitchLow)
+///
+/// # Safety
+///
+/// `data` は VPL が初期化した有効な `mfxFrameData` である必要がある。
+/// `PitchLow` は共用体のメンバなので、`Pitch` と同じ領域が初期化されている必要がある。
+unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
+    unsafe { ((data.PitchHigh as usize) << 16) + (data.__bindgen_anon_2.PitchLow as usize) }
+}
+
+/// コピー元の行を 1 行ずつコピー先のピッチに従ってコピーする
+///
+/// # Safety
+///
+/// `src` は `rows * row_bytes` バイト以上、`dst` は `(rows - 1) * pitch + row_bytes` バイト以上
+/// 読み書き可能である必要がある。
+unsafe fn copy_rows(src: *const u8, dst: *mut u8, row_bytes: usize, rows: usize, pitch: usize) {
+    for row in 0..rows {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(row * row_bytes),
+                dst.add(row * pitch),
+                row_bytes,
+            );
         }
     }
 }
@@ -182,7 +207,7 @@ pub struct EncoderConfig {
     pub width: u32,
     /// フレーム高さ（ピクセル、16 の倍数にアライメントされる）
     pub height: u32,
-    /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth を決定する）
+    /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth / Shift を決定する）
     pub frame_format: FrameFormat,
     /// フレームレートの分子（mfxFrameInfo.FrameRateExtN）
     pub framerate_num: u32,
@@ -961,6 +986,24 @@ impl<H: EncodeHandler> Encoder<H> {
     }
 
     /// エンコーダを作成する
+    ///
+    /// # 入力フォーマットとプロファイル
+    ///
+    /// 次の組み合わせは入力のビット深度がプロファイルの制限に合わないためエラーを返す。
+    ///
+    /// - H.264: 8bit 入力のみ (10bit 入力は指定できない)
+    /// - HEVC [`HevcProfile::Main10`]: 10bit 入力 ([`FrameFormat::P010`] または
+    ///   [`FrameFormat::Y410`]) のみ (8bit 入力は指定できない)
+    /// - VP9 [`Vp9Profile::Profile0`] / [`Vp9Profile::Profile1`]: 8bit 入力のみ
+    ///   (10bit 入力は指定できない)
+    ///
+    /// 上記以外のプロファイルは入力のビット深度を限定しない。
+    ///
+    /// GPU やコーデックが対応していない色形式を指定した場合はエラーを返す。
+    /// このとき [`Error::function`] は `MFXVideoENCODE_Init` になる。
+    /// 事前に対応を判定する場合は [`crate::supported_codecs`] が返す
+    /// [`crate::EncodingInfo::profiles`] の
+    /// [`crate::MemoryTypeCapabilities::color_formats`] を参照する。
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
@@ -986,21 +1029,20 @@ impl<H: EncodeHandler> Encoder<H> {
                 ),
             ));
         }
-        // pitch（行あたりのバイト数）が u16 に収まるか検証する
-        // NV12: width, YUY2: width * 2, BGRA: width * 4
-        let pitch_bytes: u64 = match config.frame_format {
-            FrameFormat::Nv12 => aligned_width as u64,
-            FrameFormat::Yuy2 => aligned_width as u64 * 2,
-            FrameFormat::Bgra => aligned_width as u64 * 4,
-        };
-        if pitch_bytes > u16::MAX as u64 {
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "pitch ({pitch_bytes} bytes) for {:?} with width {} exceeds u16::MAX",
-                    config.frame_format, aligned_width
-                ),
-            ));
+        // プロファイルが入力のビット深度を限定している場合、それに一致しない入力は
+        // MFXVideoENCODE_Init が MFX_ERR_INVALID_VIDEO_PARAM で拒否するため、
+        // セッションを作る前にエラーにする。
+        if let Some(accepted_bit_depth) = accepted_input_bit_depth(&config.codec) {
+            let actual_bit_depth = config.frame_format.bit_depth();
+            if actual_bit_depth != accepted_bit_depth {
+                return Err(Error::new_custom_owned(
+                    "Encoder::new",
+                    format!(
+                        "input format {:?} is {actual_bit_depth}bit but the configured codec profile accepts {accepted_bit_depth}bit input only",
+                        config.frame_format
+                    ),
+                ));
+            }
         }
 
         let lib = VplLibrary::load()?;
@@ -1016,6 +1058,7 @@ impl<H: EncodeHandler> Encoder<H> {
         frame_info.ChromaFormat = config.frame_format.chroma_format();
         frame_info.BitDepthLuma = config.frame_format.bit_depth();
         frame_info.BitDepthChroma = config.frame_format.bit_depth();
+        frame_info.Shift = config.frame_format.frame_info_shift();
         frame_info.PicStruct = sys::MFX_PICSTRUCT_PROGRESSIVE as u16;
         frame_info.FrameRateExtN = config.framerate_num;
         frame_info.FrameRateExtD = config.framerate_den;
@@ -2008,6 +2051,32 @@ fn codec_profile(codec: &CodecConfig) -> u16 {
     profile.map_or(sys::MFX_PROFILE_UNKNOWN as u16, |profile| profile as u16)
 }
 
+/// プロファイルが入力として受け付けるビット深度を返す
+///
+/// ビット深度を限定しないプロファイルの場合は `None` を返し、VPL の判定に任せる。
+///
+/// VPL のエンコーダーはプロファイルによって入力のビット深度を制限する。
+/// 制限に合わない入力は `MFXVideoENCODE_Init` が `MFX_ERR_INVALID_VIDEO_PARAM` で
+/// 拒否するため、ここではプロファイルごとの制限を返す。
+fn accepted_input_bit_depth(codec: &CodecConfig) -> Option<u16> {
+    match codec {
+        // AVC エンコーダーは 8bit 入力だけを受け付ける
+        CodecConfig::H264(_) => Some(8),
+        CodecConfig::Hevc(config) => match config.profile {
+            // Main10 は 10bit 入力だけを受け付ける
+            Some(HevcProfile::Main10) => Some(10),
+            _ => None,
+        },
+        CodecConfig::Vp9(config) => match config.profile {
+            // Profile0 / Profile1 は 8bit 入力だけを受け付ける
+            Some(Vp9Profile::Profile0 | Vp9Profile::Profile1) => Some(8),
+            _ => None,
+        },
+        // AV1 は 8bit と 10bit の両方を受け付ける
+        CodecConfig::Av1(_) => None,
+    }
+}
+
 /// alignment の倍数に切り上げる
 ///
 /// オーバーフロー時は alignment 境界に丸めた最大値を返す。
@@ -2053,10 +2122,10 @@ mod tests {
     /// すべての FrameFormat が FourCC との相互変換で往復すること
     #[test]
     fn frame_format_fourcc_roundtrip() {
-        for format in [FrameFormat::Nv12, FrameFormat::Yuy2, FrameFormat::Bgra] {
+        for format in FrameFormat::all() {
             assert_eq!(
                 FrameFormat::from_fourcc(format.fourcc()),
-                Some(format),
+                Some(*format),
                 "{format:?} の FourCC 変換が往復しない"
             );
         }
@@ -2066,6 +2135,251 @@ mod tests {
     #[test]
     fn frame_format_from_unknown_fourcc_returns_none() {
         assert_eq!(FrameFormat::from_fourcc(0xDEAD_BEEF), None);
+    }
+
+    /// 各形式のフレームサイズが 1 画素あたりのバイト数と一致すること
+    #[test]
+    fn frame_format_frame_size_matches_bytes_per_pixel() {
+        // 4x4 画素で検証する
+        let cases = [
+            // YUV 4:2:0 8bit: Y + UV/2
+            (FrameFormat::Nv12, 4 * 4 * 3 / 2),
+            // YUV 4:2:0 10bit: 1 サンプル 2 バイトで Y + UV/2
+            (FrameFormat::P010, 4 * 4 * 3),
+            // YUY2: 2 バイト/画素
+            (FrameFormat::Yuy2, 4 * 4 * 2),
+            // BGRA / AYUV / Y410: 4 バイト/画素
+            (FrameFormat::Bgra, 4 * 4 * 4),
+            (FrameFormat::Ayuv, 4 * 4 * 4),
+            (FrameFormat::Y410, 4 * 4 * 4),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(
+                format.frame_size(4, 4),
+                Some(expected),
+                "{format:?} の 4x4 のフレームサイズが不一致"
+            );
+        }
+    }
+
+    /// フレームサイズの計算がオーバーフローした場合は `None` を返すこと
+    #[test]
+    fn frame_format_frame_size_returns_none_on_overflow() {
+        for format in FrameFormat::all() {
+            assert_eq!(
+                format.frame_size(usize::MAX, 2),
+                None,
+                "{format:?} のフレームサイズがオーバーフロー時に None にならない"
+            );
+        }
+    }
+
+    /// 1 行あたりの最小バイト数が形式ごとの 1 画素あたりのバイト数と一致すること
+    #[test]
+    fn frame_format_min_pitch_matches_bytes_per_pixel() {
+        let cases = [
+            (FrameFormat::Nv12, 320),
+            (FrameFormat::P010, 640),
+            (FrameFormat::Yuy2, 640),
+            (FrameFormat::Bgra, 1280),
+            (FrameFormat::Ayuv, 1280),
+            (FrameFormat::Y410, 1280),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(
+                format.min_pitch(320),
+                Some(expected),
+                "{format:?} の最小ピッチが不一致"
+            );
+        }
+        // 1 画素 1 バイトの Nv12 は乗算がないためオーバーフローしない
+        assert_eq!(FrameFormat::Nv12.min_pitch(usize::MAX), Some(usize::MAX));
+        for format in [
+            FrameFormat::P010,
+            FrameFormat::Yuy2,
+            FrameFormat::Bgra,
+            FrameFormat::Ayuv,
+            FrameFormat::Y410,
+        ] {
+            assert_eq!(
+                format.min_pitch(usize::MAX),
+                None,
+                "{format:?} の最小ピッチがオーバーフロー時に None にならない"
+            );
+        }
+    }
+
+    /// ビット深度と `mfxFrameInfo.Shift` が形式ごとに正しいこと
+    #[test]
+    fn frame_format_bit_depth_and_shift() {
+        let cases = [
+            // 8bit の形式は Shift を 0 にする
+            (FrameFormat::Nv12, 8, 0),
+            (FrameFormat::Yuy2, 8, 0),
+            (FrameFormat::Bgra, 8, 0),
+            (FrameFormat::Ayuv, 8, 0),
+            // P010 は 10bit の値を 16bit ワードの上位ビットに格納するため Shift を 1 にする
+            (FrameFormat::P010, 10, 1),
+            // Y410 は 10bit の値が 10bit 幅のフィールドにそのまま入るため Shift を 0 にする
+            (FrameFormat::Y410, 10, 0),
+        ];
+        for (format, bit_depth, shift) in cases {
+            assert_eq!(
+                format.bit_depth(),
+                bit_depth,
+                "{format:?} のビット深度が不一致"
+            );
+            assert_eq!(
+                format.frame_info_shift(),
+                shift,
+                "{format:?} の mfxFrameInfo.Shift が不一致"
+            );
+        }
+    }
+
+    /// ピッチが PitchHigh と PitchLow を合わせた 32bit の値になること
+    #[test]
+    fn frame_data_pitch_combines_pitch_high_and_pitch_low() {
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 1;
+        data.__bindgen_anon_2.PitchLow = 2;
+        // finalPitch = (1 << 16) + 2
+        assert_eq!(unsafe { frame_data_pitch(&data) }, 65538);
+    }
+
+    /// 生成したエンコーダ設定を返す (プロファイルとビット深度の検証用)
+    fn encoder_config_for_validation(codec: CodecConfig, format: FrameFormat) -> EncoderConfig {
+        EncoderConfig::new(
+            // 検証はセッション作成より前に行われるため、存在しない render node でもよい
+            AdapterSelector::DrmRenderNode(0),
+            codec,
+            320,
+            240,
+            format,
+            30,
+            1,
+            RateControlMode::Cqp,
+        )
+    }
+
+    /// プロファイルの入力ビット深度の制限に合わない場合はエラーになること
+    #[test]
+    fn encoder_new_rejects_profile_bit_depth_mismatch() {
+        let cases = [
+            // H.264 は 8bit 入力だけを受け付ける
+            (
+                CodecConfig::H264(H264EncoderConfig {
+                    profile: Some(H264Profile::High),
+                }),
+                FrameFormat::P010,
+                "8bit",
+                "10bit",
+            ),
+            // HEVC Main10 は 10bit 入力だけを受け付ける
+            (
+                CodecConfig::Hevc(HevcEncoderConfig {
+                    profile: Some(HevcProfile::Main10),
+                }),
+                FrameFormat::Nv12,
+                "10bit",
+                "8bit",
+            ),
+            // VP9 Profile0 は 8bit 入力だけを受け付ける
+            (
+                CodecConfig::Vp9(Vp9EncoderConfig {
+                    profile: Some(Vp9Profile::Profile0),
+                    write_ivf_headers: false,
+                }),
+                FrameFormat::P010,
+                "8bit",
+                "10bit",
+            ),
+            // VP9 Profile1 は 8bit 入力だけを受け付ける
+            (
+                CodecConfig::Vp9(Vp9EncoderConfig {
+                    profile: Some(Vp9Profile::Profile1),
+                    write_ivf_headers: false,
+                }),
+                FrameFormat::Y410,
+                "8bit",
+                "10bit",
+            ),
+        ];
+        for (codec, format, accepted, actual) in cases {
+            let config = encoder_config_for_validation(codec, format);
+            let error = Encoder::new(
+                config,
+                FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{format:?} の検証がエラーにならなかった"));
+            assert_eq!(error.function(), "Encoder::new");
+            let message = error.status_message().unwrap_or_default();
+            assert!(
+                message.contains(accepted) && message.contains(actual),
+                "エラーメッセージに受け付けるビット深度 ({accepted}) と実際のビット深度 ({actual}) が含まれない: {message}"
+            );
+        }
+    }
+
+    /// 入力のビット深度を限定しないプロファイルでは `None` を返すこと
+    #[test]
+    fn accepted_input_bit_depth_returns_none_for_unrestricted_profiles() {
+        // AV1 Main は 8bit と 10bit の両方を受け付ける
+        let av1 = CodecConfig::Av1(Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        });
+        assert_eq!(accepted_input_bit_depth(&av1), None);
+        // HEVC の Main / MainSp / Rext / Scc はビット深度を限定しない
+        for profile in [
+            Some(HevcProfile::Main),
+            Some(HevcProfile::MainSp),
+            Some(HevcProfile::Rext),
+            Some(HevcProfile::Scc),
+            None,
+        ] {
+            let codec = CodecConfig::Hevc(HevcEncoderConfig { profile });
+            assert_eq!(
+                accepted_input_bit_depth(&codec),
+                None,
+                "{profile:?} のビット深度が限定されている"
+            );
+        }
+        // VP9 の Profile2 / Profile3 とプロファイル未指定はビット深度を限定しない
+        for profile in [Some(Vp9Profile::Profile2), Some(Vp9Profile::Profile3), None] {
+            let codec = CodecConfig::Vp9(Vp9EncoderConfig {
+                profile,
+                write_ivf_headers: false,
+            });
+            assert_eq!(
+                accepted_input_bit_depth(&codec),
+                None,
+                "{profile:?} のビット深度が限定されている"
+            );
+        }
+    }
+
+    /// 入力のビット深度を限定するプロファイルではそのビット深度を返すこと
+    #[test]
+    fn accepted_input_bit_depth_returns_limit_for_restricted_profiles() {
+        // H.264 はプロファイルにかかわらず 8bit 入力だけを受け付ける
+        for profile in [None, Some(H264Profile::High10)] {
+            let codec = CodecConfig::H264(H264EncoderConfig { profile });
+            assert_eq!(accepted_input_bit_depth(&codec), Some(8));
+        }
+        // HEVC Main10 は 10bit 入力だけを受け付ける
+        let hevc_main10 = CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        });
+        assert_eq!(accepted_input_bit_depth(&hevc_main10), Some(10));
+        // VP9 Profile0 / Profile1 は 8bit 入力だけを受け付ける
+        for profile in [Vp9Profile::Profile0, Vp9Profile::Profile1] {
+            let codec = CodecConfig::Vp9(Vp9EncoderConfig {
+                profile: Some(profile),
+                write_ivf_headers: false,
+            });
+            assert_eq!(accepted_input_bit_depth(&codec), Some(8));
+        }
     }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {

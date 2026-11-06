@@ -13,8 +13,15 @@
 //! # 対応入力フォーマット
 //!
 //! - NV12 (Semi-Planar YUV 4:2:0 8bit)
+//! - P010 (Semi-Planar YUV 4:2:0 10bit)
 //! - YUY2 (Packed YUV 4:2:2 8bit)
 //! - BGRA (Packed 8bit)
+//! - AYUV (Packed YUV 4:4:4 8bit)
+//! - Y410 (Packed YUV 4:4:4 10bit)
+//!
+//! 入力フォーマットのビット深度はプロファイルごとの制限に合わせる必要がある。
+//! 例えば HEVC の Main 10 プロファイルは 10bit 入力 (P010 / Y410) だけを受け付ける。
+//! 制限の詳細は [`Encoder::new`] を参照。
 //!
 //! # メモリタイプ
 //!

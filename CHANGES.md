@@ -40,6 +40,12 @@
   - `Encoder::get_sequence_params` でスタートコードを含まない NAL / OBU を取得できる
   - `SequenceParams` を公開し、AV1 は Sequence Header OBU、VP9 は `None` を返す
   - @melpon
+- [ADD] エンコーダーの入力フォーマットに P010 / AYUV / Y410 を追加する
+  - `FrameFormat::P010` / `FrameFormat::Ayuv` / `FrameFormat::Y410` を追加し、10bit と 4:4:4 の入力に対応する
+  - P010 の 10bit 値は 16bit ワードの上位ビットに格納し、`mfxFrameInfo.Shift` に 1 を設定する
+  - `FrameFormat::frame_size` を各形式のバイト数に対応させ、`mfxFrameData` のピッチは `PitchHigh` と `PitchLow` を合わせて計算する
+  - プロファイルごとの入力ビット深度の制限に合わない入力は `Encoder::new` がエラーを返す
+  - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon

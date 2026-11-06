@@ -177,17 +177,23 @@ union 別メンバを同時に立てると意味不明な設定になる。 モ�
 
 ### `FrameFormat` と `coded_size` / `frame_size`
 
-入力フォーマットは `Nv12` / `Yuy2` / `Bgra` のみ:
+入力フォーマットは次の 6 種類:
 
 | 列挙子 | FourCC | チャネル |
 |---|---|---|
 | `FrameFormat::Nv12` | `MFX_FOURCC_NV12` | Y plane + interleaved UV plane (4:2:0 8bit) |
+| `FrameFormat::P010` | `MFX_FOURCC_P010` | Y plane + interleaved UV plane (4:2:0 10bit)。 10bit の値は 16bit ワードの上位 10bit に置く |
 | `FrameFormat::Yuy2` | `MFX_FOURCC_YUY2` | YUYV interleaved (4:2:2 8bit) |
 | `FrameFormat::Bgra` | `MFX_FOURCC_RGB4` | BGRA packed (8bit) |
+| `FrameFormat::Ayuv` | `MFX_FOURCC_AYUV` | Packed YUV 4:4:4 8bit。 バイト順は V, U, Y, A |
+| `FrameFormat::Y410` | `MFX_FOURCC_Y410` | Packed YUV 4:4:4 10bit。 32bit ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) |
 
 - `Encoder::coded_size()` は 16 ピクセルにアラインされた符号化サイズを返す。 入力バッファサイズは `width` / `height` ではなくこの coded サイズで計算する。
-- `FrameFormat::frame_size(width, height) -> Option<usize>` で必要バイト数を取る。 `usize::checked_mul` 系でオーバーフロー検出する。 NV12 は `pixels * 3 / 2`、 YUY2 は `pixels * 2`、 BGRA は `pixels * 4`。
-- `set_planes` の内部実装は libvpl ヘッダ (`api/vpl/mfxstructures.h:344-349`) の指示通り、 NV12 / YUY2 のようなパック済みフォーマットでも Y/U/V を「先頭サンプル」へ向ける。 これは VPL 仕様の制約なので、 サーフェスを直接組むときは同じ規約に従う。
+- `FrameFormat::frame_size(width, height) -> Option<usize>` で必要バイト数を取る。 `usize::checked_mul` 系でオーバーフロー検出する。 NV12 は `pixels * 3 / 2`、 P010 は `pixels * 3`、 YUY2 は `pixels * 2`、 BGRA / AYUV / Y410 は `pixels * 4`。
+- P010 は `mfxFrameInfo.Shift` に 1 を設定する。 VPL の仕様では Shift が 1 のとき有効データが 16bit ワードの上位 10bit にある (Shift が 0 なら下位 10bit)。
+- `Encoder::new` はプロファイルごとの入力ビット深度の制限に合わない場合にエラーを返す。 H.264 は 8bit 入力のみ、 HEVC `HevcProfile::Main10` は 10bit 入力 (P010 / Y410) のみ、 VP9 `Vp9Profile::Profile0` / `Vp9Profile::Profile1` は 8bit 入力のみを受け付ける。 それ以外のプロファイルは入力のビット深度を限定せず、 対応の可否は VPL が判定する。
+- コーデックや GPU が対応していない色形式は `MFXVideoENCODE_Init` が失敗し、 `Encoder::new` がそのエラーを返す。 事前判定は `supported_codecs()` の `MemoryTypeCapabilities::color_formats` を使う。
+- パック形式のプレーンコピーは VPL のチャネルポインタに従う。 BGRA は `Data.B`、 AYUV は `Data.V` (メモリ上のバイト順 V, U, Y, A の先頭)、 Y410 は `Data.Y410` を行の先頭として扱う。
 
 ### `EncodeOptions.frame_type` の使い方
 
