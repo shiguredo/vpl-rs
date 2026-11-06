@@ -510,10 +510,8 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{
-        CodecConfig, Encoder, EncoderConfig, FrameFormat, H264EncoderConfig, RateControlMode,
-    };
-    use crate::{EncodedFrame, FnEncodeHandler};
+    use crate::encode::{CodecConfig, Encoder, EncoderConfig, H264EncoderConfig, RateControlMode};
+    use crate::{EncodedFrame, FnEncodeHandler, FrameFormat};
 
     #[test]
     fn frame_surface_new_rejects_null() {

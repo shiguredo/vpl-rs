@@ -35,6 +35,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
 - パラメータのサポート可否検証 (MFXVideoENCODE_Query)
 - エンコーダーからの SPS / PPS / VPS 取得 (MP4 / RTP 用のパラメータセット)
+- コーデックケーパビリティ照会 (プロファイル別・メモリタイプ別の解像度範囲 / 最大コーデックレベル / 対応色形式)
 
 ## 動作要件
 
@@ -81,6 +82,56 @@ for adapter in &adapters {
 // 使用する GPU アダプタを DRM render node 番号で指定する
 let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
 ```
+
+### コーデック情報の照会
+
+`supported_codecs()` は、H.264 / HEVC / VP9 / AV1 それぞれの対応状況とケーパビリティを返します。
+エンコード・デコードに対応していないコーデックは、`CodecInfo::encoding` / `CodecInfo::decoding` が `None` になります。
+
+ケーパビリティは VPL の実装記述 (`mfxDecoderDescription` / `mfxEncoderDescription`) の階層をそのまま反映します。プロファイルやメモリタイプをまたいだ集約は行いません。
+
+```rust
+use shiguredo_vpl::{AdapterSelector, list_adapters, supported_codecs};
+
+let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
+for codec in supported_codecs(adapter)? {
+    if let Some(encoding) = &codec.encoding {
+        for profile in &encoding.profiles {
+            for memory_type in &profile.memory_types {
+                println!(
+                    "{:?} {:?} {:?}: width={}..{} step={}, height={}..{} step={}, {:?}",
+                    codec.codec,
+                    profile.profile,
+                    memory_type.memory_type,
+                    memory_type.width.min,
+                    memory_type.width.max,
+                    memory_type.width.step,
+                    memory_type.height.min,
+                    memory_type.height.max,
+                    memory_type.height.step,
+                    memory_type.color_formats,
+                );
+            }
+        }
+    }
+}
+```
+
+| 型 | 説明 |
+|---|---|
+| `CodecInfo` | コーデック種別と、エンコード・デコードの情報 |
+| `DecodingInfo` / `EncodingInfo` | 最大コーデックレベルとプロファイル一覧。エンコードは B フレーム対応も持つ |
+| `ProfileCapabilities` | プロファイルと、メモリタイプごとのケーパビリティ |
+| `MemoryTypeCapabilities` | メモリタイプ、幅・高さの範囲 (`ValueRange`)、対応色形式 |
+| `ValueRange` | 最小値・最大値・増分 (VPL の `mfxRange32U`) |
+| `VideoProfile` | コーデックごとのプロファイル。既知の型で表現できない値は `Unknown(u32)` |
+| `MemoryType` | VPL の `mfxResourceType`。既知の型で表現できない値は `Unknown(u32)` |
+
+- 解像度範囲と色形式は、プロファイルとメモリタイプごとの値をそのまま返す
+- 色形式は `FrameFormat` で表現できる FourCC だけを、VPL の `ColorFormats` に並んでいる順序で返す
+- `max_codec_level` は最大コーデックレベルを返し、レベルが不明な場合は `None`
+- すべてのメモリタイプを返すが、このクレートの `Encoder` / `Decoder` が実際に使うのは `MemoryType::System` だけ
+- VPL がプロファイルを返さない場合は `profiles` が空、メモリタイプを返さない場合は `memory_types` が空、色形式を返さない場合や表現できる FourCC が無い場合は `color_formats` が空になる
 
 ### エンコード
 
@@ -232,6 +283,9 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 | フォーマット | 説明 |
 |---|---|
 | NV12 | Semi-Planar YUV 4:2:0 8bit |
+
+`supported_codecs()` が返す `CodecInfo::decoding` → `DecodingInfo::profiles` → `ProfileCapabilities::memory_types` → `MemoryTypeCapabilities::color_formats` に、プロファイル・メモリタイプごとのデコード出力色形式が入ります。
+このクレートの `Decoder` が実際に出力する形式は NV12 のみで、ほかの形式を選択する API はありません。
 
 ## サポートプロファイル
 

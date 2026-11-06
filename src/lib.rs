@@ -16,6 +16,11 @@
 //! - YUY2 (Packed YUV 4:2:2 8bit)
 //! - BGRA (Packed 8bit)
 //!
+//! # メモリタイプ
+//!
+//! `supported_codecs` の `MemoryType` は VPL の実装記述が持つすべてのメモリタイプを返す。
+//! このクレートの `Encoder` / `Decoder` が実際に使うのは `MemoryType::System` だけである。
+//!
 //! # 動作要件
 //!
 //! - Linux (x86_64)
@@ -110,9 +115,8 @@ pub use decode::{
 };
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
-    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, FrameFormat, H264EncoderConfig,
-    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam,
-    Vp9EncoderConfig,
+    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, H264EncoderConfig, HevcEncoderConfig,
+    PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam, Vp9EncoderConfig,
 };
 pub use error::Error;
 pub use stats::{Counter, Gauge};
