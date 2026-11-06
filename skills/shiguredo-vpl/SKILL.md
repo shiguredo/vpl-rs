@@ -177,17 +177,22 @@ union 別メンバを同時に立てると意味不明な設定になる。 モ�
 
 ### `FrameFormat` と `coded_size` / `frame_size`
 
-入力フォーマットは `Nv12` / `Yuy2` / `Bgra` のみ:
+入力フォーマットは次の 6 種類:
 
 | 列挙子 | FourCC | チャネル |
 |---|---|---|
 | `FrameFormat::Nv12` | `MFX_FOURCC_NV12` | Y plane + interleaved UV plane (4:2:0 8bit) |
+| `FrameFormat::P010` | `MFX_FOURCC_P010` | Y plane + interleaved UV plane (4:2:0 10bit)。 10bit の値は 16bit ワードの上位 10bit に置く |
 | `FrameFormat::Yuy2` | `MFX_FOURCC_YUY2` | YUYV interleaved (4:2:2 8bit) |
 | `FrameFormat::Bgra` | `MFX_FOURCC_RGB4` | BGRA packed (8bit) |
+| `FrameFormat::Ayuv` | `MFX_FOURCC_AYUV` | Packed YUV 4:4:4 8bit。 バイト順は V, U, Y, A |
+| `FrameFormat::Y410` | `MFX_FOURCC_Y410` | Packed YUV 4:4:4 10bit。 32bit ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) |
 
 - `Encoder::coded_size()` は 16 ピクセルにアラインされた符号化サイズを返す。 入力バッファサイズは `width` / `height` ではなくこの coded サイズで計算する。
-- `FrameFormat::frame_size(width, height) -> Option<usize>` で必要バイト数を取る。 `usize::checked_mul` 系でオーバーフロー検出する。 NV12 は `pixels * 3 / 2`、 YUY2 は `pixels * 2`、 BGRA は `pixels * 4`。
-- `set_planes` の内部実装は libvpl ヘッダ (`api/vpl/mfxstructures.h:344-349`) の指示通り、 NV12 / YUY2 のようなパック済みフォーマットでも Y/U/V を「先頭サンプル」へ向ける。 これは VPL 仕様の制約なので、 サーフェスを直接組むときは同じ規約に従う。
+- `FrameFormat::frame_size(width, height) -> Option<usize>` で必要バイト数を取る。 `usize::checked_mul` 系でオーバーフロー検出する。 NV12 は `pixels * 3 / 2`、 P010 は `pixels * 3`、 YUY2 は `pixels * 2`、 BGRA / AYUV / Y410 は `pixels * 4`。
+- P010 は `mfxFrameInfo.Shift` に 1 を設定する。 VPL の仕様では Shift が 1 のとき有効データが 16bit ワードの上位 10bit にある (Shift が 0 なら下位 10bit)。
+- 入力フォーマットとプロファイルの組み合わせの可否は `MFXVideoENCODE_Init` の結果に従う。 事前判定は `supported_codecs()` の `MemoryTypeCapabilities::color_formats` を使うが、 その結果は初期化の成功を保証しない。
+- パック形式のプレーンコピーは VPL のチャネルポインタに従う。 BGRA は `Data.B`、 AYUV は `Data.V` (メモリ上のバイト順 V, U, Y, A の先頭)、 Y410 は `Data.Y410` を行の先頭として扱う。
 
 ### `EncodeOptions.frame_type` の使い方
 
@@ -358,7 +363,7 @@ while let Ok(result) = rx.try_recv() {
 - `DecoderConfig` は `#[non_exhaustive]`。 必須は `adapter` と `codec` のみ。 解像度・フレームレートはビットストリームヘッダ (SPS/PPS など) から自動検出される。
 - `async_depth: Option<u16>` を持つ。 `None` の場合は 4。 エンコーダと同じ意味。
 - 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 ヘッダ未到達のうちは `MFX_ERR_MORE_DATA` を内部で吸収して何も出さない (`initialized` フラグで管理)。
-- 出力フォーマットは **NV12 固定** (`IOPattern = OUT_SYSTEM_MEMORY`)。 別フォーマットへの変換は VPP 等で別途処理する。
+- 出力フォーマットはストリームのネイティブ形式で決まる (8bit は NV12、10bit は P010)。 出力形式を選択する API はない。 4:4:4 ストリームのデコードは未対応。 `IOPattern = OUT_SYSTEM_MEMORY` は変わらない。
 - サーフェスは VPL の **内部割り当て** (`surface_work = NULL`)。 アプリ側でサーフェスプールを持つ必要はなく、`FrameSurface` の Drop で `Release` が自動的に呼ばれる。
 - worker スレッド名は `vpl-decoder-sync`。 `user_data` は入力ビットストリームの `TimeStamp` に載せた連番と、 出力フレームの `TimeStamp` の**完全一致**で対応付く (Encoder と同じ方式)。 B フレームの表示順並び替えがあっても正しい入力フレームに戻る。 なお、 1 フレームが複数の `decode()` 呼び出しに分割して供給されるケースでは、 出力フレームの TimeStamp がどの呼び出しの連番になるかが VPL 実装依存のため、 user_data の対応付けは保証されない (分割入力で未消費の連番が残留した場合、 `finish()` が残留チェックエラーを返す)。
 - `decode` 呼び出しごとに `user_data` を 1 つ供給する。 VPL が内部蓄積でフレームを出さないターンでは消費されず、 出力フレーム数より供給数が多い場合の残余は `finish()` の残留チェックでエラーになる (エラーが通知され、 `finish()` が `Err` を返す)。 `decode` がエラーを返した場合も `frame_seq` は消費済みで、 失敗フレームの `user_data` は出力に紐付かず `finish()` の残留チェック (または `Drop` 時の `MFX_ERR_ABORTED` 通知) でエラーとして通知される。
@@ -387,7 +392,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 }
 ```
 
-- `y()` / `uv()` は **ピッチ込みの生サーフェス**。 各行の先頭 `width()` バイトのみが有効データで、残りはパディング。 `pitch() != width()` が普通なので、 そのまま `width * height * 3 / 2` バイトのバッファにコピーすると壊れる。 行ごとにコピーする。
+- `y()` / `uv()` は **ピッチ込みの生サーフェス**。 8bit は各行の先頭 `width()` バイト、 P010 は各行の先頭 `width() * 2` バイトのみが有効データで、残りはパディング。 P010 は各サンプルが 16bit ワードで上位 10bit が有効。 `pitch() != width()` が普通なので、 そのまま `width * height * 3 / 2` バイトのバッファにコピーすると壊れる。 行ごとにコピーする。
 - スライスのライフタイム `'a` は `on_decoded` 呼び出し中のみ。 コールバックの外に持ち出そうとするとコンパイルエラーになる。 外で使いたいなら `to_vec()` でコピーする。
 - VPL から返るサーフェスが不正 (null プレーン / `crop = 0` / `pitch < crop_w`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
 
@@ -429,6 +434,62 @@ for codec in supported_codecs(adapter)? {
     }
 }
 ```
+
+## 実機で確認した制約
+
+次の環境で確認した `supported_codecs` と実際の Init / Encode / Decode の差、および実装上の制約をまとめる。
+これらは API の保証ではなく、この環境での観測結果である。別の GPU やドライバでは再確認すること。
+
+- 実機: GMKtec NucBox K9、Intel Meteor Lake-P [Intel Arc Graphics] (8086:7d55)
+- OS / kernel: Ubuntu 24.04.5 LTS / 6.8.0-85-generic
+- VA-API: 1.22 (libva 2.22.0)、iHD 24.3.4
+- oneVPL: libvpl 2.17.0 (static link)
+- 確認日: 2026-11-07
+- 測定条件: 320x240、System メモリ、CQP (QPI=10)、AsyncDepth 4
+
+### エンコーダー
+
+| コーデック / プロファイル | 入力 | capability | Init (CQP) | 結果 |
+|---|---|---|---|---|
+| H.264 High | P010 / Y410 | 非対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
+| HEVC Main10 | NV12 / AYUV | 対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
+| VP9 Profile0 / Profile1 | P010 / Y410 | 対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
+| VP9 Profile2 | AYUV / Y410 | 対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
+| AV1 Main | AYUV | 非対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
+| HEVC Rext | AYUV / Y410 | 対応 | 成功 | 出力あり (CQP / CBR) |
+| HEVC Scc | AYUV | 対応 | 成功 | CQP は出力あり、CBR は Init 失敗 |
+| HEVC Scc | Y410 | 対応 | 成功 | CQP は出力なし、CBR は Init 失敗 |
+
+補足:
+
+- HEVC Rext + AYUV / Y410 は CQP (3 / 10 フレーム) と CBR のいずれも出力が得られる。
+- HEVC Scc + AYUV は CQP (3 / 10 フレーム) で出力が得られるが、CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
+- HEVC Scc + Y410 は CQP 3 フレームで `Encoder::finish` が pending frames のエラーを返して出力が得られず、10 フレームでは 6 フレーム目の `EncodeFrameAsync` が device busy で失敗する。CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
+- 測定条件: CQP は QPI=10、GOP=30、qpp / qpb 未指定。CBR は 1000 kbps。AsyncDepth 4。
+- HEVC Main + P010 は Init が成功し、実効 FourCC は P010 のままになる。エンコード結果のプロファイルとビット深度の整合は未確認。
+- capability が「対応」でも Init が失敗する組み合わせがある。Init が成功してもエンコードに失敗する組み合わせもある。`supported_codecs` の結果だけで成功を判断しない。
+
+### デコーダー
+
+| ストリーム | 出力 | 備考 |
+|---|---|---|
+| 8bit (H.264 / HEVC Main / VP9 Profile0 / AV1 8bit) | NV12 | - |
+| 10bit (HEVC Main10 / AV1 10bit) | P010 | - |
+| HEVC Main10 + Y410 | P010 | 4:4:4 から 4:2:0 に変換される |
+| VP9 Profile2 + P010 | P010 | - |
+| HEVC Rext / Scc + AYUV / Y410 | AYUV / Y410 | NV12 / P010 以外のためデコードはエラー |
+| VP9 Profile2 + NV12 | P016 (12bit) | 入力のビット深度がプロファイルと合わない例。NV12 / P010 以外のためデコードはエラー |
+
+- 出力形式はストリームのネイティブ形式で決まり、選択する API はない。
+- `DecodeHeader` 後の FourCC 上書きはプロファイル依存で、YUY2 出力は確認できていない。
+- NV12 / P010 以外の出力は未対応で、デコード時にエラーになる。
+
+### 再確認方法
+
+- `vainfo` で VA-API のプロファイルとドライバを確認する。
+- `supported_codecs()` で capability を取得する。
+- `Encoder::new` で Init を試し、成功した場合は `EncodeFrameAsync` の出力を確認する。
+- `Decoder` でデコードし、実際の `mfxFrameInfo` (FourCC / BitDepth / ChromaFormat) を確認する。
 
 ## エラー型 (`Error`)
 
