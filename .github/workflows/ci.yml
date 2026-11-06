@@ -45,7 +45,7 @@ jobs:
       labels: [self-hosted, linux, x64, Intel-VPL]
     timeout-minutes: 15
     env:
-      # 実機アダプタを使う統合テスト (tests/test_adapter.rs::test_real_adapter_session) を有効化する
+      # 実機アダプタを使う統合テストを有効化する
       INTEL_VPL: 1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -66,6 +66,7 @@ jobs:
     timeout-minutes: 15
     env:
       DOCS_RS: 1
+      RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # Rust ツールチェイン (1.93) は rust-toolchain.toml に従って rustup が自動導入する
