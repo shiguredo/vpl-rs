@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use crate::codec_info::{Av1Profile, H264Profile, HevcProfile, VideoCodecType, Vp9Profile};
+use crate::codec_info::{
+    Av1Profile, FrameFormat, H264Profile, HevcProfile, VideoCodecType, Vp9Profile,
+};
 use crate::stats::{Counter, Gauge};
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
@@ -52,67 +54,7 @@ pub enum CodecConfig {
     Av1(Av1EncoderConfig),
 }
 
-/// フレームの色形式
-///
-/// エンコーダーの入力形式として指定する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameFormat {
-    /// Semi-Planar YUV 4:2:0 8bit [Y plane + interleaved UV plane]
-    Nv12,
-    /// Packed YUV 4:2:2 8bit [YUYV interleaved]
-    Yuy2,
-    /// Packed BGRA 8bit
-    Bgra,
-}
-
 impl FrameFormat {
-    /// MFX_FOURCC_* の値から変換する
-    ///
-    /// 本クレートが表現できない FourCC の場合は `None` を返す。
-    pub(crate) fn from_fourcc(fourcc: u32) -> Option<Self> {
-        match fourcc {
-            sys::MFX_FOURCC_NV12 => Some(Self::Nv12),
-            sys::MFX_FOURCC_YUY2 => Some(Self::Yuy2),
-            sys::MFX_FOURCC_RGB4 => Some(Self::Bgra),
-            _ => None,
-        }
-    }
-
-    fn fourcc(self) -> u32 {
-        match self {
-            FrameFormat::Nv12 => sys::MFX_FOURCC_NV12,
-            FrameFormat::Yuy2 => sys::MFX_FOURCC_YUY2,
-            FrameFormat::Bgra => sys::MFX_FOURCC_RGB4,
-        }
-    }
-
-    fn chroma_format(self) -> u16 {
-        match self {
-            FrameFormat::Nv12 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
-            FrameFormat::Yuy2 => sys::MFX_CHROMAFORMAT_YUV422 as u16,
-            FrameFormat::Bgra => sys::MFX_CHROMAFORMAT_YUV444 as u16,
-        }
-    }
-
-    fn bit_depth(self) -> u16 {
-        8
-    }
-
-    /// フレームデータのバイトサイズを返す
-    ///
-    /// オーバーフロー時は `None` を返す。
-    pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
-        let pixels = width.checked_mul(height)?;
-        match self {
-            // YUV 4:2:0 8bit: Y + UV/2 = pixels * 3 / 2
-            FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
-            // YUY2: 2 bytes/pixel (packed YUYV)
-            FrameFormat::Yuy2 => pixels.checked_mul(2),
-            // BGRA: 4 bytes/pixel
-            FrameFormat::Bgra => pixels.checked_mul(4),
-        }
-    }
-
     /// フレームデータを内部サーフェスの mfxFrameData にコピーする
     ///
     /// # Safety
@@ -2118,6 +2060,12 @@ mod tests {
                 "{format:?} の FourCC 変換が往復しない"
             );
         }
+    }
+
+    /// 未知の FourCC が `None` になること
+    #[test]
+    fn frame_format_from_unknown_fourcc_returns_none() {
+        assert_eq!(FrameFormat::from_fourcc(0xDEAD_BEEF), None);
     }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {

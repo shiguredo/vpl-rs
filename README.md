@@ -85,7 +85,7 @@ let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
 
 ### コーデック情報の照会
 
-`supported_codecs()` は、指定アダプタで利用できるコーデックと、そのケーパビリティを返します。
+`supported_codecs()` は、H.264 / HEVC / VP9 / AV1 それぞれの対応状況とケーパビリティを返します。
 エンコード・デコードに対応していないコーデックは、`CodecInfo::encoding` / `CodecInfo::decoding` が `None` になります。
 
 ケーパビリティは VPL の実装記述 (`mfxDecoderDescription` / `mfxEncoderDescription`) の階層をそのまま反映します。プロファイルやメモリタイプをまたいだ集約は行いません。
@@ -122,15 +122,16 @@ for codec in supported_codecs(adapter)? {
 | `CodecInfo` | コーデック種別と、エンコード・デコードの情報 |
 | `DecodingInfo` / `EncodingInfo` | 最大コーデックレベルとプロファイル一覧。エンコードは B フレーム対応も持つ |
 | `ProfileCapabilities` | プロファイルと、メモリタイプごとのケーパビリティ |
-| `MemoryTypeCapabilities` | メモリタイプ、幅・高さの範囲 (`Range`)、対応色形式 |
-| `Range` | 最小値・最大値・増分 (VPL の `mfxRange32U`) |
+| `MemoryTypeCapabilities` | メモリタイプ、幅・高さの範囲 (`ValueRange`)、対応色形式 |
+| `ValueRange` | 最小値・最大値・増分 (VPL の `mfxRange32U`) |
 | `VideoProfile` | コーデックごとのプロファイル。既知の型で表現できない値は `Unknown(u32)` |
 | `MemoryType` | VPL の `mfxResourceType`。既知の型で表現できない値は `Unknown(u32)` |
 
 - 解像度範囲と色形式は、プロファイルとメモリタイプごとの値をそのまま返す
 - 色形式は `FrameFormat` で表現できる FourCC だけを、VPL の `ColorFormats` に並んでいる順序で返す
-- `max_codec_level` はコーデックのエントリが持つ値をそのまま返し、VPL が 0 を返す場合は `None`
+- `max_codec_level` は最大コーデックレベルを返し、レベルが不明な場合は `None`
 - すべてのメモリタイプを返すが、このクレートの `Encoder` / `Decoder` が実際に使うのは `MemoryType::System` だけ
+- VPL がプロファイルを返さない場合は `profiles` が空、メモリタイプを返さない場合は `memory_types` が空、色形式を返さない場合や表現できる FourCC が無い場合は `color_formats` が空になる
 
 ### エンコード
 
@@ -283,8 +284,8 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 |---|---|
 | NV12 | Semi-Planar YUV 4:2:0 8bit |
 
-`supported_codecs()` の `DecodingInfo::color_formats` は VPL の実装が対応する色形式の一覧です。
-このクレートの `Decoder` が出力する形式は NV12 のみで、ほかの形式を選択する API はありません。
+`supported_codecs()` が返す `CodecInfo::decoding` → `DecodingInfo::profiles` → `ProfileCapabilities::memory_types` → `MemoryTypeCapabilities::color_formats` に、プロファイル・メモリタイプごとのデコード出力色形式が入ります。
+このクレートの `Decoder` が実際に出力する形式は NV12 のみで、ほかの形式を選択する API はありません。
 
 ## サポートプロファイル
 

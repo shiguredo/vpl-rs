@@ -28,9 +28,9 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 `src/lib.rs` から再エクスポートされる API:
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
-- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `Range` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
+- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
 - `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `SequenceParams` / `VideoParam` / `ExtParams` / `FrameFormat` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `stats` — `Counter` / `Gauge`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
@@ -391,19 +391,20 @@ impl<'a, T> DecodedFrame<'a, T> {
 - スライスのライフタイム `'a` は `on_decoded` 呼び出し中のみ。 コールバックの外に持ち出そうとするとコンパイルエラーになる。 外で使いたいなら `to_vec()` でコピーする。
 - VPL から返るサーフェスが不正 (null プレーン / `crop = 0` / `pitch < crop_w`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
 
-## コーデック情報の照会 (`codec_info`)
+## コーデック情報の照会 (`supported_codecs`)
 
-`shiguredo_vpl::codec_info` は静的なテーブルではなく、 **指定アダプタに対する VPL の実装記述から実際に取れる値**を返す。
+`supported_codecs` は静的なテーブルではなく、 **指定アダプタに対する VPL の実装記述から実際に取れる値**を返す。
 
 - H.264 / HEVC / VP9 / AV1 を順に問い合わせて `CodecInfo` を組み立てる。
 - `CodecInfo` は `decoding: Option<DecodingInfo>` / `encoding: Option<EncodingInfo>` を持つ。 エンコード・デコードに対応していないコーデックは `None` になる。
 - `DecodingInfo` / `EncodingInfo` は `max_codec_level: Option<u16>` と `profiles: Vec<ProfileCapabilities>` を持つ。 `EncodingInfo` はこのほかに `supports_frame_reordering` (B フレーム) を持つ。
 - `ProfileCapabilities` はコーデックごとの `profile: VideoProfile` と、メモリタイプごとの `memory_types: Vec<MemoryTypeCapabilities>` を持つ。
-- `MemoryTypeCapabilities` は `memory_type: MemoryType` / `width: Range` / `height: Range` / `color_formats: Vec<FrameFormat>` を持つ。 `Range` は VPL の `mfxRange32U` に対応し、 `min` / `max` / `step` を持つ。
+- `MemoryTypeCapabilities` は `memory_type: MemoryType` / `width: ValueRange` / `height: ValueRange` / `color_formats: Vec<FrameFormat>` を持つ。 `ValueRange` は VPL の `mfxRange32U` に対応し、 `min` / `max` / `step` を持つ。
 - 解像度範囲と色形式は、プロファイルとメモリタイプごとの記述をそのまま返す。 プロファイルやメモリタイプをまたいだ集約はしない。 色形式は `FrameFormat` で表現できる FourCC だけを、 VPL の `ColorFormats` に並んでいる順序で返す。
 - 既知の型で表現できないプロファイル ID とメモリタイプは `VideoProfile::Unknown(u32)` / `MemoryType::Unknown(u32)` として生の値を保持する。
 - すべてのメモリタイプを返すが、 このクレートの `Encoder` / `Decoder` が実際に使うのは `MemoryType::System` だけ。
-- `max_codec_level` は VPL の `MaxcodecLevel` をそのまま返す。 VPL が 0 を返す場合 (VP9 など) は `None`。
+- `max_codec_level` は最大コーデックレベルを返す。 レベルが不明な場合は `None`。
+- VPL がプロファイルを返さない場合は `profiles` が空、 メモリタイプを返さない場合は `memory_types` が空、 色形式を返さない場合や表現できる FourCC が無い場合は `color_formats` が空になる。
 - 「このマシンで実際に何が動くか」を起動時に確認する用途。 ハードコードしたサポート表ではなく必ず実行時に取る。
 
 ```rust

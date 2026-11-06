@@ -1,28 +1,15 @@
-use std::sync::OnceLock;
+mod helpers;
+
 use std::sync::mpsc;
 use std::time::Duration;
 
+use helpers::test_adapter;
 use shiguredo_vpl::{
-    AdapterSelector, Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder,
-    DecoderConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler,
-    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
-    PictureType, RateControlMode, ReconfigureParams, VideoCodecType, Vp9EncoderConfig, Vp9Profile,
-    frame_type, list_adapters,
+    Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder, DecoderConfig, EncodeOptions,
+    EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat,
+    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, PictureType, RateControlMode,
+    ReconfigureParams, VideoCodecType, Vp9EncoderConfig, Vp9Profile, frame_type,
 };
-
-/// テスト用アダプタを返す
-///
-/// `list_adapters()` の結果をテストバイナリ単位でキャッシュし、`MFXLoad` の
-/// 繰り返し呼び出しを避ける。Intel HW アダプタが見つからない環境では panic
-/// する（実機テストは Intel GPU 付きランナー上で実行する想定）。
-fn test_adapter() -> AdapterSelector {
-    static CACHED: OnceLock<AdapterSelector> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let adapters = list_adapters().expect("list_adapters に失敗");
-        let first = adapters.first().expect("Intel HW アダプタが見つからない");
-        AdapterSelector::DrmRenderNode(first.drm_render_node)
-    })
-}
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
 struct DecodedFrameInfo {

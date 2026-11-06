@@ -42,8 +42,8 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) の `mfxImplDescription` で確認�
   - `max_codec_level` (`MaxcodecLevel`)
   - `profiles: Vec<ProfileCapabilities>` (プロファイルごとの情報)
 - `ProfileCapabilities` は `profile: VideoProfile` と `memory_types: Vec<MemoryTypeCapabilities>` を持つ。
-- `MemoryTypeCapabilities` は `memory_type: MemoryType` / `width: Range` / `height: Range` / `color_formats: Vec<FrameFormat>` を持つ。
-- `Range` は VPL の `mfxRange32U` に対応し、`min` / `max` / `step` を持つ。
+- `MemoryTypeCapabilities` は `memory_type: MemoryType` / `width: ValueRange` / `height: ValueRange` / `color_formats: Vec<FrameFormat>` を持つ。
+- `ValueRange` は VPL の `mfxRange32U` に対応し、`min` / `max` / `step` を持つ。
 - 解像度範囲と色形式は、プロファイルとメモリタイプごとの定義をそのまま返す。プロファイルやメモリタイプをまたいだ集約は行わない。
 - すべてのメモリタイプを返す。このクレートの `Encoder` / `Decoder` が実際に使うのは `MemoryType::System` だけであることを rustdoc に明記する。
 - `CodecInfo` の `decoding` / `encoding` を `Option` にし、非対応コーデックは `None` を返す。`DecodingInfo` / `EncodingInfo` の `supported` / `hardware_accelerated` と `EncodingProfiles` は `Option` と per-profile 構造で表現できるため削除する。
@@ -76,9 +76,9 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) の `mfxImplDescription` で確認�
 
 - `CodecInfo::decoding` / `CodecInfo::encoding` を `Option` にし、非対応コーデックでは `None` を返すようにした
 - `DecodingInfo` / `EncodingInfo` の `supported` / `hardware_accelerated` と `EncodingProfiles` を削除した
-- `ProfileCapabilities` / `MemoryTypeCapabilities` / `Range` / `VideoProfile` / `MemoryType` を追加した
+- `ProfileCapabilities` / `MemoryTypeCapabilities` / `ValueRange` / `VideoProfile` / `MemoryType` を追加した
 - プロファイルやメモリタイプをまたいだ集約をやめ、VPL の `Profiles` / `MemDesc` をそのまま反映するようにした
-- `Range` に VPL の `mfxRange32U` に対応する `step` を含めた
+- `ValueRange` に VPL の `mfxRange32U` に対応する `step` を含めた
 - 未知のプロファイル ID とメモリタイプを `VideoProfile::Unknown(u32)` / `MemoryType::Unknown(u32)` で保持するようにした
 - `FrameFormat` に FourCC からの変換を追加し、`FrameFormat` で表現できない FourCC は無視するようにした
 - `EncodingInfo::supports_multi_pass` を削除した
@@ -89,11 +89,11 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) の `mfxImplDescription` で確認�
 
 ### 確認
 
-`shiguredo-gmktec-k9` の `~/melpon/vpl-rs` で確認した。
+Intel GPU を搭載した実機で確認した。
 
 | 確認内容 | 結果 |
 | --- | --- |
 | `cargo fmt --all -- --check` | pass |
 | `INTEL_VPL=1 cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` | pass（lib 44 件、adapter 6 件、codec_info 1 件、roundtrip 36 件、doctest 2 件） |
-| `DOCS_RS=1 cargo doc --no-deps` | pass |
+| `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` | pass（lib 48 件、adapter 6 件、codec_info 1 件、roundtrip 36 件、doctest 2 件） |
+| `DOCS_RS=1 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | pass |

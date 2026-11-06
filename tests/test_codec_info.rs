@@ -2,20 +2,15 @@
 
 #![cfg(intel_vpl)]
 
+mod helpers;
+
+use helpers::test_adapter;
 use shiguredo_vpl::{
-    AdapterSelector, FrameFormat, MemoryType, MemoryTypeCapabilities, ProfileCapabilities, Range,
-    VideoCodecType, list_adapters, supported_codecs,
+    FrameFormat, MemoryType, ProfileCapabilities, ValueRange, VideoCodecType, supported_codecs,
 };
 
-/// テスト用アダプタを返す
-fn test_adapter() -> AdapterSelector {
-    let adapters = list_adapters().expect("list_adapters に失敗");
-    let first = adapters.first().expect("Intel HW アダプタが見つからない");
-    AdapterSelector::DrmRenderNode(first.drm_render_node)
-}
-
 /// 幅・高さの範囲を検証する
-fn assert_range(range: Range, context: &str) {
+fn assert_range(range: ValueRange, context: &str) {
     assert!(range.min > 0, "{context}: min が 0 になっている: {range:?}");
     assert!(
         range.max >= range.min,
@@ -27,12 +22,6 @@ fn assert_range(range: Range, context: &str) {
         range.step > 0,
         "{context}: step が 0 になっている: {range:?}"
     );
-}
-
-/// メモリタイプごとのケーパビリティを検証する
-fn assert_memory_type_capabilities(capabilities: &MemoryTypeCapabilities, context: &str) {
-    assert_range(capabilities.width, &format!("{context} 幅"));
-    assert_range(capabilities.height, &format!("{context} 高さ"));
 }
 
 /// プロファイルごとのケーパビリティを検証する
@@ -49,13 +38,12 @@ fn assert_profiles(profiles: &[ProfileCapabilities], context: &str) {
             profile.profile
         );
         for capabilities in &profile.memory_types {
-            assert_memory_type_capabilities(
-                capabilities,
-                &format!(
-                    "{context} {:?} {:?}",
-                    profile.profile, capabilities.memory_type
-                ),
+            let context = format!(
+                "{context} {:?} {:?}",
+                profile.profile, capabilities.memory_type
             );
+            assert_range(capabilities.width, &format!("{context} 幅"));
+            assert_range(capabilities.height, &format!("{context} 高さ"));
         }
     }
 }
@@ -79,6 +67,16 @@ fn test_supported_codecs_return_capabilities() {
     let codecs = supported_codecs(test_adapter()).expect("supported_codecs に失敗");
     let listing = format!("{codecs:#?}");
     assert_eq!(codecs.len(), 4, "コーデック数が 4 ではない: {listing}");
+    assert_eq!(
+        codecs.iter().map(|codec| codec.codec).collect::<Vec<_>>(),
+        vec![
+            VideoCodecType::H264,
+            VideoCodecType::Hevc,
+            VideoCodecType::Vp9,
+            VideoCodecType::Av1,
+        ],
+        "コーデックの順序が正しくない: {listing}"
+    );
 
     let mut num_supported_decoding = 0usize;
     let mut num_supported_encoding = 0usize;

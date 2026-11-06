@@ -13,7 +13,6 @@
 
 - [CHANGE] プロファイル型とコーデック識別型を統合する
   - `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` に統合する
-  - `EncodingProfiles` の各 variant が `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` の一覧を持つようになる
   - `DecoderCodec` を削除し、`DecoderConfig` のコーデックを `VideoCodecType` で指定するよう変更する
   - @melpon
 - [CHANGE] `Encoder::get_video_param` の戻り値を `VideoParam` に変更する
@@ -26,9 +25,10 @@
 - [CHANGE] `supported_codecs` が返すコーデック情報を VPL の実装記述に合わせて拡充する
   - `CodecInfo::decoding` / `CodecInfo::encoding` を `Option` に変更し、非対応コーデックでは `None` を返す
   - `DecodingInfo` / `EncodingInfo` から `supported` / `hardware_accelerated` / `supports_multi_pass` を削除する
+  - `DecodingInfo` / `EncodingInfo` に `max_codec_level: Option<u16>` を追加し、レベルが不明な場合は `None` にする
   - プロファイルごとの `ProfileCapabilities` と、メモリタイプごとの `MemoryTypeCapabilities` を追加する
-  - `MemoryTypeCapabilities` は幅・高さの範囲 (`Range`) と色形式をメモリタイプ別に返し、プロファイルやメモリタイプをまたいだ集約はしない
-  - `VideoProfile` / `MemoryType` / `Range` を公開し、未知のプロファイルとメモリタイプは `Unknown(u32)` で保持する
+  - `MemoryTypeCapabilities` は幅・高さの範囲 (`ValueRange`) と色形式をメモリタイプ別に返し、プロファイルやメモリタイプをまたいだ集約はしない
+  - `VideoProfile` / `MemoryType` / `ValueRange` を公開し、未知のプロファイルとメモリタイプは `Unknown(u32)` で保持する
   - `EncodingProfiles` を削除する
   - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する

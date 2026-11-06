@@ -1,6 +1,5 @@
-//! コーデック種別・プロファイルの定義と、コーデック情報の照会
+//! コーデック種別・プロファイル・色形式の定義と、コーデック情報の照会
 
-use crate::encode::FrameFormat;
 use crate::vpl::{VplLibrary, VplLoader};
 use crate::{AdapterSelector, Error, sys};
 
@@ -193,7 +192,7 @@ impl Av1Profile {
 /// コーデックのプロファイル
 ///
 /// VPL の `Profile` の値に対応するコーデックごとの型。
-/// 本クレートが既知の型で表現できないプロファイルは `Unknown` に生の値を保持する。
+/// VPL の標準プロファイルでも、本クレートが型として持たないものは `Unknown` に生の値を保持する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoProfile {
     /// H.264 プロファイル
@@ -204,7 +203,11 @@ pub enum VideoProfile {
     Vp9(Vp9Profile),
     /// AV1 プロファイル
     Av1(Av1Profile),
-    /// 既知の型で表現できないプロファイル
+    /// 本クレートが型として持たないプロファイル
+    ///
+    /// VPL の標準プロファイルでも、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile`
+    /// に定義されていないものはここに入る。
+    /// 例えば H.264 の Extended、AV1 の High / Professional が該当する。
     Unknown(u32),
 }
 
@@ -278,7 +281,7 @@ impl MemoryType {
 ///
 /// VPL の `mfxRange32U` に対応する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Range {
+pub struct ValueRange {
     /// 最小値
     pub min: u32,
     /// 最大値
@@ -287,7 +290,7 @@ pub struct Range {
     pub step: u32,
 }
 
-impl Range {
+impl ValueRange {
     /// mfxRange32U の値から変換する
     fn from_mfx_range(range: sys::mfxRange32U) -> Self {
         Self {
@@ -298,15 +301,75 @@ impl Range {
     }
 }
 
+/// フレームの色形式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameFormat {
+    /// Semi-Planar YUV 4:2:0 8bit [Y プレーン + インターリーブ UV プレーン]
+    Nv12,
+    /// Packed YUV 4:2:2 8bit [YUYV インターリーブ]
+    Yuy2,
+    /// Packed BGRA 8bit
+    Bgra,
+}
+
+impl FrameFormat {
+    /// MFX_FOURCC_* の値から変換する
+    ///
+    /// 本クレートが表現できない FourCC の場合は `None` を返す。
+    pub(crate) fn from_fourcc(fourcc: u32) -> Option<Self> {
+        match fourcc {
+            sys::MFX_FOURCC_NV12 => Some(Self::Nv12),
+            sys::MFX_FOURCC_YUY2 => Some(Self::Yuy2),
+            sys::MFX_FOURCC_RGB4 => Some(Self::Bgra),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fourcc(self) -> u32 {
+        match self {
+            FrameFormat::Nv12 => sys::MFX_FOURCC_NV12,
+            FrameFormat::Yuy2 => sys::MFX_FOURCC_YUY2,
+            FrameFormat::Bgra => sys::MFX_FOURCC_RGB4,
+        }
+    }
+
+    pub(crate) fn chroma_format(self) -> u16 {
+        match self {
+            FrameFormat::Nv12 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
+            FrameFormat::Yuy2 => sys::MFX_CHROMAFORMAT_YUV422 as u16,
+            FrameFormat::Bgra => sys::MFX_CHROMAFORMAT_YUV444 as u16,
+        }
+    }
+
+    pub(crate) fn bit_depth(self) -> u16 {
+        8
+    }
+
+    /// フレームデータのバイトサイズを返す
+    ///
+    /// オーバーフロー時は `None` を返す。
+    pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
+        let pixels = width.checked_mul(height)?;
+        match self {
+            // YUV 4:2:0 8bit: Y + UV/2 = 画素 * 3 / 2
+            FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
+            // YUY2: 2 バイト/画素 (YUYV パック)
+            FrameFormat::Yuy2 => pixels.checked_mul(2),
+            // BGRA: 4 バイト/画素
+            FrameFormat::Bgra => pixels.checked_mul(4),
+        }
+    }
+}
+
 /// メモリタイプごとのケーパビリティ
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryTypeCapabilities {
     /// メモリタイプ
     pub memory_type: MemoryType,
     /// 幅の範囲
-    pub width: Range,
+    pub width: ValueRange,
     /// 高さの範囲
-    pub height: Range,
+    pub height: ValueRange,
     /// 対応する色形式
     ///
     /// [`FrameFormat`] で表現できる FourCC だけを、VPL の `ColorFormats` に
@@ -350,8 +413,8 @@ pub struct CodecInfo {
 pub struct DecodingInfo {
     /// 最大コーデックレベル
     ///
-    /// VPL の `MaxcodecLevel` の値で、意味はコーデックごとに異なる。
-    /// VPL が値を返さない場合は `None`。
+    /// 値の意味はコーデックごとに異なる。
+    /// レベルが不明な場合は `None`。
     pub max_codec_level: Option<u16>,
     /// プロファイルごとの情報
     ///
@@ -370,8 +433,8 @@ pub struct EncodingInfo {
     pub supports_frame_reordering: bool,
     /// 最大コーデックレベル
     ///
-    /// VPL の `MaxcodecLevel` の値で、意味はコーデックごとに異なる。
-    /// VPL が値を返さない場合は `None`。
+    /// 値の意味はコーデックごとに異なる。
+    /// レベルが不明な場合は `None`。
     pub max_codec_level: Option<u16>,
     /// プロファイルごとの情報
     ///
@@ -400,7 +463,8 @@ pub struct EncodingInfo {
 /// 並んでいる順序で格納する。
 /// VPL が返すプロファイル ID とメモリタイプのうち、本クレートが既知の型で表現できないものは
 /// [`VideoProfile::Unknown`] / [`MemoryType::Unknown`] として生の値を保持する。
-/// `max_codec_level` は VPL が 0 を返す場合とコーデックのエントリが無い場合は `None` になる。
+/// `max_codec_level` はレベルが不明な場合に `None` になる。
+/// コーデックのエントリが無い場合は `decoding` / `encoding` 自体が `None` になる。
 ///
 /// 指定アダプタに対応する Intel HW 実装が見つからない場合は、render node 番号を含む
 /// メッセージと `MFX_ERR_NOT_FOUND` のステータスを持つ `Error` を返す。
@@ -460,16 +524,6 @@ unsafe fn build_codec_info_list(desc: &sys::mfxImplDescription) -> Vec<CodecInfo
         .collect()
 }
 
-/// MFX_FOURCC_* の配列を FrameFormat の一覧に変換する
-///
-/// VPL の `ColorFormats` に並んでいる順序を維持する。
-fn collect_color_formats(fourccs: &[u32]) -> Vec<FrameFormat> {
-    fourccs
-        .iter()
-        .filter_map(|&fourcc| FrameFormat::from_fourcc(fourcc))
-        .collect()
-}
-
 /// メモリタイプごとのケーパビリティを返す
 ///
 /// # Safety
@@ -489,12 +543,14 @@ unsafe fn memory_type_capabilities(
         Vec::new()
     } else {
         let raw = unsafe { std::slice::from_raw_parts(color_formats, num_color_formats as usize) };
-        collect_color_formats(raw)
+        raw.iter()
+            .filter_map(|&fourcc| FrameFormat::from_fourcc(fourcc))
+            .collect()
     };
     MemoryTypeCapabilities {
         memory_type: MemoryType::from_mfx_resource_type(memory_type),
-        width: Range::from_mfx_range(width),
-        height: Range::from_mfx_range(height),
+        width: ValueRange::from_mfx_range(width),
+        height: ValueRange::from_mfx_range(height),
         color_formats,
     }
 }
@@ -520,6 +576,7 @@ unsafe fn probe_decoding(
         }
 
         return Some(DecodingInfo {
+            // VPL はレベルが不明な場合に 0 (MFX_LEVEL_UNKNOWN) を返す。
             max_codec_level: (entry.MaxcodecLevel != 0).then_some(entry.MaxcodecLevel),
             profiles: unsafe { query_decoding_profiles(codec, entry) },
         });
@@ -529,9 +586,6 @@ unsafe fn probe_decoding(
 }
 
 /// デコーダのプロファイル一覧を返す
-///
-/// VPL の `Profiles` に並んでいる順序を維持する。
-/// VPL がプロファイルを返さない場合は空。
 unsafe fn query_decoding_profiles(
     codec: VideoCodecType,
     entry: &sys::mfxDecoderDescription_decoder,
@@ -590,6 +644,7 @@ unsafe fn probe_encoding(
 
         return Some(EncodingInfo {
             supports_frame_reordering: entry.BiDirectionalPrediction != 0,
+            // VPL はレベルが不明な場合に 0 (MFX_LEVEL_UNKNOWN) を返す。
             max_codec_level: (entry.MaxcodecLevel != 0).then_some(entry.MaxcodecLevel),
             profiles: unsafe { query_encoding_profiles(codec, entry) },
         });
@@ -599,9 +654,6 @@ unsafe fn probe_encoding(
 }
 
 /// エンコーダのプロファイル一覧を返す
-///
-/// VPL の `Profiles` に並んでいる順序を維持する。
-/// VPL がプロファイルを返さない場合は空。
 unsafe fn query_encoding_profiles(
     codec: VideoCodecType,
     entry: &sys::mfxEncoderDescription_encoder,
@@ -859,7 +911,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].width,
-            Range {
+            ValueRange {
                 min: 64,
                 max: 1920,
                 step: 16
@@ -868,7 +920,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].height,
-            Range {
+            ValueRange {
                 min: 64,
                 max: 1080,
                 step: 16
@@ -887,7 +939,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[1].width,
-            Range {
+            ValueRange {
                 min: 1,
                 max: 8192,
                 step: 1
@@ -906,7 +958,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[1].memory_types[0].width,
-            Range {
+            ValueRange {
                 min: 128,
                 max: 4096,
                 step: 8
@@ -915,7 +967,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[1].memory_types[0].height,
-            Range {
+            ValueRange {
                 min: 96,
                 max: 2160,
                 step: 8
@@ -940,15 +992,21 @@ mod tests {
             &mut formats,
         )];
         let mut profiles = [dec_profile(999, &mut mem_descs)];
-        let mut codecs = [dec_codec(sys::MFX_CODEC_AVC, 0, &mut profiles)];
+        let mut codecs = [dec_codec(sys::MFX_CODEC_AVC, 52, &mut profiles)];
         let dec = dec_description(&mut codecs);
 
         let info = unsafe { probe_decoding(&dec, VideoCodecType::H264) }
             .expect("H.264 のデコード情報が取得できない");
 
         assert_eq!(
-            info.max_codec_level, None,
-            "最大コーデックレベルが None ではない: {info:?}"
+            info.profiles.len(),
+            1,
+            "プロファイル数が正しくない: {info:?}"
+        );
+        assert_eq!(
+            info.profiles[0].memory_types.len(),
+            1,
+            "メモリタイプ数が正しくない: {info:?}"
         );
         assert_eq!(
             info.profiles[0].profile,
@@ -962,7 +1020,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].width,
-            Range {
+            ValueRange {
                 min: 1,
                 max: 2,
                 step: 1
@@ -971,7 +1029,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].height,
-            Range {
+            ValueRange {
                 min: 3,
                 max: 4,
                 step: 1
@@ -1028,15 +1086,75 @@ mod tests {
         );
     }
 
-    /// 未知のコーデックを照会すると `None` が返ること
+    /// コーデック一覧が空の場合に `None` が返ること
     #[test]
-    fn test_probe_decoding_unknown_codec_returns_none() {
+    fn test_probe_decoding_empty_codecs_returns_none() {
         let mut codecs = [];
         let dec = dec_description(&mut codecs);
 
         let info = unsafe { probe_decoding(&dec, VideoCodecType::H264) };
 
         assert!(info.is_none(), "非対応になっていない: {info:?}");
+    }
+
+    /// 対象コーデックが一覧に無い場合に `None` が返ること
+    #[test]
+    fn test_probe_decoding_mismatched_codec_returns_none() {
+        let mut profiles = [];
+        let mut codecs = [dec_codec(sys::MFX_CODEC_HEVC, 52, &mut profiles)];
+        let dec = dec_description(&mut codecs);
+
+        let info = unsafe { probe_decoding(&dec, VideoCodecType::H264) };
+
+        assert!(info.is_none(), "非対応になっていない: {info:?}");
+    }
+
+    /// 色形式の個数が 0、またはポインタが null の場合に空になること
+    #[test]
+    fn test_probe_decoding_without_color_formats_returns_empty() {
+        let mut mem_descs = [
+            sys::mfxDecoderDescription_decoder_decprofile_decmemdesc {
+                MemHandleType: sys::mfxResourceType_MFX_RESOURCE_SYSTEM_SURFACE,
+                Width: range(1, 2, 1),
+                Height: range(1, 2, 1),
+                reserved: [0; 7],
+                NumColorFormats: 0,
+                ColorFormats: std::ptr::null_mut(),
+            },
+            sys::mfxDecoderDescription_decoder_decprofile_decmemdesc {
+                MemHandleType: sys::mfxResourceType_MFX_RESOURCE_VA_SURFACE,
+                Width: range(1, 2, 1),
+                Height: range(1, 2, 1),
+                reserved: [0; 7],
+                NumColorFormats: 1,
+                ColorFormats: std::ptr::null_mut(),
+            },
+        ];
+        let mut profiles = [dec_profile(sys::MFX_PROFILE_AVC_HIGH, &mut mem_descs)];
+        let mut codecs = [dec_codec(sys::MFX_CODEC_AVC, 52, &mut profiles)];
+        let dec = dec_description(&mut codecs);
+
+        let info = unsafe { probe_decoding(&dec, VideoCodecType::H264) }
+            .expect("H.264 のデコード情報が取得できない");
+
+        assert_eq!(
+            info.profiles.len(),
+            1,
+            "プロファイル数が正しくない: {info:?}"
+        );
+        assert_eq!(
+            info.profiles[0].memory_types.len(),
+            2,
+            "メモリタイプ数が正しくない: {info:?}"
+        );
+        assert!(
+            info.profiles[0].memory_types[0].color_formats.is_empty(),
+            "色形式が空ではない: {info:?}"
+        );
+        assert!(
+            info.profiles[0].memory_types[1].color_formats.is_empty(),
+            "色形式が空ではない: {info:?}"
+        );
     }
 
     /// エンコーダのプロファイル・メモリタイプごとの値が VPL の記述どおりに返ること
@@ -1113,7 +1231,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].width,
-            Range {
+            ValueRange {
                 min: 16,
                 max: 4096,
                 step: 16
@@ -1122,7 +1240,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].height,
-            Range {
+            ValueRange {
                 min: 16,
                 max: 4096,
                 step: 16
@@ -1150,7 +1268,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[1].memory_types[0].width,
-            Range {
+            ValueRange {
                 min: 128,
                 max: 8192,
                 step: 8
@@ -1189,10 +1307,22 @@ mod tests {
         );
     }
 
-    /// 未知のコーデックを照会すると `None` が返ること
+    /// コーデック一覧が空の場合に `None` が返ること
     #[test]
-    fn test_probe_encoding_unknown_codec_returns_none() {
+    fn test_probe_encoding_empty_codecs_returns_none() {
         let mut codecs = [];
+        let enc = enc_description(&mut codecs);
+
+        let info = unsafe { probe_encoding(&enc, VideoCodecType::H264) };
+
+        assert!(info.is_none(), "非対応になっていない: {info:?}");
+    }
+
+    /// 対象コーデックが一覧に無い場合に `None` が返ること
+    #[test]
+    fn test_probe_encoding_mismatched_codec_returns_none() {
+        let mut profiles = [];
+        let mut codecs = [enc_codec(sys::MFX_CODEC_HEVC, 52, 0, &mut profiles)];
         let enc = enc_description(&mut codecs);
 
         let info = unsafe { probe_encoding(&enc, VideoCodecType::H264) };
