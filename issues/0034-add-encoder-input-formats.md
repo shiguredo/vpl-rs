@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-07
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-encoder-input-formats
 - Polished: {YYYY-MM-DD}
@@ -74,6 +74,33 @@ Meteor Lake (Intel Arc Graphics, `mfx-gen`) で `MFXVideoENCODE_Init` と 1 フ�
 4. 対応している形式のラウンドトリップテストを追加する。
 5. 非対応形式とプロファイルの組み合わせの扱い (エラー / スキップ) を rustdoc とテストで明確にする。
 6. `CHANGES.md` と `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新する。
+
+## 解決方法
+
+`FrameFormat` に `P010` / `Ayuv` / `Y410` を追加し、エンコーダーの入力フォーマットとして扱えるようにした。
+
+### 変更内容
+
+- `FrameFormat` に `P010` / `Ayuv` / `Y410` を追加し、各 variant のデータ配置をドキュメント化した
+- `frame_size()` を各形式のバイト数に対応させ、P010 は `mfxFrameInfo.Shift` に 1 を設定した
+- `mfxFrameData` のピッチを `PitchHigh` と `PitchLow` から計算し、P010 / AYUV / Y410 のプレーンコピーに対応した
+- 入力フォーマットとプロファイルの組み合わせは事前検証せず、`MFXVideoENCODE_Init` の結果に従うようにした。将来の GPU / VPL の更新で受け付ける組み合わせが増える可能性があるため
+- P010 / AYUV / Y410 の初期化パラメータ検証と、P010 / Y410 / AYUV 入力のラウンドトリップおよびルマ PSNR をテストに追加した
+- `CHANGES.md` / `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新し、SKILL.md に実機で確認した制約を追記した
+- 4:4:4 エンコードは GPU / プロファイル依存で、Scc + Y410 では出力が得られない組み合わせがあることを SKILL.md に記録した
+
+4:4:4 出力のデコード対応 (AYUV / Y410) は本 issue の対象外とし、別 issue で扱う。
+
+### 確認
+
+Intel GPU を搭載した実機で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` | pass (lib 56 件、adapter 6 件、codec_info 1 件、roundtrip 44 件、doctest 2 件) |
+| `INTEL_VPL=1 cargo doc --no-deps` | pass |
 
 ## 参考
 
