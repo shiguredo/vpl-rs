@@ -72,7 +72,7 @@ impl FrameFormat {
             let pitch = frame_data_pitch(data);
             // coded_width は u16 に収まるため、1 行あたりのバイト数は必ず usize に収まる
             let row_bytes = self
-                .min_pitch(coded_width)
+                .bytes_per_row(coded_width)
                 .expect("row bytes must fit in usize because the coded width fits in u16");
             match self {
                 FrameFormat::Nv12 | FrameFormat::P010 => {
@@ -109,6 +109,40 @@ impl FrameFormat {
                     copy_rows(src.as_ptr(), y410_ptr, row_bytes, coded_height, pitch);
                 }
             }
+        }
+    }
+
+    /// 指定幅のフレームを密に詰めた場合の 1 行あたりのバイト数を返す
+    ///
+    /// `mfxFrameData` のピッチはこの値以上になる。
+    /// オーバーフロー時は `None` を返す。
+    pub(crate) fn bytes_per_row(self, width: usize) -> Option<usize> {
+        match self {
+            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
+            FrameFormat::Nv12 => Some(width),
+            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
+            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
+            // 1 画素 4 バイト
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
+        }
+    }
+
+    /// `mfxFrameInfo.Shift` に設定する値を返す
+    ///
+    /// VPL の仕様では、10bit サンプルを 16bit ワードに格納する形式について、Shift が 0 の場合は
+    /// 有効データが下位 10bit に、0 以外の場合は上位 10bit にあることを表す。
+    /// 10bit サンプルを 16bit ワードの上位ビットに格納する P010 だけ 1 を返す。
+    /// 10bit サンプルが 10bit 幅のフィールドにそのまま入る Y410 と、8bit の各形式は 0 を返す。
+    ///
+    /// ref: libvpl api/vpl/mfxstructures.h (mfxFrameInfo::Shift)
+    pub(crate) fn frame_info_shift(self) -> u16 {
+        match self {
+            FrameFormat::P010 => 1,
+            FrameFormat::Nv12
+            | FrameFormat::Yuy2
+            | FrameFormat::Bgra
+            | FrameFormat::Ayuv
+            | FrameFormat::Y410 => 0,
         }
     }
 }
@@ -989,21 +1023,13 @@ impl<H: EncodeHandler> Encoder<H> {
     ///
     /// # 入力フォーマットとプロファイル
     ///
-    /// 次の組み合わせは入力のビット深度がプロファイルの制限に合わないためエラーを返す。
+    /// 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
+    /// 初期化に失敗した場合、[`Error::function`] は `MFXVideoENCODE_Init` になる。
     ///
-    /// - H.264: 8bit 入力のみ (10bit 入力は指定できない)
-    /// - HEVC [`HevcProfile::Main10`]: 10bit 入力 ([`FrameFormat::P010`] または
-    ///   [`FrameFormat::Y410`]) のみ (8bit 入力は指定できない)
-    /// - VP9 [`Vp9Profile::Profile0`] / [`Vp9Profile::Profile1`]: 8bit 入力のみ
-    ///   (10bit 入力は指定できない)
-    ///
-    /// 上記以外のプロファイルは入力のビット深度を限定しない。
-    ///
-    /// GPU やコーデックが対応していない色形式を指定した場合はエラーを返す。
-    /// このとき [`Error::function`] は `MFXVideoENCODE_Init` になる。
     /// 事前に対応を判定する場合は [`crate::supported_codecs`] が返す
     /// [`crate::EncodingInfo::profiles`] の
     /// [`crate::MemoryTypeCapabilities::color_formats`] を参照する。
+    /// ただし、ケーパビリティ照会の結果は初期化の成功を保証しない。
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
@@ -1028,21 +1054,6 @@ impl<H: EncodeHandler> Encoder<H> {
                     u16::MAX
                 ),
             ));
-        }
-        // プロファイルが入力のビット深度を限定している場合、それに一致しない入力は
-        // MFXVideoENCODE_Init が MFX_ERR_INVALID_VIDEO_PARAM で拒否するため、
-        // セッションを作る前にエラーにする。
-        if let Some(accepted_bit_depth) = accepted_input_bit_depth(&config.codec) {
-            let actual_bit_depth = config.frame_format.bit_depth();
-            if actual_bit_depth != accepted_bit_depth {
-                return Err(Error::new_custom_owned(
-                    "Encoder::new",
-                    format!(
-                        "input format {:?} is {actual_bit_depth}bit but the configured codec profile accepts {accepted_bit_depth}bit input only",
-                        config.frame_format
-                    ),
-                ));
-            }
         }
 
         let lib = VplLibrary::load()?;
@@ -2051,32 +2062,6 @@ fn codec_profile(codec: &CodecConfig) -> u16 {
     profile.map_or(sys::MFX_PROFILE_UNKNOWN as u16, |profile| profile as u16)
 }
 
-/// プロファイルが入力として受け付けるビット深度を返す
-///
-/// ビット深度を限定しないプロファイルの場合は `None` を返し、VPL の判定に任せる。
-///
-/// VPL のエンコーダーはプロファイルによって入力のビット深度を制限する。
-/// 制限に合わない入力は `MFXVideoENCODE_Init` が `MFX_ERR_INVALID_VIDEO_PARAM` で
-/// 拒否するため、ここではプロファイルごとの制限を返す。
-fn accepted_input_bit_depth(codec: &CodecConfig) -> Option<u16> {
-    match codec {
-        // AVC エンコーダーは 8bit 入力だけを受け付ける
-        CodecConfig::H264(_) => Some(8),
-        CodecConfig::Hevc(config) => match config.profile {
-            // Main10 は 10bit 入力だけを受け付ける
-            Some(HevcProfile::Main10) => Some(10),
-            _ => None,
-        },
-        CodecConfig::Vp9(config) => match config.profile {
-            // Profile0 / Profile1 は 8bit 入力だけを受け付ける
-            Some(Vp9Profile::Profile0 | Vp9Profile::Profile1) => Some(8),
-            _ => None,
-        },
-        // AV1 は 8bit と 10bit の両方を受け付ける
-        CodecConfig::Av1(_) => None,
-    }
-}
-
 /// alignment の倍数に切り上げる
 ///
 /// オーバーフロー時は alignment 境界に丸めた最大値を返す。
@@ -2165,6 +2150,7 @@ mod tests {
     /// フレームサイズの計算がオーバーフローした場合は `None` を返すこと
     #[test]
     fn frame_format_frame_size_returns_none_on_overflow() {
+        // width * height 自体がオーバーフローするケース
         for format in FrameFormat::all() {
             assert_eq!(
                 format.frame_size(usize::MAX, 2),
@@ -2172,11 +2158,19 @@ mod tests {
                 "{format:?} のフレームサイズがオーバーフロー時に None にならない"
             );
         }
+        // width * height は収まるが、形式ごとの乗算がオーバーフローするケース
+        for format in FrameFormat::all() {
+            assert_eq!(
+                format.frame_size(usize::MAX / 2, 2),
+                None,
+                "{format:?} の形式ごとの乗算がオーバーフロー時に None にならない"
+            );
+        }
     }
 
-    /// 1 行あたりの最小バイト数が形式ごとの 1 画素あたりのバイト数と一致すること
+    /// 1 行あたりのバイト数が形式ごとの 1 画素あたりのバイト数と一致すること
     #[test]
-    fn frame_format_min_pitch_matches_bytes_per_pixel() {
+    fn frame_format_bytes_per_row_matches_bytes_per_pixel() {
         let cases = [
             (FrameFormat::Nv12, 320),
             (FrameFormat::P010, 640),
@@ -2187,13 +2181,16 @@ mod tests {
         ];
         for (format, expected) in cases {
             assert_eq!(
-                format.min_pitch(320),
+                format.bytes_per_row(320),
                 Some(expected),
-                "{format:?} の最小ピッチが不一致"
+                "{format:?} の行あたりのバイト数が不一致"
             );
         }
         // 1 画素 1 バイトの Nv12 は乗算がないためオーバーフローしない
-        assert_eq!(FrameFormat::Nv12.min_pitch(usize::MAX), Some(usize::MAX));
+        assert_eq!(
+            FrameFormat::Nv12.bytes_per_row(usize::MAX),
+            Some(usize::MAX)
+        );
         for format in [
             FrameFormat::P010,
             FrameFormat::Yuy2,
@@ -2202,9 +2199,9 @@ mod tests {
             FrameFormat::Y410,
         ] {
             assert_eq!(
-                format.min_pitch(usize::MAX),
+                format.bytes_per_row(usize::MAX),
                 None,
-                "{format:?} の最小ピッチがオーバーフロー時に None にならない"
+                "{format:?} の行あたりのバイト数がオーバーフロー時に None にならない"
             );
         }
     }
@@ -2245,141 +2242,6 @@ mod tests {
         data.__bindgen_anon_2.PitchLow = 2;
         // finalPitch = (1 << 16) + 2
         assert_eq!(unsafe { frame_data_pitch(&data) }, 65538);
-    }
-
-    /// 生成したエンコーダ設定を返す (プロファイルとビット深度の検証用)
-    fn encoder_config_for_validation(codec: CodecConfig, format: FrameFormat) -> EncoderConfig {
-        EncoderConfig::new(
-            // 検証はセッション作成より前に行われるため、存在しない render node でもよい
-            AdapterSelector::DrmRenderNode(0),
-            codec,
-            320,
-            240,
-            format,
-            30,
-            1,
-            RateControlMode::Cqp,
-        )
-    }
-
-    /// プロファイルの入力ビット深度の制限に合わない場合はエラーになること
-    #[test]
-    fn encoder_new_rejects_profile_bit_depth_mismatch() {
-        let cases = [
-            // H.264 は 8bit 入力だけを受け付ける
-            (
-                CodecConfig::H264(H264EncoderConfig {
-                    profile: Some(H264Profile::High),
-                }),
-                FrameFormat::P010,
-                "8bit",
-                "10bit",
-            ),
-            // HEVC Main10 は 10bit 入力だけを受け付ける
-            (
-                CodecConfig::Hevc(HevcEncoderConfig {
-                    profile: Some(HevcProfile::Main10),
-                }),
-                FrameFormat::Nv12,
-                "10bit",
-                "8bit",
-            ),
-            // VP9 Profile0 は 8bit 入力だけを受け付ける
-            (
-                CodecConfig::Vp9(Vp9EncoderConfig {
-                    profile: Some(Vp9Profile::Profile0),
-                    write_ivf_headers: false,
-                }),
-                FrameFormat::P010,
-                "8bit",
-                "10bit",
-            ),
-            // VP9 Profile1 は 8bit 入力だけを受け付ける
-            (
-                CodecConfig::Vp9(Vp9EncoderConfig {
-                    profile: Some(Vp9Profile::Profile1),
-                    write_ivf_headers: false,
-                }),
-                FrameFormat::Y410,
-                "8bit",
-                "10bit",
-            ),
-        ];
-        for (codec, format, accepted, actual) in cases {
-            let config = encoder_config_for_validation(codec, format);
-            let error = Encoder::new(
-                config,
-                FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
-            )
-            .err()
-            .unwrap_or_else(|| panic!("{format:?} の検証がエラーにならなかった"));
-            assert_eq!(error.function(), "Encoder::new");
-            let message = error.status_message().unwrap_or_default();
-            assert!(
-                message.contains(accepted) && message.contains(actual),
-                "エラーメッセージに受け付けるビット深度 ({accepted}) と実際のビット深度 ({actual}) が含まれない: {message}"
-            );
-        }
-    }
-
-    /// 入力のビット深度を限定しないプロファイルでは `None` を返すこと
-    #[test]
-    fn accepted_input_bit_depth_returns_none_for_unrestricted_profiles() {
-        // AV1 Main は 8bit と 10bit の両方を受け付ける
-        let av1 = CodecConfig::Av1(Av1EncoderConfig {
-            profile: Some(Av1Profile::Main),
-        });
-        assert_eq!(accepted_input_bit_depth(&av1), None);
-        // HEVC の Main / MainSp / Rext / Scc はビット深度を限定しない
-        for profile in [
-            Some(HevcProfile::Main),
-            Some(HevcProfile::MainSp),
-            Some(HevcProfile::Rext),
-            Some(HevcProfile::Scc),
-            None,
-        ] {
-            let codec = CodecConfig::Hevc(HevcEncoderConfig { profile });
-            assert_eq!(
-                accepted_input_bit_depth(&codec),
-                None,
-                "{profile:?} のビット深度が限定されている"
-            );
-        }
-        // VP9 の Profile2 / Profile3 とプロファイル未指定はビット深度を限定しない
-        for profile in [Some(Vp9Profile::Profile2), Some(Vp9Profile::Profile3), None] {
-            let codec = CodecConfig::Vp9(Vp9EncoderConfig {
-                profile,
-                write_ivf_headers: false,
-            });
-            assert_eq!(
-                accepted_input_bit_depth(&codec),
-                None,
-                "{profile:?} のビット深度が限定されている"
-            );
-        }
-    }
-
-    /// 入力のビット深度を限定するプロファイルではそのビット深度を返すこと
-    #[test]
-    fn accepted_input_bit_depth_returns_limit_for_restricted_profiles() {
-        // H.264 はプロファイルにかかわらず 8bit 入力だけを受け付ける
-        for profile in [None, Some(H264Profile::High10)] {
-            let codec = CodecConfig::H264(H264EncoderConfig { profile });
-            assert_eq!(accepted_input_bit_depth(&codec), Some(8));
-        }
-        // HEVC Main10 は 10bit 入力だけを受け付ける
-        let hevc_main10 = CodecConfig::Hevc(HevcEncoderConfig {
-            profile: Some(HevcProfile::Main10),
-        });
-        assert_eq!(accepted_input_bit_depth(&hevc_main10), Some(10));
-        // VP9 Profile0 / Profile1 は 8bit 入力だけを受け付ける
-        for profile in [Vp9Profile::Profile0, Vp9Profile::Profile1] {
-            let codec = CodecConfig::Vp9(Vp9EncoderConfig {
-                profile: Some(profile),
-                write_ivf_headers: false,
-            });
-            assert_eq!(accepted_input_bit_depth(&codec), Some(8));
-        }
     }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {

@@ -304,24 +304,36 @@ impl ValueRange {
 /// フレームの色形式
 ///
 /// エンコーダーの入力と、エンコード・デコードのケーパビリティ照会で使う。
-/// 各バリアントのバイト配置は [`FrameFormat::frame_size`] の項で説明する。
+///
+/// ref: libvpl api/vpl/mfxstructures.h (MFX_FOURCC_P010 / MFX_FOURCC_AYUV / MFX_FOURCC_Y410 / mfxY410)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
-    /// Semi-Planar YUV 4:2:0 8bit [Y プレーン + インターリーブ UV プレーン]
-    Nv12,
-    /// Semi-Planar YUV 4:2:0 10bit [Y プレーン + インターリーブ UV プレーン]
+    /// Semi-Planar YUV 4:2:0 8bit
     ///
-    /// 各サンプルは 16bit ワードの上位 10bit に格納する (P010)。
+    /// Y プレーン (画素数と同じバイト数) の後ろに、2 画素につき 1 組の UV を
+    /// インターリーブしたプレーン (画素数の半分のバイト数) を並べる。
+    Nv12,
+    /// Semi-Planar YUV 4:2:0 10bit
+    ///
+    /// 並びは [`FrameFormat::Nv12`] と同じで、1 サンプルを 16bit ワードで格納する。
+    /// 10bit の値は 16bit ワードの上位ビットに入れる。
     P010,
-    /// Packed YUV 4:2:2 8bit [YUYV インターリーブ]
+    /// Packed YUV 4:2:2 8bit
+    ///
+    /// 2 画素を 4 バイト (Y0, U, Y1, V) で格納する。
     Yuy2,
     /// Packed BGRA 8bit
+    ///
+    /// 1 画素を 4 バイト (B, G, R, A) で格納する。
     Bgra,
-    /// Packed YUV 4:4:4 8bit [メモリ上のバイト順は V, U, Y, A]
+    /// Packed YUV 4:4:4 8bit
+    ///
+    /// 1 画素を 4 バイト (V, U, Y, A) で格納する。
     Ayuv,
     /// Packed YUV 4:4:4 10bit
     ///
-    /// 各サンプルは 32bit ワードで、下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に格納する (Y410)。
+    /// 1 画素を 4 バイトの 32bit ワードで格納する。
+    /// ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に入れる。
     Y410,
 }
 
@@ -329,14 +341,31 @@ impl FrameFormat {
     /// すべての色形式を返す
     #[cfg(test)]
     pub(crate) fn all() -> &'static [Self] {
-        &[
-            Self::Nv12,
-            Self::P010,
-            Self::Yuy2,
-            Self::Bgra,
-            Self::Ayuv,
-            Self::Y410,
-        ]
+        // variant を追加したときにこの match がコンパイルエラーになり、
+        // 一覧の更新漏れに気づけるようにする
+        fn check_exhaustive(format: FrameFormat) {
+            match format {
+                FrameFormat::Nv12
+                | FrameFormat::P010
+                | FrameFormat::Yuy2
+                | FrameFormat::Bgra
+                | FrameFormat::Ayuv
+                | FrameFormat::Y410 => {}
+            }
+        }
+
+        const ALL: &[FrameFormat] = &[
+            FrameFormat::Nv12,
+            FrameFormat::P010,
+            FrameFormat::Yuy2,
+            FrameFormat::Bgra,
+            FrameFormat::Ayuv,
+            FrameFormat::Y410,
+        ];
+        for format in ALL {
+            check_exhaustive(*format);
+        }
+        ALL
     }
 
     /// MFX_FOURCC_* の値から変換する
@@ -383,59 +412,10 @@ impl FrameFormat {
         }
     }
 
-    /// 指定幅のフレームで 1 行あたりに必要な最小バイト数を返す
+    /// 指定した幅と高さのフレームのバイトサイズを返す
     ///
-    /// VPL の `mfxFrameData` のピッチはこの値以上になる。
-    /// オーバーフロー時は `None` を返す。
-    pub(crate) fn min_pitch(self, width: usize) -> Option<usize> {
-        match self {
-            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
-            FrameFormat::Nv12 => Some(width),
-            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
-            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
-            // 1 画素 4 バイト
-            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
-        }
-    }
-
-    /// `mfxFrameInfo.Shift` に設定する値を返す
-    ///
-    /// VPL の仕様では、10bit サンプルを 16bit ワードに格納する形式について、Shift が 0 の場合は
-    /// 有効データが下位 10bit に、0 以外の場合は上位 10bit にあることを表す。
-    /// 10bit サンプルを 16bit ワードの上位ビットに格納する P010 だけ 1 を返す。
-    /// 10bit サンプルが 10bit 幅のフィールドにそのまま入る Y410 と、8bit の各形式は 0 を返す。
-    ///
-    /// ref: libvpl api/vpl/mfxstructures.h (mfxFrameInfo::Shift)
-    pub(crate) fn frame_info_shift(self) -> u16 {
-        match self {
-            FrameFormat::P010 => 1,
-            FrameFormat::Nv12
-            | FrameFormat::Yuy2
-            | FrameFormat::Bgra
-            | FrameFormat::Ayuv
-            | FrameFormat::Y410 => 0,
-        }
-    }
-
-    /// フレームデータのバイトサイズを返す
-    ///
-    /// `height` が偶数の場合のレイアウトを前提とする。
-    ///
-    /// 各形式のデータは次のように並んでいるものとして扱う。
-    ///
-    /// - [`FrameFormat::Nv12`]: Y プレーン (`width * height` バイト) の後ろに、
-    ///   2 画素につき 1 組の UV をインターリーブしたプレーン (`width * height / 2` バイト)
-    /// - [`FrameFormat::P010`]: [`FrameFormat::Nv12`] と同じ並びを 1 サンプル 2 バイトで格納する。
-    ///   10bit の値は 16bit ワードの上位ビットに入れる
-    /// - [`FrameFormat::Yuy2`]: 2 画素を 4 バイト (Y0, U, Y1, V) で格納する
-    /// - [`FrameFormat::Bgra`]: 1 画素を 4 バイト (B, G, R, A) で格納する
-    /// - [`FrameFormat::Ayuv`]: 1 画素を 4 バイト (V, U, Y, A) で格納する
-    /// - [`FrameFormat::Y410`]: 1 画素を 4 バイトの 32bit ワードで格納する。
-    ///   ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に入れる
-    ///
-    /// オーバーフロー時は `None` を返す。
-    ///
-    /// ref: libvpl api/vpl/mfxstructures.h (MFX_FOURCC_P010 / MFX_FOURCC_AYUV / MFX_FOURCC_Y410 / mfxY410)
+    /// NV12 / P010 は `height` が偶数の場合のレイアウトを前提とする。
+    /// 計算がオーバーフローした場合は `None` を返す。
     pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
         let pixels = width.checked_mul(height)?;
         match self {

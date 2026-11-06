@@ -29,7 +29,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - libvpl を static link してビルド (CMake で自動ビルド)
 - ビルド時に GitHub から libvpl ヘッダーを自動取得
 - エンコード入力フォーマット選択 (NV12 / P010 / YUY2 / BGRA / AYUV / Y410)
-- デコード出力は NV12 フォーマット
+- デコード出力はストリームのネイティブ形式 (8bit は NV12、10bit は P010)
 - フレーム単位のエンコードオプション (IDR フレーム強制)
 - CBR / VBR / CQP / ICQ / QVBR / LA / AVBR / VCM / LA_ICQ / LA_HRD レート制御モード
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
@@ -281,22 +281,24 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 | AYUV | `FrameFormat::Ayuv` | Packed YUV 4:4:4 8bit (バイト順は V, U, Y, A) |
 | Y410 | `FrameFormat::Y410` | Packed YUV 4:4:4 10bit (下位から U 10bit / Y 10bit / V 10bit / A 2bit) |
 
-入力フォーマットのビット深度は、プロファイルごとの制限に合わせてください。
-H.264 は 8bit 入力のみ、HEVC の `HevcProfile::Main10` は 10bit 入力 (`FrameFormat::P010` / `FrameFormat::Y410`) のみ、VP9 の `Vp9Profile::Profile0` / `Vp9Profile::Profile1` は 8bit 入力のみを受け付けます。
-これらに合わない入力は `Encoder::new` がエラーを返します。
-上記以外のプロファイルは入力のビット深度を限定しないため、対応の可否は GPU と VPL の実装に依存します。
-
-GPU やコーデックが対応していない色形式を指定した場合は、`Encoder::new` が VPL の `MFXVideoENCODE_Init` のエラーを返します。
-事前に対応を確認する場合は `supported_codecs()` が返す `EncodingInfo::profiles` の `MemoryTypeCapabilities::color_formats` を参照してください。
+入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存し、初期化時に判定されます。
+初期化に失敗した場合、`Encoder::new` はそのエラーを返します。
+事前に対応を確認する場合は `supported_codecs()` が返す `EncodingInfo::profiles` の `MemoryTypeCapabilities::color_formats` を参照してください。ただし、ケーパビリティ照会の結果は初期化の成功を保証しません。
+詳細は `Encoder::new` のドキュメントを参照してください。
 
 ### デコード出力フォーマット
 
+デコード出力の形式はストリームのネイティブ形式で決まります。出力形式を選択する API はありません。
+
 | フォーマット | 説明 |
 |---|---|
-| NV12 | Semi-Planar YUV 4:2:0 8bit |
+| NV12 | 8bit ストリームの出力 (Semi-Planar YUV 4:2:0 8bit) |
+| P010 | 10bit ストリームの出力 (Semi-Planar YUV 4:2:0 10bit、16bit ワードの上位 10bit) |
 
 `supported_codecs()` が返す `CodecInfo::decoding` → `DecodingInfo::profiles` → `ProfileCapabilities::memory_types` → `MemoryTypeCapabilities::color_formats` に、プロファイル・メモリタイプごとのデコード出力色形式が入ります。
-このクレートの `Decoder` が実際に出力する形式は NV12 のみで、ほかの形式を選択する API はありません。
+
+4:4:4 ストリーム (HEVC の `HevcProfile::Rext` / `HevcProfile::Scc` + AYUV / Y410) のデコードは未対応です。
+また、`Decoder` から出力フォーマットを取得する API はありません。
 
 ## サポートプロファイル
 
