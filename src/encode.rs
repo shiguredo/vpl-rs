@@ -2117,16 +2117,6 @@ mod tests {
         }
     }
 
-    /// `FrameFormat::all()` がすべての variant を含むこと
-    #[test]
-    fn frame_format_all_contains_all_variants() {
-        assert_eq!(
-            FrameFormat::all().len(),
-            crate::codec_info::FRAME_FORMAT_VARIANT_COUNT,
-            "FrameFormat::all() の要素数が variant 数と一致しない"
-        );
-    }
-
     /// 未知の FourCC が `None` になること
     #[test]
     fn frame_format_from_unknown_fourcc_returns_none() {

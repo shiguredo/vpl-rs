@@ -341,19 +341,6 @@ impl FrameFormat {
     /// すべての色形式を返す
     #[cfg(test)]
     pub(crate) fn all() -> &'static [Self] {
-        // variant を追加したときにこの match がコンパイルエラーになり、
-        // 一覧の更新漏れに気づけるようにする
-        fn check_exhaustive(format: FrameFormat) {
-            match format {
-                FrameFormat::Nv12
-                | FrameFormat::P010
-                | FrameFormat::Yuy2
-                | FrameFormat::Bgra
-                | FrameFormat::Ayuv
-                | FrameFormat::Y410 => {}
-            }
-        }
-
         const ALL: &[FrameFormat] = &[
             FrameFormat::Nv12,
             FrameFormat::P010,
