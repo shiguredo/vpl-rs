@@ -43,7 +43,8 @@ impl DecoderConfig {
 /// デコードされたフレーム
 ///
 /// デコード出力の形式はストリームのネイティブ形式で決まる。8bit ストリームは
-/// NV12、10bit ストリームは P010 になる。4:4:4 ストリームには未対応。
+/// NV12、10bit ストリームは P010 になる。12bit (P016) や 4:4:4 (AYUV / Y410) など
+/// NV12 / P010 以外の出力には未対応で、デコード時にエラーになる。
 /// 出力形式を取得する API はない。
 ///
 /// データはピッチ幅を考慮した生データとして渡される。
@@ -207,7 +208,8 @@ where
 /// Intel VPL ハードウェアデコーダ
 ///
 /// 圧縮されたビットストリームをデコードする。
-/// 出力フォーマットはストリームのネイティブ形式で決まる。詳細は [`DecodedFrame`] を参照。
+/// 出力フォーマットはストリームのネイティブ形式で決まる。NV12 / P010 以外の出力には
+/// 未対応で、デコード時にエラーになる。詳細は [`DecodedFrame`] を参照。
 /// 最初の [`Decoder::decode`] 呼び出し時にビットストリームのヘッダ (SPS/PPS 等) を解析して
 /// 自動的に初期化される。
 ///
@@ -744,6 +746,12 @@ fn sync_and_callback<H: DecodeHandler>(
     Ok(())
 }
 
+/// デコード結果として扱える色形式かどうか
+fn is_supported_decoded_format(fourcc: u32, chroma_format: u16) -> bool {
+    (fourcc == sys::MFX_FOURCC_NV12 || fourcc == sys::MFX_FOURCC_P010)
+        && chroma_format == sys::MFX_CHROMAFORMAT_YUV420 as u16
+}
+
 /// デコード済みサーフェスから Y/UV スライスを読み取り `DecodedFrame` を構築する
 ///
 /// Map 済みであることと、戻り値の `DecodedFrame` が生存している間
@@ -753,6 +761,17 @@ fn read_decoded_surface<'a, T>(
     user_data: T,
 ) -> Result<DecodedFrame<'a, T>, Error> {
     let surface = unsafe { &*frame_surface.as_ptr() };
+    let fourcc = surface.Info.FourCC;
+    let chroma_format = surface.Info.ChromaFormat;
+    if !is_supported_decoded_format(fourcc, chroma_format) {
+        return Err(Error::new_custom_owned(
+            "Decoder::sync_worker",
+            format!(
+                "unsupported decoded surface format: FourCC={fourcc:#x}, ChromaFormat={chroma_format}"
+            ),
+        ));
+    }
+
     let (crop_w, crop_h) = unsafe {
         let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
         (fi.CropW as usize, fi.CropH as usize)
@@ -1044,6 +1063,36 @@ mod tests {
             stats.in_flight_frames.get(),
             0,
             "重複と中断の通知後に in-flight が 0 であること"
+        );
+    }
+
+    /// NV12 / P010 をデコード結果として受け付けること
+    #[test]
+    fn supported_decoded_format_accepts_nv12_and_p010() {
+        for fourcc in [sys::MFX_FOURCC_NV12, sys::MFX_FOURCC_P010] {
+            assert!(
+                is_supported_decoded_format(fourcc, sys::MFX_CHROMAFORMAT_YUV420 as u16),
+                "FourCC {fourcc:#x} が受け付けられない"
+            );
+        }
+    }
+
+    /// 4:4:4 / 12bit など NV12 / P010 以外を拒否すること
+    #[test]
+    fn supported_decoded_format_rejects_other_formats() {
+        for fourcc in [
+            sys::MFX_FOURCC_AYUV,
+            sys::MFX_FOURCC_Y410,
+            sys::MFX_FOURCC_P016,
+        ] {
+            assert!(
+                !is_supported_decoded_format(fourcc, sys::MFX_CHROMAFORMAT_YUV444 as u16),
+                "FourCC {fourcc:#x} が受け付けられている"
+            );
+        }
+        assert!(
+            !is_supported_decoded_format(sys::MFX_FOURCC_NV12, sys::MFX_CHROMAFORMAT_YUV444 as u16),
+            "ChromaFormat が 4:2:0 以外の NV12 が受け付けられている"
         );
     }
 }

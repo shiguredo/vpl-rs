@@ -362,8 +362,17 @@ impl FrameFormat {
             FrameFormat::Ayuv,
             FrameFormat::Y410,
         ];
+        // variant を追加したときに match がコンパイルエラーになり、
+        // 一覧の更新漏れに気づけるようにする
         for format in ALL {
-            check_exhaustive(*format);
+            match format {
+                FrameFormat::Nv12
+                | FrameFormat::P010
+                | FrameFormat::Yuy2
+                | FrameFormat::Bgra
+                | FrameFormat::Ayuv
+                | FrameFormat::Y410 => {}
+            }
         }
         ALL
     }

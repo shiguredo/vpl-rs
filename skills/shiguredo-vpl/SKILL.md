@@ -449,20 +449,25 @@ for codec in supported_codecs(adapter)? {
 
 ### エンコーダー
 
-| コーデック / プロファイル | 入力 | capability | Init | EncodeFrameAsync |
+| コーデック / プロファイル | 入力 | capability | Init (CQP) | 結果 |
 |---|---|---|---|---|
 | H.264 High | P010 / Y410 | 非対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
 | HEVC Main10 | NV12 / AYUV | 対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
 | VP9 Profile0 / Profile1 | P010 / Y410 | 対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
 | VP9 Profile2 | AYUV / Y410 | 対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
 | AV1 Main | AYUV | 非対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
-| HEVC Rext / Scc | AYUV / Y410 | 対応 | 成功 | 出力なし (CQP) / CBR は Init 失敗 |
+| HEVC Rext | AYUV / Y410 | 対応 | 成功 | 出力あり (CQP / CBR) |
+| HEVC Scc | AYUV | 対応 | 成功 | CQP は出力あり、CBR は Init 失敗 |
+| HEVC Scc | Y410 | 対応 | 成功 | CQP は出力なし、CBR は Init 失敗 |
 
 補足:
 
-- HEVC Rext / Scc + AYUV / Y410 は Init が成功し、`get_video_param` の FourCC / BitDepth / ChromaFormat も要求どおりになる。しかし CQP (QPI=10、3 フレーム) では `Encoder::finish` が pending frames のエラーを返して出力が得られず、10 フレームでは `EncodeFrameAsync` が device busy で失敗する。CBR (1000 kbps) では Init が `MFX_ERR_DEVICE_FAILED` になる。
+- HEVC Rext + AYUV / Y410 は CQP (3 / 10 フレーム) と CBR のいずれも出力が得られる。
+- HEVC Scc + AYUV は CQP (3 / 10 フレーム) で出力が得られるが、CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
+- HEVC Scc + Y410 は CQP 3 フレームで `Encoder::finish` が pending frames のエラーを返して出力が得られず、10 フレームでは 6 フレーム目の `EncodeFrameAsync` が device busy で失敗する。CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
+- 測定条件: CQP は QPI=10、GOP=30、qpp / qpb 未指定。CBR は 1000 kbps。AsyncDepth 4。
 - HEVC Main + P010 は Init が成功し、実効 FourCC は P010 のままになる。エンコード結果のプロファイルとビット深度の整合は未確認。
-- capability が「対応」でも Init が失敗する組み合わせがある。`supported_codecs` の結果だけで Init の成功を判断しない。
+- capability が「対応」でも Init が失敗する組み合わせがある。Init が成功してもエンコードに失敗する組み合わせもある。`supported_codecs` の結果だけで成功を判断しない。
 
 ### デコーダー
 
@@ -471,12 +476,13 @@ for codec in supported_codecs(adapter)? {
 | 8bit (H.264 / HEVC Main / VP9 Profile0 / AV1 8bit) | NV12 | - |
 | 10bit (HEVC Main10 / AV1 10bit) | P010 | - |
 | HEVC Main10 + Y410 | P010 | 4:4:4 から 4:2:0 に変換される |
-| HEVC Rext / Scc + AYUV / Y410 | AYUV / Y410 | `DecodedFrame` は未対応。AYUV は壊れたスライス、Y410 は null ポインタエラー |
-| VP9 Profile2 + NV12 | P016 (12bit) | `FrameFormat` に P016 がない |
+| VP9 Profile2 + P010 | P010 | - |
+| HEVC Rext / Scc + AYUV / Y410 | AYUV / Y410 | NV12 / P010 以外のためデコードはエラー |
+| VP9 Profile2 + NV12 | P016 (12bit) | 入力のビット深度がプロファイルと合わない例。NV12 / P010 以外のためデコードはエラー |
 
 - 出力形式はストリームのネイティブ形式で決まり、選択する API はない。
 - `DecodeHeader` 後の FourCC 上書きはプロファイル依存で、YUY2 出力は確認できていない。
-- 4:4:4 出力のデコードは未対応。
+- NV12 / P010 以外の出力は未対応で、デコード時にエラーになる。
 
 ### 再確認方法
 

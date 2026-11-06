@@ -9,7 +9,7 @@ use shiguredo_vpl::{
     EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat,
     H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, MemoryType, PictureType,
     RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile, Vp9EncoderConfig, Vp9Profile,
-    frame_type, supported_codecs,
+    ffi, frame_type, supported_codecs,
 };
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
@@ -1484,13 +1484,16 @@ fn test_roundtrip_hevc_ayuv_luma() {
     }
 }
 
-/// HEVC Main10 で 10bit 入力の Y プレーンを検証する
+/// 10bit 入力の Y プレーンを検証する
 ///
-/// Main10 は 4:2:0 なので、4:4:4 の Y410 入力は 4:2:0 に変換され、デコード出力は P010 になる。
-/// ルマは変換で失われないため、どちらの入力も P010 の Y プレーンと比較する。
-fn assert_hevc_main10_10bit_luma(format: FrameFormat) {
-    let codec = VideoCodecType::Hevc;
-    let profile = VideoProfile::Hevc(HevcProfile::Main10);
+/// 4:2:0 のプロファイルでは、4:4:4 の Y410 入力は 4:2:0 に変換され、デコード出力は P010 になる。
+/// ルマは変換で失われないため、P010 の Y プレーンと比較する。
+fn assert_10bit_luma_roundtrip(
+    codec: VideoCodecType,
+    codec_config: CodecConfig,
+    profile: VideoProfile,
+    format: FrameFormat,
+) {
     if skip_if_encoder_format_unsupported(codec, profile, format) {
         return;
     }
@@ -1500,9 +1503,7 @@ fn assert_hevc_main10_10bit_luma(format: FrameFormat) {
     let num_frames = 5usize;
     let mut config = EncoderConfig::new(
         test_adapter(),
-        CodecConfig::Hevc(HevcEncoderConfig {
-            profile: Some(HevcProfile::Main10),
-        }),
+        codec_config,
         width as u32,
         height as u32,
         format,
@@ -1542,13 +1543,27 @@ fn assert_hevc_main10_10bit_luma(format: FrameFormat) {
 /// P010 (10bit 4:2:0) 入力の HEVC Main10 ラウンドトリップ
 #[test]
 fn test_roundtrip_hevc_main10_p010() {
-    assert_hevc_main10_10bit_luma(FrameFormat::P010);
+    assert_10bit_luma_roundtrip(
+        VideoCodecType::Hevc,
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        VideoProfile::Hevc(HevcProfile::Main10),
+        FrameFormat::P010,
+    );
 }
 
 /// Y410 (10bit 4:4:4) 入力の HEVC Main10 ラウンドトリップ
 #[test]
 fn test_roundtrip_hevc_main10_y410() {
-    assert_hevc_main10_10bit_luma(FrameFormat::Y410);
+    assert_10bit_luma_roundtrip(
+        VideoCodecType::Hevc,
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        VideoProfile::Hevc(HevcProfile::Main10),
+        FrameFormat::Y410,
+    );
 }
 
 /// AYUV (8bit 4:4:4) 入力の H.264 High ラウンドトリップ
@@ -1572,18 +1587,13 @@ fn test_roundtrip_h264_ayuv() {
 /// P010 (10bit 4:2:0) 入力の AV1 Main ラウンドトリップ
 #[test]
 fn test_roundtrip_av1_p010() {
-    let codec = VideoCodecType::Av1;
-    let profile = VideoProfile::Av1(Av1Profile::Main);
-    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::P010) {
-        return;
-    }
-    roundtrip_format(
+    assert_10bit_luma_roundtrip(
+        VideoCodecType::Av1,
         CodecConfig::Av1(Av1EncoderConfig {
             profile: Some(Av1Profile::Main),
         }),
-        codec,
+        VideoProfile::Av1(Av1Profile::Main),
         FrameFormat::P010,
-        10,
     );
 }
 
@@ -1636,8 +1646,8 @@ fn test_encoder_new_rejects_unsupported_format() {
 
 /// 入力フォーマットとプロファイルの組み合わせの可否が Init の結果に従うこと
 ///
-/// `Encoder::new` が Ok を返す場合と、`MFXVideoENCODE_Init` のエラーを返す場合の
-/// どちらも受け入れる。
+/// `Encoder::new` が Init に成功した場合は実効パラメータが要求した色形式と一致し、
+/// 失敗した場合は `MFXVideoENCODE_Init` のエラーを返すことを確認する。
 #[test]
 fn test_encoder_new_profile_bit_depth_depends_on_init() {
     let cases = [
@@ -1654,6 +1664,13 @@ fn test_encoder_new_profile_bit_depth_depends_on_init() {
             }),
             FrameFormat::Nv12,
             "HEVC Main10 + NV12",
+        ),
+        (
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(HevcProfile::Main),
+            }),
+            FrameFormat::P010,
+            "HEVC Main + P010",
         ),
         (
             CodecConfig::Vp9(Vp9EncoderConfig {
@@ -1675,120 +1692,107 @@ fn test_encoder_new_profile_bit_depth_depends_on_init() {
             1,
             RateControlMode::Cqp,
         );
-        let result = Encoder::new(
+        match Encoder::new(
             config,
             FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
-        );
-        if let Err(error) = result {
-            assert_eq!(
-                error.function(),
-                "MFXVideoENCODE_Init",
-                "{name}: MFXVideoENCODE_Init 以外のエラーが返った"
-            );
+        ) {
+            Ok(encoder) => {
+                let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+                let frame_info = unsafe { param.param.__bindgen_anon_1.mfx.FrameInfo };
+                let (fourcc, bit_depth, chroma_format, shift) = expected_frame_info(format);
+                assert_eq!(frame_info.FourCC, fourcc, "{name}: FourCC が要求値と違う");
+                assert_eq!(
+                    frame_info.BitDepthLuma, bit_depth,
+                    "{name}: BitDepthLuma が要求値と違う"
+                );
+                assert_eq!(
+                    frame_info.BitDepthChroma, bit_depth,
+                    "{name}: BitDepthChroma が要求値と違う"
+                );
+                assert_eq!(
+                    frame_info.ChromaFormat, chroma_format,
+                    "{name}: ChromaFormat が要求値と違う"
+                );
+                assert_eq!(frame_info.Shift, shift, "{name}: Shift が要求値と違う");
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.function(),
+                    "MFXVideoENCODE_Init",
+                    "{name}: MFXVideoENCODE_Init 以外のエラーが返った"
+                );
+            }
         }
     }
 }
 
-/// エンコーダーの実効パラメータ検証用のケース
-type FrameFormatCase = (
-    VideoCodecType,
-    VideoProfile,
-    CodecConfig,
-    FrameFormat,
-    u32,
-    u16,
-    u16,
-);
-
-/// エンコーダーの実効パラメータ検証用の HEVC ケースを生成する
-fn hevc_format_case(
-    profile: HevcProfile,
-    format: FrameFormat,
-    fourcc: u32,
-    bit_depth: u16,
-    shift: u16,
-) -> FrameFormatCase {
-    (
-        VideoCodecType::Hevc,
-        VideoProfile::Hevc(profile),
-        CodecConfig::Hevc(HevcEncoderConfig {
-            profile: Some(profile),
-        }),
-        format,
-        fourcc,
-        bit_depth,
-        shift,
-    )
+/// 指定した色形式の実効パラメータ (FourCC / BitDepthLuma / ChromaFormat / Shift)
+fn expected_frame_info(format: FrameFormat) -> (u32, u16, u16, u16) {
+    match format {
+        FrameFormat::Nv12 => (
+            ffi::MFX_FOURCC_NV12,
+            8,
+            ffi::MFX_CHROMAFORMAT_YUV420 as u16,
+            0,
+        ),
+        FrameFormat::P010 => (
+            ffi::MFX_FOURCC_P010,
+            10,
+            ffi::MFX_CHROMAFORMAT_YUV420 as u16,
+            1,
+        ),
+        FrameFormat::Yuy2 => (
+            ffi::MFX_FOURCC_YUY2,
+            8,
+            ffi::MFX_CHROMAFORMAT_YUV422 as u16,
+            0,
+        ),
+        FrameFormat::Bgra => (
+            ffi::MFX_FOURCC_RGB4,
+            8,
+            ffi::MFX_CHROMAFORMAT_YUV444 as u16,
+            0,
+        ),
+        FrameFormat::Ayuv => (
+            ffi::MFX_FOURCC_AYUV,
+            8,
+            ffi::MFX_CHROMAFORMAT_YUV444 as u16,
+            0,
+        ),
+        FrameFormat::Y410 => (
+            ffi::MFX_FOURCC_Y410,
+            10,
+            ffi::MFX_CHROMAFORMAT_YUV444 as u16,
+            0,
+        ),
+    }
 }
 
 /// Init 後の実効パラメータが要求した色形式と一致すること
 ///
-/// FourCC / ビット深度 / `mfxFrameInfo.Shift` が Init の前後で変わらないことを確認する。
-/// 10bit 入力のサンプル配置は Shift で指定するため、実効値が要求値と一致しない場合は
-/// エンコーダーが意図したデータ配置で解釈しないことを意味する。
+/// FourCC / ビット深度 / ChromaFormat / `mfxFrameInfo.Shift` が Init の前後で変わらないことを確認する。
 #[test]
 fn test_encoder_keeps_requested_frame_format() {
     let cases = [
-        // P010 は 16bit ワードの上位 10bit に有効データを置く
-        hevc_format_case(
-            HevcProfile::Main10,
-            FrameFormat::P010,
-            shiguredo_vpl::ffi::MFX_FOURCC_P010,
-            10,
-            1,
-        ),
-        // Y410 は 10bit 幅のフィールドにそのまま格納する
-        hevc_format_case(
-            HevcProfile::Main10,
-            FrameFormat::Y410,
-            shiguredo_vpl::ffi::MFX_FOURCC_Y410,
-            10,
-            0,
-        ),
-        hevc_format_case(
-            HevcProfile::Main,
-            FrameFormat::Ayuv,
-            shiguredo_vpl::ffi::MFX_FOURCC_AYUV,
-            8,
-            0,
-        ),
-        // 4:4:4 出力を伴う Rext / Scc のエンコード経路
-        hevc_format_case(
-            HevcProfile::Rext,
-            FrameFormat::Ayuv,
-            shiguredo_vpl::ffi::MFX_FOURCC_AYUV,
-            8,
-            0,
-        ),
-        hevc_format_case(
-            HevcProfile::Rext,
-            FrameFormat::Y410,
-            shiguredo_vpl::ffi::MFX_FOURCC_Y410,
-            10,
-            0,
-        ),
-        hevc_format_case(
-            HevcProfile::Scc,
-            FrameFormat::Ayuv,
-            shiguredo_vpl::ffi::MFX_FOURCC_AYUV,
-            8,
-            0,
-        ),
-        hevc_format_case(
-            HevcProfile::Scc,
-            FrameFormat::Y410,
-            shiguredo_vpl::ffi::MFX_FOURCC_Y410,
-            10,
-            0,
-        ),
+        (HevcProfile::Main10, FrameFormat::P010),
+        (HevcProfile::Main10, FrameFormat::Y410),
+        (HevcProfile::Main, FrameFormat::Ayuv),
+        (HevcProfile::Rext, FrameFormat::Ayuv),
+        (HevcProfile::Rext, FrameFormat::Y410),
+        (HevcProfile::Scc, FrameFormat::Ayuv),
+        (HevcProfile::Scc, FrameFormat::Y410),
     ];
-    for (codec, profile, codec_config, format, fourcc, bit_depth, shift) in cases {
-        if skip_if_encoder_format_unsupported(codec, profile, format) {
+    for (profile, format) in cases {
+        let video_profile = VideoProfile::Hevc(profile);
+        if skip_if_encoder_format_unsupported(VideoCodecType::Hevc, video_profile, format) {
             continue;
         }
+
         let config = EncoderConfig::new(
             test_adapter(),
-            codec_config,
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(profile),
+            }),
             320,
             240,
             format,
@@ -1800,38 +1804,32 @@ fn test_encoder_keeps_requested_frame_format() {
             config,
             FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
         )
-        .unwrap_or_else(|error| panic!("{format:?} のエンコーダー初期化に失敗した: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("{profile:?} + {format:?} のエンコーダー初期化に失敗した: {error}")
+        });
 
         let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
         let frame_info = unsafe { param.param.__bindgen_anon_1.mfx.FrameInfo };
+        let (fourcc, bit_depth, chroma_format, shift) = expected_frame_info(format);
         assert_eq!(
             frame_info.FourCC, fourcc,
-            "{format:?} の FourCC が Init 後に変わった"
+            "{profile:?} + {format:?} の FourCC が Init 後に変わった"
         );
         assert_eq!(
             frame_info.BitDepthLuma, bit_depth,
-            "{format:?} の BitDepthLuma が Init 後に変わった"
+            "{profile:?} + {format:?} の BitDepthLuma が Init 後に変わった"
         );
         assert_eq!(
             frame_info.BitDepthChroma, bit_depth,
-            "{format:?} の BitDepthChroma が Init 後に変わった"
+            "{profile:?} + {format:?} の BitDepthChroma が Init 後に変わった"
+        );
+        assert_eq!(
+            frame_info.ChromaFormat, chroma_format,
+            "{profile:?} + {format:?} の ChromaFormat が Init 後に変わった"
         );
         assert_eq!(
             frame_info.Shift, shift,
-            "{format:?} の Shift が Init 後に変わった"
-        );
-        let expected_chroma = match format {
-            FrameFormat::Nv12 | FrameFormat::P010 => {
-                shiguredo_vpl::ffi::MFX_CHROMAFORMAT_YUV420 as u16
-            }
-            FrameFormat::Yuy2 => shiguredo_vpl::ffi::MFX_CHROMAFORMAT_YUV422 as u16,
-            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => {
-                shiguredo_vpl::ffi::MFX_CHROMAFORMAT_YUV444 as u16
-            }
-        };
-        assert_eq!(
-            frame_info.ChromaFormat, expected_chroma,
-            "{format:?} の ChromaFormat が Init 後に変わった"
+            "{profile:?} + {format:?} の Shift が Init 後に変わった"
         );
     }
 }

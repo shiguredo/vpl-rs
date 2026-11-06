@@ -281,9 +281,9 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 | AYUV | `FrameFormat::Ayuv` | Packed YUV 4:4:4 8bit (バイト順は V, U, Y, A) |
 | Y410 | `FrameFormat::Y410` | Packed YUV 4:4:4 10bit (下位から U 10bit / Y 10bit / V 10bit / A 2bit) |
 
-入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存し、初期化時に判定されます。
-初期化に失敗した場合、`Encoder::new` はそのエラーを返します。
-事前に対応を確認する場合は `supported_codecs()` が返す `EncodingInfo::profiles` の `MemoryTypeCapabilities::color_formats` を参照してください。ただし、ケーパビリティ照会の結果は初期化の成功を保証しません。
+入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存し、初期化およびエンコード時に判定されます。
+初期化に失敗した場合、`Encoder::new` はそのエラーを返します。初期化に成功しても、エンコードに失敗する組み合わせがあります。
+事前に対応を確認する場合は `supported_codecs()` が返す `EncodingInfo::profiles` の `MemoryTypeCapabilities::color_formats` を参照してください。ただし、ケーパビリティ照会の結果は初期化やエンコードの成功を保証しません。
 詳細は `Encoder::new` のドキュメントを参照してください。
 
 ### デコード出力フォーマット
@@ -297,7 +297,7 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 
 `supported_codecs()` が返す `CodecInfo::decoding` → `DecodingInfo::profiles` → `ProfileCapabilities::memory_types` → `MemoryTypeCapabilities::color_formats` に、プロファイル・メモリタイプごとのデコード出力色形式が入ります。
 
-4:4:4 ストリーム (HEVC の `HevcProfile::Rext` / `HevcProfile::Scc` + AYUV / Y410) のデコードは未対応です。
+12bit (P016) や 4:4:4 (AYUV / Y410) など、NV12 / P010 以外の出力は未対応で、デコード時にエラーになります。
 また、`Decoder` から出力フォーマットを取得する API はありません。
 
 ## サポートプロファイル

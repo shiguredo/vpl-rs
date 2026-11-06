@@ -1025,11 +1025,12 @@ impl<H: EncodeHandler> Encoder<H> {
     ///
     /// 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
     /// 初期化に失敗した場合、[`Error::function`] は `MFXVideoENCODE_Init` になる。
+    /// 初期化に成功しても、エンコードに失敗する組み合わせがある。
     ///
     /// 事前に対応を判定する場合は [`crate::supported_codecs`] が返す
     /// [`crate::EncodingInfo::profiles`] の
     /// [`crate::MemoryTypeCapabilities::color_formats`] を参照する。
-    /// ただし、ケーパビリティ照会の結果は初期化の成功を保証しない。
+    /// ただし、ケーパビリティ照会の結果は初期化やエンコードの成功を保証しない。
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
@@ -2114,6 +2115,16 @@ mod tests {
                 "{format:?} の FourCC 変換が往復しない"
             );
         }
+    }
+
+    /// `FrameFormat::all()` がすべての variant を含むこと
+    #[test]
+    fn frame_format_all_contains_all_variants() {
+        assert_eq!(
+            FrameFormat::all().len(),
+            crate::codec_info::FRAME_FORMAT_VARIANT_COUNT,
+            "FrameFormat::all() の要素数が variant 数と一致しない"
+        );
     }
 
     /// 未知の FourCC が `None` になること
