@@ -36,6 +36,14 @@
   - P010 の 10bit 値は 16bit ワードの上位ビットに格納し、`mfxFrameInfo.Shift` に 1 を設定する
   - `FrameFormat::frame_size` を各形式のバイト数に対応させ、`mfxFrameData` のピッチは `PitchHigh` と `PitchLow` を合わせて計算する
   - @melpon
+- [CHANGE] `Encoder::encode` の入力を `FrameData` に変更し、表示サイズと行ピッチに対応する
+  - `FrameData::SemiPlanar` で NV12 / P010 の Y/UV プレーンを、`FrameData::Packed` で YUY2 / BGRA / AYUV / Y410 のパック形式を指定する
+  - `y_pitch` / `uv_pitch` / `pitch` で行間のバイト数（パディングを含む）を指定でき、表示幅と異なるピッチのバッファをそのまま渡せる
+  - `FrameFormat::bytes_per_row` を公開する
+  - `FrameFormat::frame_size` を削除する。入力バッファの行長は `FrameFormat::bytes_per_row` から求める
+  - NV12 / P010 の奇数サイズと YUY2 の奇数幅は `Encoder::new` がエラーにする
+  - `Encoder::coded_size` はサーフェスのサイズを返す API として残る
+  - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する
   - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・出力ビット数・in-flight フレーム数を取得できる
   - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する
