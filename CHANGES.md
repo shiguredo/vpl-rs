@@ -31,6 +31,11 @@
   - `VideoProfile` / `MemoryType` / `ValueRange` を公開し、未知のプロファイルとメモリタイプは `Unknown(u32)` で保持する
   - `EncodingProfiles` を削除する
   - @melpon
+- [CHANGE] エンコーダーの入力フォーマットに P010 / AYUV / Y410 を追加する
+  - `FrameFormat` に `P010` / `Ayuv` / `Y410` を追加する。variant の追加により、`FrameFormat` を網羅する `match` を持つ利用側はコンパイルできなくなる
+  - P010 の 10bit 値は 16bit ワードの上位ビットに格納し、`mfxFrameInfo.Shift` に 1 を設定する
+  - `FrameFormat::frame_size` を各形式のバイト数に対応させ、`mfxFrameData` のピッチは `PitchHigh` と `PitchLow` を合わせて計算する
+  - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する
   - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・出力ビット数・in-flight フレーム数を取得できる
   - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する

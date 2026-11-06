@@ -13,8 +13,14 @@
 //! # 対応入力フォーマット
 //!
 //! - NV12 (Semi-Planar YUV 4:2:0 8bit)
+//! - P010 (Semi-Planar YUV 4:2:0 10bit)
 //! - YUY2 (Packed YUV 4:2:2 8bit)
 //! - BGRA (Packed 8bit)
+//! - AYUV (Packed YUV 4:4:4 8bit)
+//! - Y410 (Packed YUV 4:4:4 10bit)
+//!
+//! 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
+//! 詳細は [`Encoder::new`] を参照。
 //!
 //! # メモリタイプ
 //!

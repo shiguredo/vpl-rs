@@ -302,25 +302,79 @@ impl ValueRange {
 }
 
 /// フレームの色形式
+///
+/// エンコーダーの入力と、エンコード・デコードのケーパビリティ照会で使う。
+///
+/// ref: libvpl api/vpl/mfxstructures.h (MFX_FOURCC_P010 / MFX_FOURCC_AYUV / MFX_FOURCC_Y410 / mfxY410)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
-    /// Semi-Planar YUV 4:2:0 8bit [Y プレーン + インターリーブ UV プレーン]
+    /// Semi-Planar YUV 4:2:0 8bit
+    ///
+    /// Y プレーン (画素数と同じバイト数) の後ろに、2 画素につき 1 組の UV を
+    /// インターリーブしたプレーン (画素数の半分のバイト数) を並べる。
     Nv12,
-    /// Packed YUV 4:2:2 8bit [YUYV インターリーブ]
+    /// Semi-Planar YUV 4:2:0 10bit
+    ///
+    /// 並びは [`FrameFormat::Nv12`] と同じで、1 サンプルを 16bit ワードで格納する。
+    /// 10bit の値は 16bit ワードの上位ビットに入れる。
+    P010,
+    /// Packed YUV 4:2:2 8bit
+    ///
+    /// 2 画素を 4 バイト (Y0, U, Y1, V) で格納する。
     Yuy2,
     /// Packed BGRA 8bit
+    ///
+    /// 1 画素を 4 バイト (B, G, R, A) で格納する。
     Bgra,
+    /// Packed YUV 4:4:4 8bit
+    ///
+    /// 1 画素を 4 バイト (V, U, Y, A) で格納する。
+    Ayuv,
+    /// Packed YUV 4:4:4 10bit
+    ///
+    /// 1 画素を 4 バイトの 32bit ワードで格納する。
+    /// ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に入れる。
+    Y410,
 }
 
 impl FrameFormat {
+    /// すべての色形式を返す
+    #[cfg(test)]
+    pub(crate) fn all() -> &'static [Self] {
+        const ALL: &[FrameFormat] = &[
+            FrameFormat::Nv12,
+            FrameFormat::P010,
+            FrameFormat::Yuy2,
+            FrameFormat::Bgra,
+            FrameFormat::Ayuv,
+            FrameFormat::Y410,
+        ];
+        // variant を追加したときに match がコンパイルエラーになり、
+        // 一覧の更新漏れに気づけるようにする
+        for format in ALL {
+            match format {
+                FrameFormat::Nv12
+                | FrameFormat::P010
+                | FrameFormat::Yuy2
+                | FrameFormat::Bgra
+                | FrameFormat::Ayuv
+                | FrameFormat::Y410 => {}
+            }
+        }
+        ALL
+    }
+
     /// MFX_FOURCC_* の値から変換する
     ///
     /// 本クレートが表現できない FourCC の場合は `None` を返す。
     pub(crate) fn from_fourcc(fourcc: u32) -> Option<Self> {
         match fourcc {
             sys::MFX_FOURCC_NV12 => Some(Self::Nv12),
+            sys::MFX_FOURCC_P010 => Some(Self::P010),
             sys::MFX_FOURCC_YUY2 => Some(Self::Yuy2),
             sys::MFX_FOURCC_RGB4 => Some(Self::Bgra),
+            sys::MFX_FOURCC_AYUV => Some(Self::Ayuv),
+            sys::MFX_FOURCC_Y410 => Some(Self::Y410),
             _ => None,
         }
     }
@@ -328,35 +382,47 @@ impl FrameFormat {
     pub(crate) fn fourcc(self) -> u32 {
         match self {
             FrameFormat::Nv12 => sys::MFX_FOURCC_NV12,
+            FrameFormat::P010 => sys::MFX_FOURCC_P010,
             FrameFormat::Yuy2 => sys::MFX_FOURCC_YUY2,
             FrameFormat::Bgra => sys::MFX_FOURCC_RGB4,
+            FrameFormat::Ayuv => sys::MFX_FOURCC_AYUV,
+            FrameFormat::Y410 => sys::MFX_FOURCC_Y410,
         }
     }
 
     pub(crate) fn chroma_format(self) -> u16 {
         match self {
-            FrameFormat::Nv12 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
+            FrameFormat::Nv12 | FrameFormat::P010 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
             FrameFormat::Yuy2 => sys::MFX_CHROMAFORMAT_YUV422 as u16,
-            FrameFormat::Bgra => sys::MFX_CHROMAFORMAT_YUV444 as u16,
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => {
+                sys::MFX_CHROMAFORMAT_YUV444 as u16
+            }
         }
     }
 
+    /// フレームを構成する各サンプルのビット深度を返す
     pub(crate) fn bit_depth(self) -> u16 {
-        8
+        match self {
+            FrameFormat::P010 | FrameFormat::Y410 => 10,
+            FrameFormat::Nv12 | FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv => 8,
+        }
     }
 
-    /// フレームデータのバイトサイズを返す
+    /// 指定した幅と高さのフレームのバイトサイズを返す
     ///
-    /// オーバーフロー時は `None` を返す。
+    /// NV12 / P010 は `height` が偶数の場合のレイアウトを前提とする。
+    /// 計算がオーバーフローした場合は `None` を返す。
     pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
         let pixels = width.checked_mul(height)?;
         match self {
             // YUV 4:2:0 8bit: Y + UV/2 = 画素 * 3 / 2
             FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
+            // YUV 4:2:0 10bit: 1 サンプル 2 バイトで Y + UV/2 = 画素 * 3
+            FrameFormat::P010 => pixels.checked_mul(3),
             // YUY2: 2 バイト/画素 (YUYV パック)
             FrameFormat::Yuy2 => pixels.checked_mul(2),
-            // BGRA: 4 バイト/画素
-            FrameFormat::Bgra => pixels.checked_mul(4),
+            // BGRA / AYUV / Y410: 4 バイト/画素
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => pixels.checked_mul(4),
         }
     }
 }
@@ -838,7 +904,7 @@ mod tests {
     /// デコーダのプロファイル・メモリタイプごとの値が VPL の記述どおりに返ること
     #[test]
     fn test_probe_decoding_returns_per_profile_capabilities() {
-        // P010 / AYUV / 未知の FourCC は FrameFormat で表現できないため無視される
+        // 未知の FourCC だけが FrameFormat で表現できないため無視される
         let mut formats0 = [
             sys::MFX_FOURCC_NV12,
             sys::MFX_FOURCC_P010,
@@ -929,7 +995,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].color_formats,
-            vec![FrameFormat::Nv12],
+            vec![FrameFormat::Nv12, FrameFormat::P010, FrameFormat::Ayuv],
             "色形式が正しくない: {info:?}"
         );
         assert_eq!(
@@ -1160,7 +1226,7 @@ mod tests {
     /// エンコーダのプロファイル・メモリタイプごとの値が VPL の記述どおりに返ること
     #[test]
     fn test_probe_encoding_returns_per_profile_capabilities() {
-        // P010 / AYUV / 未知の FourCC は FrameFormat で表現できないため無視される
+        // 未知の FourCC だけが FrameFormat で表現できないため無視される
         let mut formats0 = [
             sys::MFX_FOURCC_NV12,
             sys::MFX_FOURCC_P010,
@@ -1249,7 +1315,7 @@ mod tests {
         );
         assert_eq!(
             info.profiles[0].memory_types[0].color_formats,
-            vec![FrameFormat::Nv12],
+            vec![FrameFormat::Nv12, FrameFormat::P010, FrameFormat::Ayuv],
             "色形式が正しくない: {info:?}"
         );
         assert_eq!(
@@ -1257,9 +1323,10 @@ mod tests {
             MemoryType::VaSurface,
             "メモリタイプが正しくない: {info:?}"
         );
-        assert!(
-            info.profiles[0].memory_types[1].color_formats.is_empty(),
-            "表現できない色形式が入っている: {info:?}"
+        assert_eq!(
+            info.profiles[0].memory_types[1].color_formats,
+            vec![FrameFormat::Ayuv],
+            "色形式が正しくない: {info:?}"
         );
         assert_eq!(
             info.profiles[1].profile,

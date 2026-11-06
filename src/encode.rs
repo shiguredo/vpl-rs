@@ -69,54 +69,113 @@ impl FrameFormat {
         coded_height: usize,
     ) {
         unsafe {
-            let pitch = data.__bindgen_anon_2.Pitch as usize;
+            let pitch = frame_data_pitch(data);
+            // coded_width は u16 に収まるため、1 行あたりのバイト数は必ず usize に収まる
+            let row_bytes = self
+                .bytes_per_row(coded_width)
+                .expect("row bytes must fit in usize because the coded width fits in u16");
             match self {
-                FrameFormat::Nv12 => {
+                FrameFormat::Nv12 | FrameFormat::P010 => {
                     let y_ptr = data.__bindgen_anon_3.Y;
                     let uv_ptr = data.__bindgen_anon_4.UV;
-                    let luma_size = coded_width * coded_height;
+                    let luma_size = row_bytes * coded_height;
                     // Y プレーンをコピーする
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * coded_width),
-                            y_ptr.add(row * pitch),
-                            coded_width,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), y_ptr, row_bytes, coded_height, pitch);
                     // UV プレーンをコピーする
-                    let uv_src = src.as_ptr().add(luma_size);
-                    let uv_height = coded_height / 2;
-                    for row in 0..uv_height {
-                        std::ptr::copy_nonoverlapping(
-                            uv_src.add(row * coded_width),
-                            uv_ptr.add(row * pitch),
-                            coded_width,
-                        );
-                    }
+                    copy_rows(
+                        src.as_ptr().add(luma_size),
+                        uv_ptr,
+                        row_bytes,
+                        coded_height / 2,
+                        pitch,
+                    );
                 }
                 FrameFormat::Yuy2 => {
                     let y_ptr = data.__bindgen_anon_3.Y;
-                    let row_bytes = coded_width * 2;
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * row_bytes),
-                            y_ptr.add(row * pitch),
-                            row_bytes,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), y_ptr, row_bytes, coded_height, pitch);
                 }
                 FrameFormat::Bgra => {
                     let b_ptr = data.__bindgen_anon_5.B;
-                    let row_bytes = coded_width * 4;
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * row_bytes),
-                            b_ptr.add(row * pitch),
-                            row_bytes,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), b_ptr, row_bytes, coded_height, pitch);
+                }
+                FrameFormat::Ayuv => {
+                    // AYUV の各チャネルポインタは、パックされた 1 画素の各バイトを指す。
+                    // メモリ上のバイト順は V, U, Y, A なので、行の先頭は V になる。
+                    let v_ptr = data.__bindgen_anon_5.V;
+                    copy_rows(src.as_ptr(), v_ptr, row_bytes, coded_height, pitch);
+                }
+                FrameFormat::Y410 => {
+                    let y410_ptr = data.__bindgen_anon_4.Y410 as *mut u8;
+                    copy_rows(src.as_ptr(), y410_ptr, row_bytes, coded_height, pitch);
                 }
             }
+        }
+    }
+
+    /// 指定幅のフレームを密に詰めた場合の 1 行あたりのバイト数を返す
+    ///
+    /// `mfxFrameData` のピッチはこの値以上になる。
+    /// オーバーフロー時は `None` を返す。
+    pub(crate) fn bytes_per_row(self, width: usize) -> Option<usize> {
+        match self {
+            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
+            FrameFormat::Nv12 => Some(width),
+            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
+            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
+            // 1 画素 4 バイト
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
+        }
+    }
+
+    /// `mfxFrameInfo.Shift` に設定する値を返す
+    ///
+    /// VPL の仕様では、10bit サンプルを 16bit ワードに格納する形式について、Shift が 0 の場合は
+    /// 有効データが下位 10bit に、0 以外の場合は上位 10bit にあることを表す。
+    /// 10bit サンプルを 16bit ワードの上位ビットに格納する P010 だけ 1 を返す。
+    /// 10bit サンプルが 10bit 幅のフィールドにそのまま入る Y410 と、8bit の各形式は 0 を返す。
+    ///
+    /// ref: libvpl api/vpl/mfxstructures.h (mfxFrameInfo::Shift)
+    pub(crate) fn frame_info_shift(self) -> u16 {
+        match self {
+            FrameFormat::P010 => 1,
+            FrameFormat::Nv12
+            | FrameFormat::Yuy2
+            | FrameFormat::Bgra
+            | FrameFormat::Ayuv
+            | FrameFormat::Y410 => 0,
+        }
+    }
+}
+
+/// mfxFrameData から 1 行あたりのバイト数 (ピッチ) を取り出す
+///
+/// VPL はピッチを `PitchHigh` と `PitchLow` の 2 つの 16bit 値に分けて保持する。
+/// finalPitch = (PitchHigh << 16) + PitchLow
+///
+/// ref: libvpl api/vpl/mfxstructures.h (mfxFrameData::PitchHigh / PitchLow)
+///
+/// # Safety
+///
+/// `data` は VPL が初期化した有効な `mfxFrameData` である必要がある。
+/// `PitchLow` は共用体のメンバなので、`Pitch` と同じ領域が初期化されている必要がある。
+unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
+    unsafe { ((data.PitchHigh as usize) << 16) + (data.__bindgen_anon_2.PitchLow as usize) }
+}
+
+/// コピー元の行を 1 行ずつコピー先のピッチに従ってコピーする
+///
+/// # Safety
+///
+/// `src` は `rows * row_bytes` バイト以上、`dst` は `(rows - 1) * pitch + row_bytes` バイト以上
+/// 読み書き可能である必要がある。
+unsafe fn copy_rows(src: *const u8, dst: *mut u8, row_bytes: usize, rows: usize, pitch: usize) {
+    for row in 0..rows {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(row * row_bytes),
+                dst.add(row * pitch),
+                row_bytes,
+            );
         }
     }
 }
@@ -182,7 +241,7 @@ pub struct EncoderConfig {
     pub width: u32,
     /// フレーム高さ（ピクセル、16 の倍数にアライメントされる）
     pub height: u32,
-    /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth を決定する）
+    /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth / Shift を決定する）
     pub frame_format: FrameFormat,
     /// フレームレートの分子（mfxFrameInfo.FrameRateExtN）
     pub framerate_num: u32,
@@ -961,6 +1020,17 @@ impl<H: EncodeHandler> Encoder<H> {
     }
 
     /// エンコーダを作成する
+    ///
+    /// # 入力フォーマットとプロファイル
+    ///
+    /// 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
+    /// 初期化に失敗した場合、[`Error::function`] は `MFXVideoENCODE_Init` になる。
+    /// 初期化に成功しても、エンコードに失敗する組み合わせがある。
+    ///
+    /// 事前に対応を判定する場合は [`crate::supported_codecs`] が返す
+    /// [`crate::EncodingInfo::profiles`] の
+    /// [`crate::MemoryTypeCapabilities::color_formats`] を参照する。
+    /// ただし、ケーパビリティ照会の結果は初期化やエンコードの成功を保証しない。
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
@@ -986,22 +1056,6 @@ impl<H: EncodeHandler> Encoder<H> {
                 ),
             ));
         }
-        // pitch（行あたりのバイト数）が u16 に収まるか検証する
-        // NV12: width, YUY2: width * 2, BGRA: width * 4
-        let pitch_bytes: u64 = match config.frame_format {
-            FrameFormat::Nv12 => aligned_width as u64,
-            FrameFormat::Yuy2 => aligned_width as u64 * 2,
-            FrameFormat::Bgra => aligned_width as u64 * 4,
-        };
-        if pitch_bytes > u16::MAX as u64 {
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "pitch ({pitch_bytes} bytes) for {:?} with width {} exceeds u16::MAX",
-                    config.frame_format, aligned_width
-                ),
-            ));
-        }
 
         let lib = VplLibrary::load()?;
 
@@ -1016,6 +1070,7 @@ impl<H: EncodeHandler> Encoder<H> {
         frame_info.ChromaFormat = config.frame_format.chroma_format();
         frame_info.BitDepthLuma = config.frame_format.bit_depth();
         frame_info.BitDepthChroma = config.frame_format.bit_depth();
+        frame_info.Shift = config.frame_format.frame_info_shift();
         frame_info.PicStruct = sys::MFX_PICSTRUCT_PROGRESSIVE as u16;
         frame_info.FrameRateExtN = config.framerate_num;
         frame_info.FrameRateExtD = config.framerate_den;
@@ -2053,10 +2108,10 @@ mod tests {
     /// すべての FrameFormat が FourCC との相互変換で往復すること
     #[test]
     fn frame_format_fourcc_roundtrip() {
-        for format in [FrameFormat::Nv12, FrameFormat::Yuy2, FrameFormat::Bgra] {
+        for format in FrameFormat::all() {
             assert_eq!(
                 FrameFormat::from_fourcc(format.fourcc()),
-                Some(format),
+                Some(*format),
                 "{format:?} の FourCC 変換が往復しない"
             );
         }
@@ -2066,6 +2121,128 @@ mod tests {
     #[test]
     fn frame_format_from_unknown_fourcc_returns_none() {
         assert_eq!(FrameFormat::from_fourcc(0xDEAD_BEEF), None);
+    }
+
+    /// 各形式のフレームサイズが 1 画素あたりのバイト数と一致すること
+    #[test]
+    fn frame_format_frame_size_matches_bytes_per_pixel() {
+        // 4x4 画素で検証する
+        let cases = [
+            // YUV 4:2:0 8bit: Y + UV/2
+            (FrameFormat::Nv12, 4 * 4 * 3 / 2),
+            // YUV 4:2:0 10bit: 1 サンプル 2 バイトで Y + UV/2
+            (FrameFormat::P010, 4 * 4 * 3),
+            // YUY2: 2 バイト/画素
+            (FrameFormat::Yuy2, 4 * 4 * 2),
+            // BGRA / AYUV / Y410: 4 バイト/画素
+            (FrameFormat::Bgra, 4 * 4 * 4),
+            (FrameFormat::Ayuv, 4 * 4 * 4),
+            (FrameFormat::Y410, 4 * 4 * 4),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(
+                format.frame_size(4, 4),
+                Some(expected),
+                "{format:?} の 4x4 のフレームサイズが不一致"
+            );
+        }
+    }
+
+    /// フレームサイズの計算がオーバーフローした場合は `None` を返すこと
+    #[test]
+    fn frame_format_frame_size_returns_none_on_overflow() {
+        // width * height 自体がオーバーフローするケース
+        for format in FrameFormat::all() {
+            assert_eq!(
+                format.frame_size(usize::MAX, 2),
+                None,
+                "{format:?} のフレームサイズがオーバーフロー時に None にならない"
+            );
+        }
+        // width * height は収まるが、形式ごとの乗算がオーバーフローするケース
+        for format in FrameFormat::all() {
+            assert_eq!(
+                format.frame_size(usize::MAX / 2, 2),
+                None,
+                "{format:?} の形式ごとの乗算がオーバーフロー時に None にならない"
+            );
+        }
+    }
+
+    /// 1 行あたりのバイト数が形式ごとの 1 画素あたりのバイト数と一致すること
+    #[test]
+    fn frame_format_bytes_per_row_matches_bytes_per_pixel() {
+        let cases = [
+            (FrameFormat::Nv12, 320),
+            (FrameFormat::P010, 640),
+            (FrameFormat::Yuy2, 640),
+            (FrameFormat::Bgra, 1280),
+            (FrameFormat::Ayuv, 1280),
+            (FrameFormat::Y410, 1280),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(
+                format.bytes_per_row(320),
+                Some(expected),
+                "{format:?} の行あたりのバイト数が不一致"
+            );
+        }
+        // 1 画素 1 バイトの Nv12 は乗算がないためオーバーフローしない
+        assert_eq!(
+            FrameFormat::Nv12.bytes_per_row(usize::MAX),
+            Some(usize::MAX)
+        );
+        for format in [
+            FrameFormat::P010,
+            FrameFormat::Yuy2,
+            FrameFormat::Bgra,
+            FrameFormat::Ayuv,
+            FrameFormat::Y410,
+        ] {
+            assert_eq!(
+                format.bytes_per_row(usize::MAX),
+                None,
+                "{format:?} の行あたりのバイト数がオーバーフロー時に None にならない"
+            );
+        }
+    }
+
+    /// ビット深度と `mfxFrameInfo.Shift` が形式ごとに正しいこと
+    #[test]
+    fn frame_format_bit_depth_and_shift() {
+        let cases = [
+            // 8bit の形式は Shift を 0 にする
+            (FrameFormat::Nv12, 8, 0),
+            (FrameFormat::Yuy2, 8, 0),
+            (FrameFormat::Bgra, 8, 0),
+            (FrameFormat::Ayuv, 8, 0),
+            // P010 は 10bit の値を 16bit ワードの上位ビットに格納するため Shift を 1 にする
+            (FrameFormat::P010, 10, 1),
+            // Y410 は 10bit の値が 10bit 幅のフィールドにそのまま入るため Shift を 0 にする
+            (FrameFormat::Y410, 10, 0),
+        ];
+        for (format, bit_depth, shift) in cases {
+            assert_eq!(
+                format.bit_depth(),
+                bit_depth,
+                "{format:?} のビット深度が不一致"
+            );
+            assert_eq!(
+                format.frame_info_shift(),
+                shift,
+                "{format:?} の mfxFrameInfo.Shift が不一致"
+            );
+        }
+    }
+
+    /// ピッチが PitchHigh と PitchLow を合わせた 32bit の値になること
+    #[test]
+    fn frame_data_pitch_combines_pitch_high_and_pitch_low() {
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 1;
+        data.__bindgen_anon_2.PitchLow = 2;
+        // finalPitch = (1 << 16) + 2
+        assert_eq!(unsafe { frame_data_pitch(&data) }, 65538);
     }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {
