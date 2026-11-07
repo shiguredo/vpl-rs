@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-07
 - Model: DeepSeek V4 Flash
 - Branch: feature/change-accept-display-size-input
 - Polished: {YYYY-MM-DD}
@@ -47,6 +47,44 @@ vpl-rs はアラインメント後の coded サイズのバッファを要求す
 5. `test_roundtrip_h264_nv12_alignment_mismatch` を表示サイズのバッファに変更して通る。
 6. NV12 / YUY2 / BGRA の各形式で表示サイズの入力をテストする。
 7. `CHANGES.md` の `## develop` に `[CHANGE]` を追記し、`README.md` / `skills/shiguredo-vpl/SKILL.md` を更新する。
+
+## 解決方法
+
+`Encoder::encode()` が `FrameData` を受け取るように変更し、表示サイズと行ピッチを指定した入力をサーフェスの crop 領域へコピーできるようにした。
+
+### 変更内容
+
+- `FrameData` を追加し、`SemiPlanar`（NV12 / P010）と `Packed`（YUY2 / BGRA / AYUV / Y410）で入力を表現するようにした
+- `Encoder::encode()` を `FrameData` 受け取りに変更し、`y_pitch` / `uv_pitch` / `pitch` で行間のバイト数を指定できるようにした
+- `FrameFormat::copy_to_surface_planes()` で形式・ピッチ・データ長を検証し、表示サイズ分だけコピーするようにした。コピー先のピッチ不足もエラーにする
+- `FrameFormat::bytes_per_row()` を公開し、`FrameFormat::frame_size()` を削除した
+- NV12 / P010 は幅と高さ、YUY2 は幅が偶数であることを `Encoder::new` で検証するようにした。16 の倍数に切り上げたサイズが `u16::MAX` を超える場合もエラーにする
+- `GetVideoParam` の実効フレーム情報を検証し、`CropX` / `CropY` / `CropW` / `CropH` / `Width` / `Height` / FourCC / ChromaFormat / BitDepth / Shift が要求値と一致しない場合はエラーにするようにした
+- `FrameData` のデータは `encode` 内でコピーされるため、戻った後に再利用できることをドキュメント化した
+- `Encoder::coded_size()` は内部サーフェスのサイズを返す API として残した
+- `CHANGES.md` / `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新した
+
+### テスト
+
+- `FrameFormat::copy_to_surface_planes()` の Y / UV / コピー先ピッチを合成 `mfxFrameData` で検証する単体テストを追加した
+- カラーバー、strided NV12 / YUY2 / P010 の UV プレーン PSNR を検証した
+- 318x238 / 1920x1080 の coded サイズ不変条件、pitch 不足、データ長不足、必要サイズのオーバーフロー、奇数サイズ拒否を検証した
+- HEVC / AV1 / VP9 / P010 / AYUV / Y410 の 318x238 ラウンドトリップを追加した
+- `DecodedFrame` の Y / UV / pitch をそのまま `FrameData` に渡す再エンコードを検証した
+- `Encoder::get_video_param()` で実効フレーム情報を検証するテストを追加した
+
+### 確認
+
+Intel GPU を搭載した実機で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace` | pass (lib 55 件、adapter 5 件、roundtrip 61 件、doctest 2 件) |
+| `cargo doc --no-deps` | pass |
+
+作業用の未追跡ファイル `tests/probe_444.rs` は一時退避してから実行し、確認後に元へ戻した。
 
 ## 参考
 
