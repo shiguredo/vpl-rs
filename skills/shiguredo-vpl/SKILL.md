@@ -251,7 +251,7 @@ pub trait EncodeHandler: Send + 'static {
 
 ### `Encoder::encode` / `finish` のセマンティクス
 
-- `encode(&mut self, frame: FrameData<'_>, user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame` は `EncoderConfig::frame_format` に対応する variant を選ぶ。 `y_pitch` / `uv_pitch` / `pitch` は `FrameFormat::bytes_per_row(width)` 以上で、 `data` は最終行の表示幅分まで必要。 形式と variant の不一致、 `pitch` 不足、データ長不足はエラーになる。
+- `encode(&mut self, frame: FrameData<'_>, user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame` は `EncoderConfig::frame_format` に対応する variant を選ぶ。 `y_pitch` / `uv_pitch` / `pitch` は `FrameFormat::bytes_per_row(width)` 以上であること。 `SemiPlanar` は Y が `(height - 1) * y_pitch + bytes_per_row(width)` バイト、UV が `(height / 2 - 1) * uv_pitch + bytes_per_row(width)` バイト、`Packed` は `(height - 1) * pitch + bytes_per_row(width)` バイト必要。 形式と variant の不一致、 `pitch` 不足、データ長不足はエラーになる。
 - `finish(&mut self) -> Result<(), Error>` は EOS シグナル + バリア。 null surface でドレインを呼び切り、worker に `WaitIdle` を送って **すべてのハンドラ呼び出しが完了するまでブロック** する。 戻ったときには `on_encoded` がすべて呼ばれ終わっている。
 - `Encoder` を `Drop` すると worker スレッドへ `Stop` が送られ、 ペンディング中のフレームはすべて `MFX_ERR_ABORTED` のエラー結果として `on_encoded` に通知される。 失敗フレームを取りこぼさない設計。
 - `EncodedFrame<T>` から取れる情報: `data() -> &[u8]` / `into_data() -> Vec<u8>` / `timestamp() -> u64` / `picture_type() -> PictureType` / `user_data() -> &T` / `into_user_data() -> T`。
