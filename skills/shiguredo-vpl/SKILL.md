@@ -1,6 +1,6 @@
 ---
 name: shiguredo-vpl
-description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、coded_size と frame_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
+description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
 ---
 
 # shiguredo_vpl クレート
@@ -30,7 +30,7 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
 - `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
 - `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameData<'_>` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `stats` — `Counter` / `Gauge`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
@@ -95,17 +95,19 @@ libvpl 側の関連実装:
 ```rust
 use shiguredo_vpl::{
     AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
-    FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile, RateControlMode, frame_type,
-    list_adapters,
+    FnEncodeHandler, FrameData, FrameFormat, H264EncoderConfig, H264Profile,
+    RateControlMode, frame_type, list_adapters,
 };
 use std::sync::mpsc;
 
+let width = 1920usize;
+let height = 1080usize;
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
     adapter,
     CodecConfig::H264(H264EncoderConfig { profile: Some(H264Profile::High) }),
-    1920,
-    1080,
+    width as u32,
+    height as u32,
     FrameFormat::Nv12,
     30, // framerate_num
     1,  // framerate_den
@@ -120,14 +122,23 @@ let handler = FnEncodeHandler::new(move |result: Result<EncodedFrame<u64>, Error
 });
 let mut encoder = Encoder::new(config, handler)?;
 
-let (coded_width, coded_height) = encoder.coded_size();
-let frame_size = FrameFormat::Nv12
-    .frame_size(coded_width, coded_height)
-    .ok_or("frame size overflowed")?;
-let frame_data = vec![0u8; frame_size];
+// width x height の FrameData を構築する
+let pitch = FrameFormat::Nv12
+    .bytes_per_row(width)
+    .ok_or("row bytes overflowed")?;
+let y_size = pitch * height;
+let uv_size = pitch * (height / 2);
+let frame_data = vec![0u8; y_size + uv_size];
+let frame = FrameData::SemiPlanar {
+    y: &frame_data[..y_size],
+    y_pitch: pitch,
+    uv: &frame_data[y_size..],
+    uv_pitch: pitch,
+};
 
+// 構築したフレームデータをエンコードする
 // user_data に元フレーム ID やタイムスタンプを乗せると、出力 EncodedFrame と紐付く
-encoder.encode(&frame_data, /* user_data */ 0u64, &EncodeOptions { frame_type: frame_type::UNKNOWN })?;
+encoder.encode(frame, /* user_data */ 0u64, &EncodeOptions { frame_type: frame_type::UNKNOWN })?;
 
 // finish はバリア。 ここに到達した時点で worker は全フレーム処理済み
 encoder.finish()?;
@@ -175,7 +186,7 @@ while let Ok(result) = rx.try_recv() {
 
 union 別メンバを同時に立てると意味不明な設定になる。 モードに応じて必要なフィールドだけ埋める。
 
-### `FrameFormat` と `coded_size` / `frame_size`
+### `FrameFormat` と入力バッファ / `coded_size`
 
 入力フォーマットは次の 6 種類:
 
@@ -188,8 +199,13 @@ union 別メンバを同時に立てると意味不明な設定になる。 モ�
 | `FrameFormat::Ayuv` | `MFX_FOURCC_AYUV` | Packed YUV 4:4:4 8bit。 バイト順は V, U, Y, A |
 | `FrameFormat::Y410` | `MFX_FOURCC_Y410` | Packed YUV 4:4:4 10bit。 32bit ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) |
 
-- `Encoder::coded_size()` は 16 ピクセルにアラインされた符号化サイズを返す。 入力バッファサイズは `width` / `height` ではなくこの coded サイズで計算する。
-- `FrameFormat::frame_size(width, height) -> Option<usize>` で必要バイト数を取る。 `usize::checked_mul` 系でオーバーフロー検出する。 NV12 は `pixels * 3 / 2`、 P010 は `pixels * 3`、 YUY2 は `pixels * 2`、 BGRA / AYUV / Y410 は `pixels * 4`。
+- `Encoder::encode` に渡すフレームは `FrameData` で表現する。 `FrameData::SemiPlanar` は NV12 / P010、 `FrameData::Packed` は YUY2 / BGRA / AYUV / Y410 に対応する。
+- `FrameData::SemiPlanar` は `y` / `y_pitch` / `uv` / `uv_pitch`、 `FrameData::Packed` は `data` / `pitch` を持つ。
+- `y_pitch` / `uv_pitch` / `pitch` は行間のバイト数（パディングを含む）で、 `FrameFormat::bytes_per_row(width)` 以上であること。
+- NV12 / P010 は幅と高さ、 YUY2 は幅を偶数にすること。奇数サイズは `Encoder::new` がエラーにする。
+- `EncoderConfig::width` / `EncoderConfig::height` は表示サイズ（crop サイズ）であり、 coded サイズではない。 16 の倍数に揃える必要はない。 `mfxFrameInfo.Width` / `Height` は内部で 16 の倍数に切り上げられ、 `CropW` / `CropH` に表示サイズが入る。
+- 入力バッファの最小サイズは `FrameFormat::bytes_per_row(width)` と `EncoderConfig::height` から求める。 NV12 / P010 は Y プレーンと UV プレーンの合計、パック形式は 1 プレーン分になる。
+- `Encoder::coded_size()` は 16 ピクセルにアラインされた内部サーフェスのサイズを返す。 入力バッファのサイズではない。
 - P010 は `mfxFrameInfo.Shift` に 1 を設定する。 VPL の仕様では Shift が 1 のとき有効データが 16bit ワードの上位 10bit にある (Shift が 0 なら下位 10bit)。
 - 入力フォーマットとプロファイルの組み合わせの可否は `MFXVideoENCODE_Init` の結果に従う。 事前判定は `supported_codecs()` の `MemoryTypeCapabilities::color_formats` を使うが、 その結果は初期化の成功を保証しない。
 - パック形式のプレーンコピーは VPL のチャネルポインタに従う。 BGRA は `Data.B`、 AYUV は `Data.V` (メモリ上のバイト順 V, U, Y, A の先頭)、 Y410 は `Data.Y410` を行の先頭として扱う。
@@ -235,7 +251,7 @@ pub trait EncodeHandler: Send + 'static {
 
 ### `Encoder::encode` / `finish` のセマンティクス
 
-- `encode(&mut self, frame_data: &[u8], user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame_data` の長さは `FrameFormat::frame_size(coded_w, coded_h)` 以上が必要。 不足すると即エラー。
+- `encode(&mut self, frame: FrameData<'_>, user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame` は `EncoderConfig::frame_format` に対応する variant を選ぶ。 `y_pitch` / `uv_pitch` / `pitch` は `FrameFormat::bytes_per_row(width)` 以上であること。 `SemiPlanar` は Y が `(height - 1) * y_pitch + bytes_per_row(width)` バイト、UV が `(height / 2 - 1) * uv_pitch + bytes_per_row(width)` バイト、`Packed` は `(height - 1) * pitch + bytes_per_row(width)` バイト必要。 形式と variant の不一致、 `pitch` 不足、データ長不足はエラーになる。
 - `finish(&mut self) -> Result<(), Error>` は EOS シグナル + バリア。 null surface でドレインを呼び切り、worker に `WaitIdle` を送って **すべてのハンドラ呼び出しが完了するまでブロック** する。 戻ったときには `on_encoded` がすべて呼ばれ終わっている。
 - `Encoder` を `Drop` すると worker スレッドへ `Stop` が送られ、 ペンディング中のフレームはすべて `MFX_ERR_ABORTED` のエラー結果として `on_encoded` に通知される。 失敗フレームを取りこぼさない設計。
 - `EncodedFrame<T>` から取れる情報: `data() -> &[u8]` / `into_data() -> Vec<u8>` / `timestamp() -> u64` / `picture_type() -> PictureType` / `user_data() -> &T` / `into_user_data() -> T`。
@@ -512,7 +528,7 @@ for codec in supported_codecs(adapter)? {
 
 - **アダプタ列挙の重さ**: `list_adapters()` は MFXLoad/Unload を毎回まわす。 起動時 1 回だけ呼ぶ。
 - **DRM render node 0**: 「未設定」を意味するので絶対に `AdapterSelector::DrmRenderNode(0)` を渡さない。
-- **`coded_size` vs `width`/`height`**: 入力フレームのバッファ確保は **必ず** `Encoder::coded_size()` の結果で行う。 `EncoderConfig.width` / `height` は 16 ピクセルアラインされて内部で大きくなりうる。
+- **`coded_size` vs `width`/`height`**: `encode()` に渡すフレームは `FrameData` で、 `y_pitch` / `uv_pitch` / `pitch` に実際の行間のバイト数を指定する。 `Encoder::coded_size()` は 16 ピクセルにアラインされた内部サーフェスのサイズであり、入力バッファのサイズではない。
 - **union メンバ**: `RateControlMode` ごとに有効な `EncoderConfig` フィールドが違う。 関係ないフィールドを埋めても効かないが、 別 union メンバを同時に埋めると意図しない値が選ばれる。
 - **`finish` 忘れ**: `encode` / `decode` だけ呼んで `finish` を呼ばないと内部に滞留するフレームのハンドラ通知が抜ける。 EOS では必ず `finish` を呼んで完了を待つ。 `finish` はバリアなので、 リターン後にはハンドラ呼び出しがすべて済んでいる。
 - **`frame_type` の組合せ**: IDR を強制したいときは `IDR | I | REF`。 IDR 単体だと VPL が再決定することがある。

@@ -138,19 +138,21 @@ for codec in supported_codecs(adapter)? {
 ```rust
 use shiguredo_vpl::{
     AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
-    Error, FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile,
+    Error, FnEncodeHandler, FrameData, FrameFormat, H264EncoderConfig, H264Profile,
     RateControlMode, frame_type, list_adapters,
 };
 use std::sync::mpsc;
 
+let width = 1920usize;
+let height = 1080usize;
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
     adapter,
     CodecConfig::H264(H264EncoderConfig {
         profile: Some(H264Profile::High),
     }),
-    1920,                    // width
-    1080,                    // height
+    width as u32,
+    height as u32,
     FrameFormat::Nv12,
     30,                      // framerate_num
     1,                       // framerate_den
@@ -163,17 +165,25 @@ let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |result| {
     tx.send(result).expect("failed to send callback result");
 }))?;
 
-// フレームデータをエンコード
-let (coded_width, coded_height) = encoder.coded_size();
-let frame_size = FrameFormat::Nv12
-    .frame_size(coded_width, coded_height)
-    .ok_or("frame size overflowed")?;
-let frame_data = vec![0u8; frame_size];
+// width x height の FrameData を構築する
+let pitch = FrameFormat::Nv12
+    .bytes_per_row(width)
+    .ok_or("row bytes overflowed")?;
+let y_size = pitch * height;
+let uv_size = pitch * (height / 2);
+let frame_data = vec![0u8; y_size + uv_size];
+let frame = FrameData::SemiPlanar {
+    y: &frame_data[..y_size],
+    y_pitch: pitch,
+    uv: &frame_data[y_size..],
+    uv_pitch: pitch,
+};
+// 構築したフレームデータをエンコードする
 let options = EncodeOptions { frame_type: frame_type::UNKNOWN };
-encoder.encode(&frame_data, "normal", &options)?;
+encoder.encode(frame, "normal", &options)?;
 
 // IDR フレームを強制してエンコード
-encoder.encode(&frame_data, "force-idr", &EncodeOptions {
+encoder.encode(frame, "force-idr", &EncodeOptions {
     frame_type: frame_type::IDR | frame_type::I | frame_type::REF,
 })?;
 
@@ -187,6 +197,8 @@ for _ in 0..2 {
     println!("user_data: {:?}", encoded.user_data());
 }
 ```
+
+`Encoder::encode` に渡すフレームは `FrameData` で表現します。`EncoderConfig::width` / `height` は表示サイズ（crop サイズ）で、16 の倍数に揃える必要はありませんが、NV12 / P010 は幅と高さ、YUY2 は幅を偶数にする必要があります。各行のバイト数が表示幅と異なる場合は、`y_pitch` / `uv_pitch` / `pitch` に実際の行間のバイト数を指定します。`Encoder::coded_size()` は内部サーフェスのサイズであり、入力バッファのサイズではありません。
 
 ### シーケンスパラメータの取得
 

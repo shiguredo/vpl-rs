@@ -18,7 +18,7 @@ Medium。以下による。
 
 - **規約と実装の齟齬**: shiguredo-rust 規約「PBT で実現できるものは PBT で書く」に対し、実体がない状態。規約準拠を宣言しつつ実装が伴っていない。
 - **Makefile の死にターゲット**: 実行すると失敗する Makefile ターゲットは信頼を失わせる。
-- **カバレッジ穴**: `FrameFormat::frame_size`（公開 API）など PBT で書ける対象がある（非公開 API の関数は shiguredo-rust 規約により PBT の対象外。詳細は「PBT の対象」参照）。
+- **カバレッジ穴**: `FrameFormat::bytes_per_row`（公開 API）など PBT で書ける対象がある（非公開 API の関数は shiguredo-rust 規約により PBT の対象外。詳細は「PBT の対象」参照）。
 - **Priority は High ではない**: 現状の通常テスト（実機 GPU ランナー依存）は機能しており、直接的なバグはない。
 
 ## 現状
@@ -74,7 +74,7 @@ shiguredo-rust 規約は「`tests/`・`pbt/`・`fuzz/` のテストは公開 API
 
 PBT で書ける対象（公開 API）:
 
-- `FrameFormat::frame_size` のオーバーフロー / 単調性 / フォーマット別バイト数プロパティ（`src/encode.rs` の `FrameFormat`）
+- `FrameFormat::bytes_per_row` のオーバーフロー / 単調性 / フォーマット別の行バイト数プロパティ（`src/encode.rs` の `FrameFormat`）
 
 **`Encoder::coded_size()` 経由の 16 ピクセルアライン等は GPU セッションを要するため PBT の対象外**（GPU なしの CI では実行できない）。追加する場合は GPU を要しない公開 API 経由で到達可能なものを選ぶ（例: `DecoderConfig::new` の設定プロパティの検証）。
 
@@ -96,7 +96,7 @@ PBT で書ける対象（公開 API）:
 以下のステップで PBT 基盤を段階的に整備する:
 
 1. まず Makefile の `.PHONY` 誤記（`pbt-cover` → `pbt-with-cover`）を修正する。`fuzz` の `.PHONY` は fuzz 基盤の分離候補（別 issue）で扱う。
-2. `pbt/` サブディレクトリと最小限のテスト（`FrameFormat::frame_size` の PBT）を追加する。
+2. `pbt/` サブディレクトリと最小限のテスト（`FrameFormat::bytes_per_row` の PBT）を追加する。
    - `pbt/Cargo.toml` は `[package].name = "pbt"` / `publish = false` / `edition = "2024"` / `rust-version = "1.93"` とし、`proptest` 依存と `[dev-dependencies]` への root クレート（`shiguredo_vpl`）の path 依存を追加する。
    - `pbt/` には明示的な lib target として空の `pbt/src/lib.rs` を置く（tests/ のみのクレートでも cargo は動作するが、明示的な lib target として置く）。
 3. `Cargo.toml` に `[workspace] members = ["pbt"]` を追加し workspace 構成にする。
@@ -114,7 +114,7 @@ PBT で書ける対象（公開 API）:
 1. Makefile の `.PHONY` 誤記を修正する（`pbt-cover` → `pbt-with-cover`。`fuzz` の `.PHONY` は fuzz 基盤の分離候補（別 issue）で扱うため、本 issue では触らない）。
 2. `pbt/` サブディレクトリと `pbt/Cargo.toml`（`[package].name = "pbt"` / `publish = false` / `edition = "2024"` / `rust-version = "1.93"` / `proptest` 依存 / `[dev-dependencies]` に root クレートの path 依存）と、明示的な lib target としての空の `pbt/src/lib.rs` を作成する。
 3. `Cargo.toml` に `[workspace] members = ["pbt"]` を追加する。
-4. `pbt/tests/prop_encode.rs` に `FrameFormat::frame_size` の PBT を最低 1 個追加する（shiguredo-rust 規約の「`pbt/tests/prop_<module>.rs` は `src/<module>.rs` に対応させる」に従い、`FrameFormat` が属する `encode` モジュールに対応させる）。プロパティは「任意入力でパニックしない」だけでなく、フォーマット別の期待バイト数やオーバーフロー挙動など検証可能な性質を指定する（Nv12 の奇数画素での切り捨て（`pixels.checked_mul(3).map(|v| v/2)`）に注意し、戦略の制約を設計する）。
+4. `pbt/tests/prop_encode.rs` に `FrameFormat::bytes_per_row` の PBT を最低 1 個追加する（shiguredo-rust 規約の「`pbt/tests/prop_<module>.rs` は `src/<module>.rs` に対応させる」に従い、`FrameFormat` が属する `encode` モジュールに対応させる）。プロパティは「任意入力でパニックしない」だけでなく、フォーマット別の行バイト数やオーバーフロー挙動など検証可能な性質を指定する。
 5. `make pbt` が成功し、かつ `make test`（workspace 全体の `cargo test`）も pass することを **実機 GPU 付き Linux x86_64 上で**確認する。
 6. SKILL.md の PBT 規約記述を「配置済み」に更新する。
 7. `CHANGES.md` の `## develop` の `### misc` サブセクションに `[ADD]` として追記する（PBT 基盤の追加。ライブラリ機能に直接影響しないため `### misc` に記載する）。

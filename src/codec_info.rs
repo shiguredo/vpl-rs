@@ -407,24 +407,6 @@ impl FrameFormat {
             FrameFormat::Nv12 | FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv => 8,
         }
     }
-
-    /// 指定した幅と高さのフレームのバイトサイズを返す
-    ///
-    /// NV12 / P010 は `height` が偶数の場合のレイアウトを前提とする。
-    /// 計算がオーバーフローした場合は `None` を返す。
-    pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
-        let pixels = width.checked_mul(height)?;
-        match self {
-            // YUV 4:2:0 8bit: Y + UV/2 = 画素 * 3 / 2
-            FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
-            // YUV 4:2:0 10bit: 1 サンプル 2 バイトで Y + UV/2 = 画素 * 3
-            FrameFormat::P010 => pixels.checked_mul(3),
-            // YUY2: 2 バイト/画素 (YUYV パック)
-            FrameFormat::Yuy2 => pixels.checked_mul(2),
-            // BGRA / AYUV / Y410: 4 バイト/画素
-            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => pixels.checked_mul(4),
-        }
-    }
 }
 
 /// メモリタイプごとのケーパビリティ

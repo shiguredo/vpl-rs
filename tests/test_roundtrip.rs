@@ -6,47 +6,112 @@ use std::time::Duration;
 use helpers::test_adapter;
 use shiguredo_vpl::{
     Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder, DecoderConfig, EncodeOptions,
-    EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat,
-    H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, MemoryType, PictureType,
-    RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile, Vp9EncoderConfig, Vp9Profile,
-    ffi, frame_type, supported_codecs,
+    EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameData,
+    FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, MemoryType,
+    PictureType, RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile,
+    Vp9EncoderConfig, Vp9Profile, ffi, frame_type, supported_codecs,
 };
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
 struct DecodedFrameInfo {
     y_data: Vec<u8>,
+    uv_data: Vec<u8>,
     pitch: usize,
     width: usize,
     height: usize,
     user_data: usize,
 }
 
-/// 入力サイズが coded サイズに収まっていることを検証する
-fn assert_frame_dimensions(width: usize, height: usize, coded_width: usize, coded_height: usize) {
+/// デコード結果のプレーンサイズが width / height / pitch と整合していることを検証する
+///
+/// Y プレーンは `pitch * height` バイト、UV プレーンは `pitch * (height / 2)` バイトである。
+fn assert_decoded_frame_layout(frame: &DecodedFrameInfo, label: &str) {
     assert!(
-        width <= coded_width && height <= coded_height,
-        "入力サイズ {}x{} が coded サイズ {}x{} を超えている",
-        width,
-        height,
-        coded_width,
-        coded_height,
+        frame.pitch >= frame.width,
+        "{label}: pitch {} が width {} より小さい",
+        frame.pitch,
+        frame.width
     );
+    assert_eq!(
+        frame.y_data.len(),
+        frame.pitch * frame.height,
+        "{label}: Y プレーンの長さが pitch * height と一致しない"
+    );
+    assert_eq!(
+        frame.uv_data.len(),
+        frame.pitch * (frame.height / 2),
+        "{label}: UV プレーンの長さが pitch * (height / 2) と一致しない"
+    );
+}
+
+/// 表示サイズのバッファからエンコーダー入力を構築する
+fn frame_data_from_buffer<'a>(
+    format: FrameFormat,
+    width: usize,
+    height: usize,
+    data: &'a [u8],
+) -> FrameData<'a> {
+    let pitch = format
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    match format {
+        FrameFormat::Nv12 | FrameFormat::P010 => {
+            let y_size = pitch * height;
+            assert!(
+                data.len() >= y_size,
+                "NV12 / P010 の Y プレーンに必要な長さが足りない"
+            );
+            let (y, uv) = data.split_at(y_size);
+            FrameData::SemiPlanar {
+                y,
+                y_pitch: pitch,
+                uv,
+                uv_pitch: pitch,
+            }
+        }
+        FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => {
+            FrameData::Packed { data, pitch }
+        }
+    }
+}
+
+/// 表示サイズのフレームのバイト数を返す
+fn frame_buffer_size(format: FrameFormat, width: usize, height: usize) -> usize {
+    let row_bytes = format
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    let rows = match format {
+        FrameFormat::Nv12 | FrameFormat::P010 => height + height / 2,
+        FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => height,
+    };
+    row_bytes * rows
+}
+
+/// プレーンを指定したピッチにパディングする
+fn pad_plane(data: &[u8], row_bytes: usize, rows: usize, pitch: usize) -> Vec<u8> {
+    assert!(
+        pitch >= row_bytes,
+        "ピッチ {pitch} が 1 行のバイト数 {row_bytes} より小さい"
+    );
+    assert!(
+        data.len() >= row_bytes * rows,
+        "プレーンのデータ長が不足している"
+    );
+    let mut padded = vec![0u8; pitch * rows];
+    for row in 0..rows {
+        padded[row * pitch..row * pitch + row_bytes]
+            .copy_from_slice(&data[row * row_bytes..(row + 1) * row_bytes]);
+    }
+    padded
 }
 
 /// ダミー NV12 フレームを生成する
 ///
 /// Y プレーンはフレーム番号に応じたグラデーション、UV プレーンは 128 固定。
-fn generate_dummy_nv12(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    frame_index: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
-    let y_size = coded_width * coded_height;
-    let uv_height = coded_height.div_ceil(2);
-    let uv_size = coded_width * uv_height;
+fn generate_dummy_nv12(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let y_size = width * height;
+    let uv_height = height / 2;
+    let uv_size = width * uv_height;
     let mut data = vec![0u8; y_size + uv_size];
     for i in 0..uv_size {
         data[y_size + i] = 128;
@@ -54,7 +119,7 @@ fn generate_dummy_nv12(
 
     for y in 0..height {
         for x in 0..width {
-            data[y * coded_width + x] = ((x + y + frame_index * 7) % 256) as u8;
+            data[y * width + x] = ((x + y + frame_index * 7) % 256) as u8;
         }
     }
 
@@ -65,13 +130,7 @@ fn generate_dummy_nv12(
 ///
 /// 7 色の縦ストライプ（白/黄/シアン/緑/マゼンタ/赤/青）を
 /// BT.601 で YUV に変換し NV12 形式で返す。
-fn generate_colorbar_nv12(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
+fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
     // SMPTE カラーバーの RGB 値（白/黄/シアン/緑/マゼンタ/赤/青）
     let bars: [(u8, u8, u8); 7] = [
         (235, 235, 235), // 白
@@ -83,9 +142,9 @@ fn generate_colorbar_nv12(
         (16, 16, 235),   // 青
     ];
 
-    let y_size = coded_width * coded_height;
-    let uv_height = coded_height.div_ceil(2);
-    let uv_size = coded_width * uv_height;
+    let y_size = width * height;
+    let uv_height = height / 2;
+    let uv_size = width * uv_height;
     let mut data = vec![0u8; y_size + uv_size];
     let uv_offset = y_size;
     for i in 0..uv_size {
@@ -102,7 +161,7 @@ fn generate_colorbar_nv12(
             let gf = g as f64;
             let bf = b as f64;
             let yv = (0.257 * rf + 0.504 * gf + 0.098 * bf + 16.0).clamp(16.0, 235.0) as u8;
-            data[y * coded_width + x] = yv;
+            data[y * width + x] = yv;
 
             // UV は 2x2 ブロック単位（左上ピクセルで代表する）
             if y % 2 == 0 && x % 2 == 0 {
@@ -110,8 +169,8 @@ fn generate_colorbar_nv12(
                 let v = (0.439 * rf - 0.368 * gf - 0.071 * bf + 128.0).clamp(16.0, 240.0) as u8;
                 let uv_row = y / 2;
                 let uv_col = x; // NV12 はインターリーブなので x そのまま
-                data[uv_offset + uv_row * coded_width + uv_col] = u;
-                data[uv_offset + uv_row * coded_width + uv_col + 1] = v;
+                data[uv_offset + uv_row * width + uv_col] = u;
+                data[uv_offset + uv_row * width + uv_col + 1] = v;
             }
         }
     }
@@ -146,6 +205,56 @@ fn psnr_y(original: &[u8], decoded_y: &[u8], pitch: usize, width: usize, height:
         }
     }
     psnr_from_mse(mse_sum, pixels, 255.0)
+}
+
+/// UV プレーン同士の PSNR を計算する（dB）
+///
+/// NV12 / P010 の UV プレーンはインターリーブされた 1 行 `width` サンプル、
+/// `height / 2` 行として比較する。`decoded_uv` はピッチを含む生データ。
+fn psnr_uv(
+    original_uv: &[u8],
+    decoded_uv: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    let rows = height / 2;
+    let samples = width * rows;
+    let mut mse_sum: f64 = 0.0;
+    for row in 0..rows {
+        for col in 0..width {
+            let orig = original_uv[row * width + col] as f64;
+            let dec = decoded_uv[row * pitch + col] as f64;
+            let diff = orig - dec;
+            mse_sum += diff * diff;
+        }
+    }
+    psnr_from_mse(mse_sum, samples, 255.0)
+}
+
+/// 10bit の UV プレーン同士の PSNR を計算する（dB）
+///
+/// `expected` はインターリーブされた UV の 16bit 値、`decoded_uv` は P010 の
+/// UV プレーン（1 サンプル 2 バイト、有効値は上位 10bit）で、ピッチを含む生データ。
+fn psnr_uv_10bit(
+    expected: &[u16],
+    decoded_uv: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
+    let rows = height / 2;
+    let samples = width * rows;
+    let mut mse_sum: f64 = 0.0;
+    for row in 0..rows {
+        for col in 0..width {
+            let offset = row * pitch + col * 2;
+            let decoded = u16::from_le_bytes([decoded_uv[offset], decoded_uv[offset + 1]]) >> 6;
+            let diff = expected[row * width + col] as f64 - decoded as f64;
+            mse_sum += diff * diff;
+        }
+    }
+    psnr_from_mse(mse_sum, samples, 1023.0)
 }
 
 /// 10bit の Y プレーン同士の PSNR を計算する（dB）
@@ -220,8 +329,11 @@ fn create_decoder(codec: VideoCodecType) -> DecoderAndReceiver {
 
 /// エンコードしてフレーム一覧とフレームごとのビットストリームを返すヘルパー
 fn encode(config: EncoderConfig, frames: &[Vec<u8>]) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
+    let format = config.frame_format;
+    let width = config.width as usize;
+    let height = config.height as usize;
     let (encoder, rx) = create_encoder(config);
-    encode_with_encoder(encoder, rx, frames)
+    encode_with_encoder(encoder, rx, frames, format, width, height)
 }
 
 /// 生成済みエンコーダでフレームをエンコードして結果を回収するヘルパー
@@ -229,6 +341,9 @@ fn encode_with_encoder(
     mut encoder: Encoder<FnEncodeHandler<usize>>,
     rx: mpsc::Receiver<Result<EncodedFrame<usize>, Error>>,
     frames: &[Vec<u8>],
+    format: FrameFormat,
+    width: usize,
+    height: usize,
 ) -> (Vec<EncodedFrame<usize>>, Vec<Vec<u8>>) {
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
@@ -236,7 +351,11 @@ fn encode_with_encoder(
 
     for (index, frame) in frames.iter().enumerate() {
         encoder
-            .encode(frame, index, &options)
+            .encode(
+                frame_data_from_buffer(format, width, height, frame),
+                index,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
     encoder.finish().expect("finish に失敗した");
@@ -281,8 +400,10 @@ fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedF
         FnDecodeHandler::new(move |result| {
             let info = result.map(|frame| {
                 let y_data = frame.y().to_vec();
+                let uv_data = frame.uv().to_vec();
                 DecodedFrameInfo {
                     y_data,
+                    uv_data,
                     pitch: frame.pitch(),
                     width: frame.width(),
                     height: frame.height(),
@@ -307,6 +428,10 @@ fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedF
             .expect("デコード結果コールバックの受信がタイムアウトした");
         let info = result.expect("デコードに失敗した");
         decoded_frames.push(info);
+    }
+
+    for (i, frame) in decoded_frames.iter().enumerate() {
+        assert_decoded_frame_layout(frame, &format!("デコード結果フレーム {i}"));
     }
 
     decoded_frames
@@ -369,6 +494,22 @@ fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
     encoder.coded_size()
 }
 
+/// coded サイズが表示サイズ以上で、16 の倍数であることを検証する
+fn assert_coded_size(coded: (usize, usize), width: usize, height: usize) {
+    assert!(
+        coded.0 >= width,
+        "coded 幅 {} が表示幅 {width} より小さい",
+        coded.0
+    );
+    assert!(
+        coded.1 >= height,
+        "coded 高さ {} が表示高さ {height} より小さい",
+        coded.1
+    );
+    assert_eq!(coded.0 % 16, 0, "coded 幅 {} が 16 の倍数でない", coded.0);
+    assert_eq!(coded.1 % 16, 0, "coded 高さ {} が 16 の倍数でない", coded.1);
+}
+
 /// H.264 CBR のテスト用エンコーダ設定を返す
 ///
 /// 320x240 / 30fps / 1Mbps / GOP 30 の共通設定を使うテストで利用する。
@@ -402,25 +543,29 @@ fn roundtrip_colorbar(
 ) {
     let width = encoder_config.width as usize;
     let height = encoder_config.height as usize;
-    let (coded_width, coded_height) = coded_size_for(&encoder_config);
 
-    let colorbar = generate_colorbar_nv12(width, height, coded_width, coded_height);
-    let colorbar_for_psnr = generate_colorbar_nv12(width, height, width, height);
+    let colorbar = generate_colorbar_nv12(width, height);
     let input_frames: Vec<Vec<u8>> = (0..num_frames).map(|_| colorbar.clone()).collect();
 
     let (_, decoded_frames) = roundtrip(encoder_config, decoder_codec, &input_frames);
 
+    let y_size = width * height;
     for (i, decoded) in decoded_frames.iter().enumerate() {
-        let psnr = psnr_y(
-            &colorbar_for_psnr,
-            &decoded.y_data,
+        let y_psnr = psnr_y(&colorbar, &decoded.y_data, decoded.pitch, width, height);
+        assert!(
+            y_psnr >= min_psnr_db,
+            "フレーム {i}: Y プレーンの PSNR {y_psnr:.1} dB が {min_psnr_db} dB 未満"
+        );
+        let uv_psnr = psnr_uv(
+            &colorbar[y_size..],
+            &decoded.uv_data,
             decoded.pitch,
             width,
             height,
         );
         assert!(
-            psnr >= min_psnr_db,
-            "フレーム {i}: PSNR {psnr:.1} dB が {min_psnr_db} dB 未満"
+            uv_psnr >= min_psnr_db,
+            "フレーム {i}: UV プレーンの PSNR {uv_psnr:.1} dB が {min_psnr_db} dB 未満"
         );
     }
 }
@@ -435,6 +580,9 @@ fn roundtrip_b_frames(
     decoder_codec: VideoCodecType,
     input_frames: &[Vec<u8>],
 ) -> Vec<DecodedFrameInfo> {
+    let width = encoder_config.width as usize;
+    let height = encoder_config.height as usize;
+    let format = encoder_config.frame_format;
     let num_frames = input_frames.len();
     assert!(
         num_frames >= 15,
@@ -447,7 +595,11 @@ fn roundtrip_b_frames(
     };
     for (index, frame) in input_frames.iter().enumerate() {
         encoder
-            .encode(frame, index, &options)
+            .encode(
+                frame_data_from_buffer(format, width, height, frame),
+                index,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
     encoder.finish().expect("finish に失敗した");
@@ -482,8 +634,10 @@ fn roundtrip_b_frames(
         FnDecodeHandler::new(move |result| {
             let info = result.map(|frame| {
                 let y_data = frame.y().to_vec();
+                let uv_data = frame.uv().to_vec();
                 DecodedFrameInfo {
                     y_data,
+                    uv_data,
                     pitch: frame.pitch(),
                     width: frame.width(),
                     height: frame.height(),
@@ -512,6 +666,21 @@ fn roundtrip_b_frames(
         decoded_frames.push(result.expect("デコードに失敗した"));
     }
 
+    for (i, frame) in decoded_frames.iter().enumerate() {
+        assert_eq!(
+            frame.width, width,
+            "B フレームテストのデコード結果フレーム {i} の width が不一致"
+        );
+        assert_eq!(
+            frame.height, height,
+            "B フレームテストのデコード結果フレーム {i} の height が不一致"
+        );
+        assert_decoded_frame_layout(
+            frame,
+            &format!("B フレームテストのデコード結果フレーム {i}"),
+        );
+    }
+
     decoded_frames
 }
 
@@ -523,8 +692,8 @@ fn roundtrip_b_frames(
 /// もって直接検証する。これにより B フレームの表示順並び替えがあっても user_data が
 /// 正しい入力フレームに対応付くことを確認できる。
 ///
-/// `input_frames_for_psnr` は PSNR 計算用に `width` 幅ストライドで生成した入力フレーム
-/// （`generate_dummy_nv12(width, height, width, height, i)`）を渡すこと。
+/// `input_frames_for_psnr` は PSNR 計算用に表示サイズの入力フレーム
+/// (`generate_dummy_nv12(width, height, i)`) を渡すこと。
 fn assert_user_data_matches_input(
     decoded_frames: &[DecodedFrameInfo],
     input_frames_for_psnr: &[Vec<u8>],
@@ -639,12 +808,11 @@ fn test_roundtrip_h264_force_idr() {
         }),
     )
     .expect("エンコーダの生成に失敗した");
-    let (coded_width, coded_height) = encoder.coded_size();
     let mut encoded_frames = Vec::new();
     let mut bitstreams: Vec<Vec<u8>> = Vec::new();
 
     for i in 0..15 {
-        let frame_data = generate_dummy_nv12(width, height, coded_width, coded_height, i);
+        let frame_data = generate_dummy_nv12(width, height, i);
         let options = if i == 10 {
             EncodeOptions {
                 frame_type: frame_type::IDR | frame_type::I | frame_type::REF,
@@ -655,7 +823,11 @@ fn test_roundtrip_h264_force_idr() {
             }
         };
         encoder
-            .encode(&frame_data, i, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, width, height, &frame_data),
+                i,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
     encoder.finish().expect("finish に失敗した");
@@ -724,33 +896,31 @@ fn test_roundtrip_h264_b_frame_user_data() {
     let num_frames = 15;
     let width = config.width as usize;
     let height = config.height as usize;
-    let (coded_width, coded_height) = coded_size_for(&config);
     let input_frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
-        .collect();
-    // PSNR 計算用は width 幅ストライドの入力フレームで生成する
-    let input_for_psnr: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_nv12(width, height, width, height, i))
+        .map(|i| generate_dummy_nv12(width, height, i))
         .collect();
 
     let decoded_frames = roundtrip_b_frames(config, VideoCodecType::H264, &input_frames);
 
-    assert_user_data_matches_input(&decoded_frames, &input_for_psnr, width, height);
+    assert_user_data_matches_input(&decoded_frames, &input_frames, width, height);
 }
 
 /// encode に渡した user_data が callback で回収できることを確認する
 #[test]
 fn test_encode_user_data_callback() {
     let (mut encoder, rx) = create_encoder(h264_test_config());
-    let (coded_width, coded_height) = encoder.coded_size();
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
     };
 
     for i in 0..8 {
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        let frame_data = generate_dummy_nv12(320, 240, i);
         encoder
-            .encode(&frame_data, i, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+                i,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
     encoder.finish().expect("finish に失敗した");
@@ -780,10 +950,9 @@ fn test_decode_user_data_callback() {
     let config = h264_test_config();
     let width = config.width as usize;
     let height = config.height as usize;
-    let (coded_width, coded_height) = coded_size_for(&config);
     let num_frames = 8;
     let input_frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
+        .map(|i| generate_dummy_nv12(width, height, i))
         .collect();
     let (_, bitstreams) = encode(config, &input_frames);
 
@@ -843,14 +1012,17 @@ fn test_drop_cancels_pending_callbacks() {
             }),
         )
         .expect("エンコーダの生成に失敗した");
-        let (coded_width, coded_height) = encoder.coded_size();
         let options = EncodeOptions {
             frame_type: frame_type::UNKNOWN,
         };
 
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, 0);
+        let frame_data = generate_dummy_nv12(320, 240, 0);
         encoder
-            .encode(&frame_data, 0, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+                0,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
 
@@ -905,7 +1077,6 @@ fn test_reconfigure_drains_pending_frames() {
         }),
     )
     .expect("エンコーダの生成に失敗した");
-    let (coded_width, coded_height) = encoder.coded_size();
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
     };
@@ -913,9 +1084,13 @@ fn test_reconfigure_drains_pending_frames() {
     let after_count = 8;
 
     for i in 0..before_count {
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        let frame_data = generate_dummy_nv12(320, 240, i);
         encoder
-            .encode(&frame_data, i, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+                i,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
 
@@ -940,9 +1115,13 @@ fn test_reconfigure_drains_pending_frames() {
     );
 
     for i in before_count..before_count + after_count {
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        let frame_data = generate_dummy_nv12(320, 240, i);
         encoder
-            .encode(&frame_data, i, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+                i,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
 
@@ -1052,18 +1231,13 @@ fn test_roundtrip_hevc_b_frame_user_data() {
     let num_frames = 15;
     let width = config.width as usize;
     let height = config.height as usize;
-    let (coded_width, coded_height) = coded_size_for(&config);
     let input_frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
-        .collect();
-    // PSNR 計算用は width 幅ストライドの入力フレームで生成する
-    let input_for_psnr: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_nv12(width, height, width, height, i))
+        .map(|i| generate_dummy_nv12(width, height, i))
         .collect();
 
     let decoded_frames = roundtrip_b_frames(config, VideoCodecType::Hevc, &input_frames);
 
-    assert_user_data_matches_input(&decoded_frames, &input_for_psnr, width, height);
+    assert_user_data_matches_input(&decoded_frames, &input_frames, width, height);
 }
 
 // --- AV1 ---
@@ -1114,49 +1288,68 @@ fn test_roundtrip_av1_cqp() {
 
 // ---------------------------------------------------------------------------
 // 各フレームフォーマットのダミーデータ生成ヘルパー
+//
+// 各生成関数は表示サイズのバッファを返す。
 // ---------------------------------------------------------------------------
 
 /// ダミー YUY2 フレームを生成する
 ///
-/// Packed YUV 4:2:2: YUYV の繰り返し（2 ピクセルで 4 バイト）
-fn generate_dummy_yuy2(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    frame_index: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
-    let mut data = vec![0u8; coded_width * coded_height * 2];
+/// Packed YUV 4:2:2: YUYV の繰り返し（2 ピクセルで 4 バイト）。
+fn generate_dummy_yuy2(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let mut data = vec![0u8; width * height * 2];
     for y in 0..height {
         for x in (0..width).step_by(2) {
-            let offset = (y * coded_width + x) * 2;
+            let offset = (y * width + x) * 2;
             let y0 = ((x + y + frame_index * 7) % 256) as u8;
             let y1 = ((x + 1 + y + frame_index * 7) % 256) as u8;
+            let u = ((x / 2 + y * 3 + frame_index * 5) % 256) as u8;
+            let v = ((x / 2 + y * 5 + 64 + frame_index * 11) % 256) as u8;
             data[offset] = y0; // Y0
-            data[offset + 1] = 128; // U
+            data[offset + 1] = u; // U
             data[offset + 2] = y1; // Y1
-            data[offset + 3] = 128; // V
+            data[offset + 3] = v; // V
         }
     }
     data
+}
+
+/// YUY2 の密なフレームから NV12 相当の UV プレーンを構築する
+fn yuy2_uv_plane(data: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let row_bytes = width * 2;
+    let mut uv = vec![0u8; width * (height / 2)];
+    for row in 0..height / 2 {
+        for pair in 0..width / 2 {
+            let src = (row * 2) * row_bytes + pair * 4;
+            let dst = row * width + pair * 2;
+            uv[dst] = data[src + 1];
+            uv[dst + 1] = data[src + 3];
+        }
+    }
+    uv
+}
+
+/// P010 の密なフレームから UV プレーンの 10bit 値を取り出す
+fn p010_uv_values(data: &[u8], width: usize, height: usize) -> Vec<u16> {
+    let row_bytes = width * 2;
+    let y_size = row_bytes * height;
+    let mut values = Vec::with_capacity(width * (height / 2));
+    for row in 0..height / 2 {
+        for col in 0..width {
+            let offset = y_size + row * row_bytes + col * 2;
+            values.push(u16::from_le_bytes([data[offset], data[offset + 1]]) >> 6);
+        }
+    }
+    values
 }
 
 /// ダミー P010 フレームを生成する
 ///
 /// 1 サンプル 2 バイトで、10bit の値は 16bit ワードの上位ビットに格納する。
 /// Y プレーンはフレーム番号に応じたグラデーション、UV プレーンは 10bit の中間値 (512) 固定。
-fn generate_dummy_p010(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    frame_index: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
-    let row_bytes = coded_width * 2;
-    let y_size = row_bytes * coded_height;
-    let uv_height = coded_height.div_ceil(2);
+fn generate_dummy_p010(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let row_bytes = width * 2;
+    let y_size = row_bytes * height;
+    let uv_height = height / 2;
     let mut data = vec![0u8; y_size + row_bytes * uv_height];
     for y in 0..height {
         for x in 0..width {
@@ -1166,12 +1359,14 @@ fn generate_dummy_p010(
         }
     }
     // UV は 2 画素につき 1 組をインターリーブする (NV12 と同じ並び)
-    let uv = (512u16 << 6).to_le_bytes();
     for row in 0..uv_height {
-        for x in (0..coded_width).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let pair = x / 2;
+            let u = 64 + ((pair + row * 7) % 900) as u16;
+            let v = 64 + ((pair + row * 11 + 300) % 900) as u16;
             let offset = y_size + row * row_bytes + x * 2;
-            data[offset..offset + 2].copy_from_slice(&uv);
-            data[offset + 2..offset + 4].copy_from_slice(&uv);
+            data[offset..offset + 2].copy_from_slice(&(u << 6).to_le_bytes());
+            data[offset + 2..offset + 4].copy_from_slice(&(v << 6).to_le_bytes());
         }
     }
     data
@@ -1181,18 +1376,11 @@ fn generate_dummy_p010(
 ///
 /// 1 画素を 4 バイト (V, U, Y, A) で格納する。
 /// Y はフレーム番号に応じたグラデーション、U/V は中間値、A は最大値。
-fn generate_dummy_ayuv(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    frame_index: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
-    let mut data = vec![0u8; coded_width * coded_height * 4];
+fn generate_dummy_ayuv(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let mut data = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {
-            let offset = (y * coded_width + x) * 4;
+            let offset = (y * width + x) * 4;
             data[offset] = 128; // V
             data[offset + 1] = 128; // U
             data[offset + 2] = (16 + (x + y + frame_index * 7) % 220) as u8; // Y
@@ -1207,18 +1395,11 @@ fn generate_dummy_ayuv(
 /// 1 画素を 4 バイトの 32bit ワードで格納する。
 /// ワードの下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit) の順に入れる。
 /// Y はフレーム番号に応じたグラデーション、U/V は 10bit の中間値 (512)、A は最大値。
-fn generate_dummy_y410(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    frame_index: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
-    let mut data = vec![0u8; coded_width * coded_height * 4];
+fn generate_dummy_y410(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let mut data = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {
-            let offset = (y * coded_width + x) * 4;
+            let offset = (y * width + x) * 4;
             let luma = (64 + (x + y + frame_index * 7) % 900) as u32;
             let word = 512u32 | (luma << 10) | (512u32 << 20) | (3u32 << 30);
             data[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
@@ -1228,18 +1409,11 @@ fn generate_dummy_y410(
 }
 
 /// ダミー BGRA フレームを生成する
-fn generate_dummy_bgra(
-    width: usize,
-    height: usize,
-    coded_width: usize,
-    coded_height: usize,
-    frame_index: usize,
-) -> Vec<u8> {
-    assert_frame_dimensions(width, height, coded_width, coded_height);
-    let mut data = vec![0u8; coded_width * coded_height * 4];
+fn generate_dummy_bgra(width: usize, height: usize, frame_index: usize) -> Vec<u8> {
+    let mut data = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {
-            let offset = (y * coded_width + x) * 4;
+            let offset = (y * width + x) * 4;
             let v = ((x + y + frame_index * 7) % 256) as u8;
             data[offset] = v; // B
             data[offset + 1] = v; // G
@@ -1255,29 +1429,15 @@ fn generate_dummy_frame(
     format: FrameFormat,
     width: usize,
     height: usize,
-    coded_width: usize,
-    coded_height: usize,
     frame_index: usize,
 ) -> Vec<u8> {
     match format {
-        FrameFormat::Nv12 => {
-            generate_dummy_nv12(width, height, coded_width, coded_height, frame_index)
-        }
-        FrameFormat::Yuy2 => {
-            generate_dummy_yuy2(width, height, coded_width, coded_height, frame_index)
-        }
-        FrameFormat::Bgra => {
-            generate_dummy_bgra(width, height, coded_width, coded_height, frame_index)
-        }
-        FrameFormat::P010 => {
-            generate_dummy_p010(width, height, coded_width, coded_height, frame_index)
-        }
-        FrameFormat::Ayuv => {
-            generate_dummy_ayuv(width, height, coded_width, coded_height, frame_index)
-        }
-        FrameFormat::Y410 => {
-            generate_dummy_y410(width, height, coded_width, coded_height, frame_index)
-        }
+        FrameFormat::Nv12 => generate_dummy_nv12(width, height, frame_index),
+        FrameFormat::Yuy2 => generate_dummy_yuy2(width, height, frame_index),
+        FrameFormat::Bgra => generate_dummy_bgra(width, height, frame_index),
+        FrameFormat::P010 => generate_dummy_p010(width, height, frame_index),
+        FrameFormat::Ayuv => generate_dummy_ayuv(width, height, frame_index),
+        FrameFormat::Y410 => generate_dummy_y410(width, height, frame_index),
     }
 }
 
@@ -1315,25 +1475,16 @@ fn roundtrip_format_with_size(
     );
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
-    let (coded_width, coded_height) = coded_size_for(&config);
+
+    let coded = coded_size_for(&config);
+    assert_coded_size(coded, width as usize, height as usize);
 
     let input_frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| {
-            generate_dummy_frame(
-                format,
-                width as usize,
-                height as usize,
-                coded_width,
-                coded_height,
-                i,
-            )
-        })
+        .map(|i| generate_dummy_frame(format, width as usize, height as usize, i))
         .collect();
 
-    // フレームサイズが FrameFormat::frame_size() と一致することを確認する
-    let expected_size = format
-        .frame_size(coded_width, coded_height)
-        .expect("フレームサイズ計算がオーバーフローした");
+    // フレームサイズが表示サイズのバイト数と一致することを確認する
+    let expected_size = frame_buffer_size(format, width as usize, height as usize);
     for (i, frame) in input_frames.iter().enumerate() {
         assert_eq!(
             frame.len(),
@@ -1454,19 +1605,9 @@ fn test_roundtrip_hevc_ayuv_luma() {
     );
     config.qpi = Some(10);
     config.gop_pic_size = Some(30);
-    let (coded_width, coded_height) = coded_size_for(&config);
 
     let frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| {
-            generate_dummy_frame(
-                FrameFormat::Ayuv,
-                width,
-                height,
-                coded_width,
-                coded_height,
-                i,
-            )
-        })
+        .map(|i| generate_dummy_frame(FrameFormat::Ayuv, width, height, i))
         .collect();
     let (_, decoded) = roundtrip(config, codec, &frames);
 
@@ -1513,10 +1654,9 @@ fn assert_10bit_luma_roundtrip(
     );
     config.qpi = Some(10);
     config.gop_pic_size = Some(30);
-    let (coded_width, coded_height) = coded_size_for(&config);
 
     let frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_frame(format, width, height, coded_width, coded_height, i))
+        .map(|i| generate_dummy_frame(format, width, height, i))
         .collect();
     let (_, decoded) = roundtrip(config, codec, &frames);
 
@@ -1852,10 +1992,136 @@ fn test_roundtrip_h264_nv12_alignment_mismatch() {
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
     let (coded_width, coded_height) = coded_size_for(&config);
+    assert_coded_size(
+        (coded_width, coded_height),
+        config.width as usize,
+        config.height as usize,
+    );
     assert_ne!(coded_width, config.width as usize);
     assert_ne!(coded_height, config.height as usize);
 
     roundtrip_colorbar(config, VideoCodecType::H264, 10, 25.0);
+}
+
+/// HEVC 入力で crop と coded のサイズが異なるケースのラウンドトリップ
+#[test]
+fn test_roundtrip_hevc_nv12_alignment_mismatch() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Nv12) {
+        return;
+    }
+    roundtrip_format_with_size(
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        }),
+        codec,
+        FrameFormat::Nv12,
+        5,
+        318,
+        238,
+    );
+}
+
+/// AV1 入力で crop と coded のサイズが異なるケースのラウンドトリップ
+#[test]
+fn test_roundtrip_av1_nv12_alignment_mismatch() {
+    let codec = VideoCodecType::Av1;
+    let profile = VideoProfile::Av1(Av1Profile::Main);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Nv12) {
+        return;
+    }
+    roundtrip_format_with_size(
+        CodecConfig::Av1(Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        }),
+        codec,
+        FrameFormat::Nv12,
+        5,
+        318,
+        238,
+    );
+}
+
+/// VP9 入力で crop と coded のサイズが異なるケースのラウンドトリップ
+#[test]
+fn test_roundtrip_vp9_nv12_alignment_mismatch() {
+    let codec = VideoCodecType::Vp9;
+    let profile = VideoProfile::Vp9(Vp9Profile::Profile0);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Nv12) {
+        return;
+    }
+    roundtrip_format_with_size(
+        CodecConfig::Vp9(Vp9EncoderConfig {
+            profile: Some(Vp9Profile::Profile0),
+            write_ivf_headers: false,
+        }),
+        codec,
+        FrameFormat::Nv12,
+        5,
+        318,
+        238,
+    );
+}
+
+/// P010 入力で crop と coded のサイズが異なるケースのラウンドトリップ
+#[test]
+fn test_roundtrip_hevc_main10_p010_alignment_mismatch() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main10);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::P010) {
+        return;
+    }
+    roundtrip_format_with_size(
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        codec,
+        FrameFormat::P010,
+        5,
+        318,
+        238,
+    );
+}
+
+/// AYUV 入力で crop と coded のサイズが異なるケースのラウンドトリップ
+#[test]
+fn test_roundtrip_h264_ayuv_alignment_mismatch() {
+    let codec = VideoCodecType::H264;
+    let profile = VideoProfile::H264(H264Profile::High);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
+        return;
+    }
+    roundtrip_format_with_size(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        codec,
+        FrameFormat::Ayuv,
+        5,
+        318,
+        238,
+    );
+}
+
+/// Y410 入力で crop と coded のサイズが異なるケースのラウンドトリップ
+#[test]
+fn test_roundtrip_hevc_main10_y410_alignment_mismatch() {
+    let codec = VideoCodecType::Hevc;
+    let profile = VideoProfile::Hevc(HevcProfile::Main10);
+    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Y410) {
+        return;
+    }
+    roundtrip_format_with_size(
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        codec,
+        FrameFormat::Y410,
+        5,
+        318,
+        238,
+    );
 }
 
 /// BGRA 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
@@ -1870,6 +2136,701 @@ fn test_roundtrip_h264_bgra_alignment_mismatch() {
         10,
         318,
         238,
+    );
+}
+
+/// YUY2 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
+#[test]
+fn test_roundtrip_h264_yuy2_alignment_mismatch() {
+    roundtrip_format_with_size(
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        VideoCodecType::H264,
+        FrameFormat::Yuy2,
+        10,
+        318,
+        238,
+    );
+}
+
+/// 1920x1080 (coded 1920x1088) の表示サイズ入力で H.264 ラウンドトリップできること
+///
+/// coded サイズとの差が高さだけにある一般的な解像度でも、表示サイズの
+/// バッファを受け付けることを確認する。
+#[test]
+fn test_roundtrip_h264_nv12_1920x1080() {
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        1920,
+        1080,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(5000);
+    config.gop_pic_size = Some(30);
+
+    let (coded_width, coded_height) = coded_size_for(&config);
+    assert_coded_size(
+        (coded_width, coded_height),
+        config.width as usize,
+        config.height as usize,
+    );
+    assert_eq!(coded_width, config.width as usize);
+    assert_ne!(coded_height, config.height as usize);
+
+    roundtrip_colorbar(config, VideoCodecType::H264, 2, 25.0);
+}
+
+/// NV12 / P010 の奇数サイズはエンコーダーが拒否すること
+#[test]
+fn test_encoder_rejects_odd_nv12_and_p010_dimensions() {
+    for format in [FrameFormat::Nv12, FrameFormat::P010] {
+        for (width, height, expected) in [(319, 238, "even width"), (318, 239, "even height")] {
+            let config = EncoderConfig::new(
+                test_adapter(),
+                CodecConfig::H264(H264EncoderConfig {
+                    profile: Some(H264Profile::High),
+                }),
+                width,
+                height,
+                format,
+                30,
+                1,
+                RateControlMode::Cbr,
+            );
+            let error = Encoder::new(
+                config,
+                FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+            )
+            .err()
+            .expect("奇数サイズは拒否されること");
+            assert_eq!(error.function(), "Encoder::new");
+            assert!(
+                error.to_string().contains(expected),
+                "エラーメッセージに {expected} が含まれること: {error}"
+            );
+        }
+    }
+}
+
+/// YUY2 の奇数幅はエンコーダーが拒否すること
+#[test]
+fn test_encoder_rejects_odd_yuy2_width() {
+    let config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        319,
+        240,
+        FrameFormat::Yuy2,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    let error = Encoder::new(
+        config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )
+    .err()
+    .expect("奇数幅の YUY2 は拒否されること");
+    assert_eq!(error.function(), "Encoder::new");
+    assert!(
+        error.to_string().contains("even width"),
+        "エラーメッセージに even width が含まれること: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// エンコーダーの入力検証
+// ---------------------------------------------------------------------------
+
+/// `Encoder::get_video_param` が Init 後の実効フレーム情報を返すこと
+#[test]
+fn test_encoder_get_video_param_reports_effective_frame_info() {
+    let width = 318usize;
+    let height = 238usize;
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    let (encoder, _rx) = create_encoder(config);
+    let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+    let frame_info = unsafe { param.param.__bindgen_anon_1.mfx.FrameInfo };
+    let crop = unsafe { frame_info.__bindgen_anon_1.__bindgen_anon_1 };
+    assert_eq!(crop.CropX, 0, "CropX が 0 であること");
+    assert_eq!(crop.CropY, 0, "CropY が 0 であること");
+    assert_eq!(crop.CropW, width as u16, "CropW が表示幅と一致すること");
+    assert_eq!(crop.CropH, height as u16, "CropH が表示高さと一致すること");
+    assert_eq!(crop.Width, 320, "Width が coded 幅と一致すること");
+    assert_eq!(crop.Height, 240, "Height が coded 高さと一致すること");
+    assert_eq!(
+        frame_info.FourCC,
+        ffi::MFX_FOURCC_NV12,
+        "FourCC が NV12 であること"
+    );
+    assert_eq!(
+        frame_info.ChromaFormat,
+        ffi::MFX_CHROMAFORMAT_YUV420 as u16,
+        "ChromaFormat が 4:2:0 であること"
+    );
+    assert_eq!(frame_info.BitDepthLuma, 8, "BitDepthLuma が 8 であること");
+    assert_eq!(
+        frame_info.BitDepthChroma, 8,
+        "BitDepthChroma が 8 であること"
+    );
+    assert_eq!(frame_info.Shift, 0, "Shift が 0 であること");
+}
+
+/// 表示サイズのフレームデータを受け付け、不正な入力を拒否すること
+#[test]
+fn test_encode_accepts_frame_data_and_rejects_invalid() {
+    let width = 318usize;
+    let height = 238usize;
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    let (mut encoder, rx) = create_encoder(config);
+    let (coded_width, coded_height) = encoder.coded_size();
+    assert_coded_size((coded_width, coded_height), width, height);
+    assert_ne!(coded_width, width, "coded 幅が表示幅と異なること");
+    assert_ne!(coded_height, height, "coded 高さが表示高さと異なること");
+
+    let frame_data = generate_dummy_nv12(width, height, 0);
+    let expected = frame_buffer_size(FrameFormat::Nv12, width, height);
+    let coded_expected = frame_buffer_size(FrameFormat::Nv12, coded_width, coded_height);
+    assert_eq!(
+        frame_data.len(),
+        expected,
+        "入力フレームは表示サイズのバイト数であること"
+    );
+    assert!(
+        expected < coded_expected,
+        "表示サイズのバッファが coded サイズのバッファより小さいこと"
+    );
+
+    let row_bytes = FrameFormat::Nv12
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    let FrameData::SemiPlanar {
+        y,
+        y_pitch,
+        uv,
+        uv_pitch,
+    } = frame_data_from_buffer(FrameFormat::Nv12, width, height, &frame_data)
+    else {
+        panic!("NV12 の入力は SemiPlanar であること");
+    };
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+
+    // pitch が 1 行のバイト数未満の入力は拒否される
+    let error = encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y,
+                y_pitch: row_bytes - 1,
+                uv,
+                uv_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect_err("pitch 不足の入力は拒否されること");
+    assert!(
+        error.to_string().contains("Y plane pitch"),
+        "pitch 不足のエラーメッセージが返ること: {error}"
+    );
+
+    // データ長が 1 バイト足りない入力は拒否される
+    let error = encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y: &y[..y.len() - 1],
+                y_pitch,
+                uv,
+                uv_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect_err("データ長不足の入力は拒否されること");
+    assert!(
+        error.to_string().contains("Y plane data is too small"),
+        "データ長不足のエラーメッセージが返ること: {error}"
+    );
+
+    // UV の pitch が 1 行のバイト数未満の入力は拒否される
+    let error = encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y,
+                y_pitch,
+                uv,
+                uv_pitch: row_bytes - 1,
+            },
+            0,
+            &options,
+        )
+        .expect_err("UV の pitch 不足の入力は拒否されること");
+    assert!(
+        error.to_string().contains("UV plane pitch"),
+        "UV の pitch 不足のエラーメッセージが返ること: {error}"
+    );
+
+    // UV のデータ長が 1 バイト足りない入力は拒否される
+    let error = encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y,
+                y_pitch,
+                uv: &uv[..uv.len() - 1],
+                uv_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect_err("UV のデータ長不足の入力は拒否されること");
+    assert!(
+        error.to_string().contains("UV plane data is too small"),
+        "UV のデータ長不足のエラーメッセージが返ること: {error}"
+    );
+
+    // ピッチが巨大でプレーンの必要サイズがオーバーフローする入力は拒否される
+    let error = encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y,
+                y_pitch: usize::MAX,
+                uv,
+                uv_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect_err("必要サイズがオーバーフローする入力は拒否されること");
+    assert!(
+        error
+            .to_string()
+            .contains("Y plane size calculation overflowed"),
+        "必要サイズのオーバーフローのエラーメッセージが返ること: {error}"
+    );
+
+    // 形式と variant が一致しない入力は拒否される
+    let error = encoder
+        .encode(
+            FrameData::Packed {
+                data: y,
+                pitch: y_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect_err("形式と variant が一致しない入力は拒否されること");
+    assert!(
+        error.to_string().contains("does not match"),
+        "variant 不一致のエラーメッセージが返ること: {error}"
+    );
+
+    // 正しい表示サイズの入力は受理される
+    encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y,
+                y_pitch,
+                uv,
+                uv_pitch,
+            },
+            1,
+            &options,
+        )
+        .expect("表示サイズのバッファは受理されること");
+    encoder.finish().expect("finish に失敗した");
+    let encoded = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("エンコード結果コールバックの受信がタイムアウトした")
+        .expect("エンコードに失敗した");
+    assert_eq!(
+        *encoded.user_data(),
+        1,
+        "受理したフレームの user_data が返ること"
+    );
+}
+
+/// パック形式の入力でピッチが 1 行のバイト数未満なら拒否すること
+#[test]
+fn test_encode_rejects_packed_pitch_short() {
+    let width = 318usize;
+    let height = 240usize;
+    let config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Yuy2,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    let (mut encoder, _rx) = create_encoder(config);
+    let frame = generate_dummy_yuy2(width, height, 0);
+    let row_bytes = FrameFormat::Yuy2
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    let error = encoder
+        .encode(
+            FrameData::Packed {
+                data: &frame,
+                pitch: row_bytes - 1,
+            },
+            0,
+            &options,
+        )
+        .expect_err("パック形式の pitch 不足の入力は拒否されること");
+    assert!(
+        error.to_string().contains("packed frame plane pitch"),
+        "パック形式の pitch 不足のエラーメッセージが返ること: {error}"
+    );
+}
+
+/// NV12 の入力でピッチが表示幅より大きいバッファをエンコードできること
+#[test]
+fn test_encode_accepts_strided_nv12() {
+    let width = 318usize;
+    let height = 238usize;
+    let y_pitch = 384usize;
+    let uv_pitch = 400usize;
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    let colorbar = generate_colorbar_nv12(width, height);
+    let row_bytes = FrameFormat::Nv12
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    let y_size = row_bytes * height;
+    let y = pad_plane(&colorbar[..y_size], row_bytes, height, y_pitch);
+    let uv = pad_plane(&colorbar[y_size..], row_bytes, height / 2, uv_pitch);
+
+    let (mut encoder, rx) = create_encoder(config);
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y: &y,
+                y_pitch,
+                uv: &uv,
+                uv_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect("エンコードに失敗した");
+    encoder.finish().expect("finish に失敗した");
+
+    let encoded = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("エンコード結果コールバックの受信がタイムアウトした")
+        .expect("エンコードに失敗した");
+    let decoded = decode(VideoCodecType::H264, &[encoded.data().to_vec()]);
+    assert_eq!(decoded.len(), 1, "デコード結果が 1 フレームであること");
+    let frame = &decoded[0];
+    assert_eq!(
+        frame.width, width,
+        "デコード結果の width が表示幅と一致すること"
+    );
+    assert_eq!(
+        frame.height, height,
+        "デコード結果の height が表示高さと一致すること"
+    );
+    let y_psnr = psnr_y(&colorbar, &frame.y_data, frame.pitch, width, height);
+    assert!(
+        y_psnr >= 25.0,
+        "ピッチ付き NV12 入力の Y プレーン PSNR が低すぎる: {y_psnr:.1} dB"
+    );
+    let uv_psnr = psnr_uv(
+        &colorbar[y_size..],
+        &frame.uv_data,
+        frame.pitch,
+        width,
+        height,
+    );
+    assert!(
+        uv_psnr >= 25.0,
+        "ピッチ付き NV12 入力の UV プレーン PSNR が低すぎる: {uv_psnr:.1} dB"
+    );
+}
+
+/// YUY2 の入力でピッチが表示幅より大きいバッファをエンコードできること
+#[test]
+fn test_encode_accepts_strided_yuy2() {
+    let width = 318usize;
+    let height = 238usize;
+    let pitch = 640usize;
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Yuy2,
+        30,
+        1,
+        RateControlMode::Cqp,
+    );
+    config.qpi = Some(10);
+    config.qpp = Some(10);
+    config.qpb = Some(10);
+    config.gop_pic_size = Some(30);
+
+    let data = generate_dummy_yuy2(width, height, 0);
+    let row_bytes = FrameFormat::Yuy2
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    let padded = pad_plane(&data, row_bytes, height, pitch);
+
+    let (mut encoder, rx) = create_encoder(config);
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    encoder
+        .encode(
+            FrameData::Packed {
+                data: &padded,
+                pitch,
+            },
+            0,
+            &options,
+        )
+        .expect("エンコードに失敗した");
+    encoder.finish().expect("finish に失敗した");
+
+    let encoded = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("エンコード結果コールバックの受信がタイムアウトした")
+        .expect("エンコードに失敗した");
+    let decoded = decode(VideoCodecType::H264, &[encoded.data().to_vec()]);
+    assert_eq!(decoded.len(), 1, "デコード結果が 1 フレームであること");
+    let frame = &decoded[0];
+    assert_eq!(
+        frame.width, width,
+        "デコード結果の width が表示幅と一致すること"
+    );
+    assert_eq!(
+        frame.height, height,
+        "デコード結果の height が表示高さと一致すること"
+    );
+
+    let expected_y: Vec<u8> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| ((x + y) % 256) as u8))
+        .collect();
+    let y_psnr = psnr_y(&expected_y, &frame.y_data, frame.pitch, width, height);
+    assert!(
+        y_psnr >= 25.0,
+        "ピッチ付き YUY2 入力の Y プレーン PSNR が低すぎる: {y_psnr:.1} dB"
+    );
+    let expected_uv = yuy2_uv_plane(&data, width, height);
+    let uv_psnr = psnr_uv(&expected_uv, &frame.uv_data, frame.pitch, width, height);
+    assert!(
+        uv_psnr >= 20.0,
+        "ピッチ付き YUY2 入力の UV プレーン PSNR が低すぎる: {uv_psnr:.1} dB"
+    );
+}
+
+/// デコード結果の Y/UV プレーンをそのまま `FrameData` に渡して再エンコードできること
+#[test]
+fn test_encode_decoded_frame_planes_directly() {
+    let width = 318usize;
+    let height = 238usize;
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+
+    let colorbar = generate_colorbar_nv12(width, height);
+    let (_, decoded_frames) = roundtrip(config.clone(), VideoCodecType::H264, &[colorbar]);
+    let decoded = &decoded_frames[0];
+
+    let (mut encoder, rx) = create_encoder(config);
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y: &decoded.y_data,
+                y_pitch: decoded.pitch,
+                uv: &decoded.uv_data,
+                uv_pitch: decoded.pitch,
+            },
+            0,
+            &options,
+        )
+        .expect("デコード結果のプレーンを直接エンコードできない");
+    encoder.finish().expect("finish に失敗した");
+
+    let encoded = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("エンコード結果コールバックの受信がタイムアウトした")
+        .expect("エンコードに失敗した");
+    let redecode = decode(VideoCodecType::H264, &[encoded.data().to_vec()]);
+    assert_eq!(
+        redecode.len(),
+        1,
+        "再エンコード後のデコード結果が 1 フレームであること"
+    );
+    assert_eq!(redecode[0].width, width, "再エンコード後の width が不一致");
+    assert_eq!(
+        redecode[0].height, height,
+        "再エンコード後の height が不一致"
+    );
+}
+
+/// P010 の入力で Y/UV のピッチが表示サイズより大きいバッファをエンコードできること
+#[test]
+fn test_encode_accepts_strided_p010() {
+    let width = 318usize;
+    let height = 238usize;
+    let y_pitch = 640usize;
+    let uv_pitch = 672usize;
+    if skip_if_encoder_format_unsupported(
+        VideoCodecType::Hevc,
+        VideoProfile::Hevc(HevcProfile::Main10),
+        FrameFormat::P010,
+    ) {
+        return;
+    }
+
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        }),
+        width as u32,
+        height as u32,
+        FrameFormat::P010,
+        30,
+        1,
+        RateControlMode::Cqp,
+    );
+    config.qpi = Some(10);
+    config.gop_pic_size = Some(30);
+
+    let p010 = generate_dummy_p010(width, height, 0);
+    let row_bytes = FrameFormat::P010
+        .bytes_per_row(width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    let y_size = row_bytes * height;
+    let y = pad_plane(&p010[..y_size], row_bytes, height, y_pitch);
+    let uv = pad_plane(&p010[y_size..], row_bytes, height / 2, uv_pitch);
+
+    let (mut encoder, rx) = create_encoder(config);
+    let options = EncodeOptions {
+        frame_type: frame_type::UNKNOWN,
+    };
+    encoder
+        .encode(
+            FrameData::SemiPlanar {
+                y: &y,
+                y_pitch,
+                uv: &uv,
+                uv_pitch,
+            },
+            0,
+            &options,
+        )
+        .expect("エンコードに失敗した");
+    encoder.finish().expect("finish に失敗した");
+
+    let encoded = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("エンコード結果コールバックの受信がタイムアウトした")
+        .expect("エンコードに失敗した");
+    let decoded = decode(VideoCodecType::Hevc, &[encoded.data().to_vec()]);
+    assert_eq!(decoded.len(), 1, "デコード結果が 1 フレームであること");
+    let frame = &decoded[0];
+    assert_eq!(
+        frame.width, width,
+        "デコード結果の width が表示幅と一致すること"
+    );
+    assert_eq!(
+        frame.height, height,
+        "デコード結果の height が表示高さと一致すること"
+    );
+
+    let expected_y: Vec<u16> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (64 + (x + y) % 900) as u16))
+        .collect();
+    let y_psnr = psnr_y_10bit(&expected_y, &frame.y_data, frame.pitch, width, height);
+    assert!(
+        y_psnr >= TEN_BIT_LUMA_PSNR_MIN_DB,
+        "ピッチ付き P010 入力の Y プレーン PSNR が低すぎる: {y_psnr:.1} dB"
+    );
+
+    let expected_uv = p010_uv_values(&p010, width, height);
+    let uv_psnr = psnr_uv_10bit(&expected_uv, &frame.uv_data, frame.pitch, width, height);
+    assert!(
+        uv_psnr >= 30.0,
+        "ピッチ付き P010 入力の UV プレーン PSNR が低すぎる: {uv_psnr:.1} dB"
     );
 }
 
@@ -1921,7 +2882,7 @@ fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
 
-    // getter 検証・coded_size 取得・エンコードに同じエンコーダを使い回す
+    // getter 検証とエンコードに同じエンコーダを使い回す
     let (mut encoder, rx) = create_encoder(config.clone());
 
     if reconfigure {
@@ -1942,12 +2903,17 @@ fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
 
     let width = config.width as usize;
     let height = config.height as usize;
-    let (coded_width, coded_height) = encoder.coded_size();
-    let colorbar = generate_colorbar_nv12(width, height, coded_width, coded_height);
-    let colorbar_for_psnr = generate_colorbar_nv12(width, height, width, height);
+    let colorbar = generate_colorbar_nv12(width, height);
     let input_frames: Vec<Vec<u8>> = (0..10).map(|_| colorbar.clone()).collect();
 
-    let (encoded_frames, bitstreams) = encode_with_encoder(encoder, rx, &input_frames);
+    let (encoded_frames, bitstreams) = encode_with_encoder(
+        encoder,
+        rx,
+        &input_frames,
+        config.frame_format,
+        width,
+        height,
+    );
 
     // IVF ヘッダーの有無を検証する
     for (i, frame) in encoded_frames.iter().enumerate() {
@@ -2005,13 +2971,7 @@ fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
             decoded.height, height,
             "デコード結果のフレーム {i} の height が入力と一致すること"
         );
-        let psnr = psnr_y(
-            &colorbar_for_psnr,
-            &decoded.y_data,
-            decoded.pitch,
-            width,
-            height,
-        );
+        let psnr = psnr_y(&colorbar, &decoded.y_data, decoded.pitch, width, height);
         assert!(
             psnr >= 25.0,
             "フレーム {i}: PSNR {psnr:.1} dB が 25.0 dB 未満"
@@ -2250,11 +3210,10 @@ fn test_sequence_params_unchanged_by_encode() {
             .get_sequence_params()
             .expect("シーケンスパラメータの取得に失敗した");
 
-        let (coded_width, coded_height) = encoder.coded_size();
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, 0);
+        let frame_data = generate_dummy_nv12(320, 240, 0);
         encoder
             .encode(
-                &frame_data,
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
                 (),
                 &EncodeOptions {
                     frame_type: frame_type::UNKNOWN,
@@ -2319,9 +3278,8 @@ fn test_sequence_params_change_after_reconfigure() {
 fn encode_test_bitstreams(config: EncoderConfig, num_frames: usize) -> Vec<Vec<u8>> {
     let width = config.width as usize;
     let height = config.height as usize;
-    let (coded_width, coded_height) = coded_size_for(&config);
     let input_frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_nv12(width, height, coded_width, coded_height, i))
+        .map(|i| generate_dummy_nv12(width, height, i))
         .collect();
     let (_, bitstreams) = encode(config, &input_frames);
     bitstreams
@@ -2331,16 +3289,19 @@ fn encode_test_bitstreams(config: EncoderConfig, num_frames: usize) -> Vec<Vec<u
 #[test]
 fn test_encoder_stats() {
     let (mut encoder, rx) = create_encoder(h264_test_config());
-    let (coded_width, coded_height) = encoder.coded_size();
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
     };
     let num_frames = 8;
 
     for i in 0..num_frames {
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        let frame_data = generate_dummy_nv12(320, 240, i);
         encoder
-            .encode(&frame_data, i, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+                i,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
 
@@ -2450,11 +3411,22 @@ fn test_encoder_stats_ignores_rejected_frame() {
         frame_type: frame_type::UNKNOWN,
     };
 
-    // coded_size() から求まる必要サイズより小さいデータは入力検証で拒否される
-    let result = encoder.encode(&[0u8; 16], (), &options);
+    // 必要な長さに満たないプレーンは入力検証で拒否される
+    let y = [0u8; 16];
+    let uv = [0u8; 16];
+    let result = encoder.encode(
+        FrameData::SemiPlanar {
+            y: &y,
+            y_pitch: 320,
+            uv: &uv,
+            uv_pitch: 320,
+        },
+        (),
+        &options,
+    );
     assert!(
         result.is_err(),
-        "coded サイズに満たないフレームデータは拒否されること"
+        "表示サイズに満たないフレームデータは拒否されること"
     );
 
     let stats = encoder.stats();
@@ -2499,16 +3471,19 @@ fn test_encoder_stats_in_flight_frames() {
         }),
     )
     .expect("エンコーダーの生成に失敗した");
-    let (coded_width, coded_height) = encoder.coded_size();
     let options = EncodeOptions {
         frame_type: frame_type::UNKNOWN,
     };
 
     // 2 フレームを投入すると 1 枚目のコールバックが worker で始まる
     for i in 0..2 {
-        let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, i);
+        let frame_data = generate_dummy_nv12(320, 240, i);
         encoder
-            .encode(&frame_data, i, &options)
+            .encode(
+                frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+                i,
+                &options,
+            )
             .expect("エンコードに失敗した");
     }
     started_rx
@@ -2520,9 +3495,13 @@ fn test_encoder_stats_in_flight_frames() {
     assert_eq!(before, 1, "コールバック中の in-flight が 1 であること");
 
     // worker が停止している間に 1 フレームだけ受理させる
-    let frame_data = generate_dummy_nv12(320, 240, coded_width, coded_height, 2);
+    let frame_data = generate_dummy_nv12(320, 240, 2);
     encoder
-        .encode(&frame_data, 2, &options)
+        .encode(
+            frame_data_from_buffer(FrameFormat::Nv12, 320, 240, &frame_data),
+            2,
+            &options,
+        )
         .expect("エンコードに失敗した");
     assert_eq!(
         encoder.stats().in_flight_frames.get(),
