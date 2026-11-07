@@ -19,6 +19,9 @@
 //! - AYUV (Packed YUV 4:4:4 8bit)
 //! - Y410 (Packed YUV 4:4:4 10bit)
 //!
+//! [`Encoder::encode`] に渡すフレームは [`FrameData`] で表現し、各プレーンの行間のバイト数を指定する。
+//! NV12 / P010 は幅と高さ、YUY2 は幅を偶数にする必要がある。
+//!
 //! 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
 //! 詳細は [`Encoder::new`] を参照。
 //!
@@ -38,16 +41,19 @@
 //! ```no_run
 //! use shiguredo_vpl::{
 //!     AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
-//!     Error, FnEncodeHandler, FrameFormat, H264EncoderConfig, RateControlMode, list_adapters,
+//!     Error, FnEncodeHandler, FrameData, FrameFormat, H264EncoderConfig, RateControlMode,
+//!     list_adapters,
 //! };
 //! use std::sync::mpsc;
 //!
+//! let width = 1920usize;
+//! let height = 1080usize;
 //! let adapter = list_adapters().unwrap().into_iter().next().unwrap();
 //! let config = EncoderConfig::new(
 //!     AdapterSelector::DrmRenderNode(adapter.drm_render_node),
 //!     CodecConfig::H264(H264EncoderConfig { profile: None }),
-//!     1920,
-//!     1080,
+//!     width as u32,
+//!     height as u32,
 //!     FrameFormat::Nv12,
 //!     30,
 //!     1,
@@ -58,14 +64,20 @@
 //!     tx.send(result).unwrap();
 //! })).unwrap();
 //!
-//! // フレームデータをエンコードする
-//! let (coded_width, coded_height) = encoder.coded_size();
-//! let frame_size = FrameFormat::Nv12
-//!     .frame_size(coded_width, coded_height)
-//!     .unwrap();
-//! let frame_data = vec![0u8; frame_size];
+//! // width x height の FrameData を構築する
+//! let pitch = FrameFormat::Nv12.bytes_per_row(width).unwrap();
+//! let y_size = pitch * height;
+//! let uv_size = pitch * (height / 2);
+//! let frame_data = vec![0u8; y_size + uv_size];
+//! let frame = FrameData::SemiPlanar {
+//!     y: &frame_data[..y_size],
+//!     y_pitch: pitch,
+//!     uv: &frame_data[y_size..],
+//!     uv_pitch: pitch,
+//! };
+//! // 構築したフレームデータをエンコードする
 //! let options = EncodeOptions { frame_type: 0 };
-//! encoder.encode(&frame_data, (), &options).unwrap();
+//! encoder.encode(frame, (), &options).unwrap();
 //!
 //! encoder.finish().unwrap();
 //! let encoded = rx.recv().unwrap().unwrap();
@@ -121,8 +133,9 @@ pub use decode::{
 };
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
-    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, H264EncoderConfig, HevcEncoderConfig,
-    PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam, Vp9EncoderConfig,
+    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, FrameData, H264EncoderConfig,
+    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam,
+    Vp9EncoderConfig,
 };
 pub use error::Error;
 pub use stats::{Counter, Gauge};

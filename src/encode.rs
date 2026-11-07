@@ -55,68 +55,96 @@ pub enum CodecConfig {
 }
 
 impl FrameFormat {
-    /// フレームデータを内部サーフェスの mfxFrameData にコピーする
+    /// フレームデータをコピーする
+    ///
+    /// `frame` の形式と各プレーンの `pitch` / データ長、`data` のピッチが不正な場合はエラーを返す。
     ///
     /// # Safety
     ///
     /// `data` の各プレーンポインタは有効なメモリを指し、Pitch 幅分の書き込みが可能である必要がある。
-    /// `src` は `frame_size(coded_width, coded_height)` バイト以上である必要がある。
     unsafe fn copy_to_surface_planes(
         self,
-        src: &[u8],
+        frame: FrameData<'_>,
         data: &sys::mfxFrameData,
-        coded_width: usize,
-        coded_height: usize,
-    ) {
+        width: usize,
+        height: usize,
+    ) -> Result<(), Error> {
+        let row_bytes = self.bytes_per_row(width).ok_or_else(|| {
+            Error::new_custom("Encoder::encode", "row bytes calculation overflowed")
+        })?;
         unsafe {
-            let pitch = frame_data_pitch(data);
-            // coded_width は u16 に収まるため、1 行あたりのバイト数は必ず usize に収まる
-            let row_bytes = self
-                .bytes_per_row(coded_width)
-                .expect("row bytes must fit in usize because the coded width fits in u16");
-            match self {
-                FrameFormat::Nv12 | FrameFormat::P010 => {
+            let dst_pitch = frame_data_pitch(data);
+            if dst_pitch < row_bytes {
+                return Err(Error::new_custom_owned(
+                    "Encoder::encode",
+                    format!(
+                        "destination pitch ({dst_pitch}) is less than bytes per row ({row_bytes})"
+                    ),
+                ));
+            }
+            match (self, frame) {
+                (
+                    FrameFormat::Nv12 | FrameFormat::P010,
+                    FrameData::SemiPlanar {
+                        y,
+                        y_pitch,
+                        uv,
+                        uv_pitch,
+                    },
+                ) => {
+                    validate_plane(y, y_pitch, height, row_bytes, "Y")?;
+                    validate_plane(uv, uv_pitch, height / 2, row_bytes, "UV")?;
                     let y_ptr = data.__bindgen_anon_3.Y;
                     let uv_ptr = data.__bindgen_anon_4.UV;
-                    let luma_size = row_bytes * coded_height;
                     // Y プレーンをコピーする
-                    copy_rows(src.as_ptr(), y_ptr, row_bytes, coded_height, pitch);
+                    copy_rows(y.as_ptr(), y_ptr, row_bytes, height, y_pitch, dst_pitch);
                     // UV プレーンをコピーする
                     copy_rows(
-                        src.as_ptr().add(luma_size),
+                        uv.as_ptr(),
                         uv_ptr,
                         row_bytes,
-                        coded_height / 2,
-                        pitch,
+                        height / 2,
+                        uv_pitch,
+                        dst_pitch,
                     );
                 }
-                FrameFormat::Yuy2 => {
+                (FrameFormat::Yuy2, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
                     let y_ptr = data.__bindgen_anon_3.Y;
-                    copy_rows(src.as_ptr(), y_ptr, row_bytes, coded_height, pitch);
+                    copy_rows(src.as_ptr(), y_ptr, row_bytes, height, pitch, dst_pitch);
                 }
-                FrameFormat::Bgra => {
+                (FrameFormat::Bgra, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
                     let b_ptr = data.__bindgen_anon_5.B;
-                    copy_rows(src.as_ptr(), b_ptr, row_bytes, coded_height, pitch);
+                    copy_rows(src.as_ptr(), b_ptr, row_bytes, height, pitch, dst_pitch);
                 }
-                FrameFormat::Ayuv => {
+                (FrameFormat::Ayuv, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
                     // AYUV の各チャネルポインタは、パックされた 1 画素の各バイトを指す。
                     // メモリ上のバイト順は V, U, Y, A なので、行の先頭は V になる。
                     let v_ptr = data.__bindgen_anon_5.V;
-                    copy_rows(src.as_ptr(), v_ptr, row_bytes, coded_height, pitch);
+                    copy_rows(src.as_ptr(), v_ptr, row_bytes, height, pitch, dst_pitch);
                 }
-                FrameFormat::Y410 => {
+                (FrameFormat::Y410, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
                     let y410_ptr = data.__bindgen_anon_4.Y410 as *mut u8;
-                    copy_rows(src.as_ptr(), y410_ptr, row_bytes, coded_height, pitch);
+                    copy_rows(src.as_ptr(), y410_ptr, row_bytes, height, pitch, dst_pitch);
+                }
+                (format, _) => {
+                    return Err(Error::new_custom_owned(
+                        "Encoder::encode",
+                        format!("frame data variant does not match frame format {format:?}"),
+                    ));
                 }
             }
         }
+        Ok(())
     }
 
-    /// 指定幅のフレームを密に詰めた場合の 1 行あたりのバイト数を返す
+    /// 指定幅のフレームの 1 行あたりの最小バイト数を返す
     ///
-    /// `mfxFrameData` のピッチはこの値以上になる。
     /// オーバーフロー時は `None` を返す。
-    pub(crate) fn bytes_per_row(self, width: usize) -> Option<usize> {
+    pub fn bytes_per_row(self, width: usize) -> Option<usize> {
         match self {
             // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
             FrameFormat::Nv12 => Some(width),
@@ -166,14 +194,21 @@ unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
 ///
 /// # Safety
 ///
-/// `src` は `rows * row_bytes` バイト以上、`dst` は `(rows - 1) * pitch + row_bytes` バイト以上
-/// 読み書き可能である必要がある。
-unsafe fn copy_rows(src: *const u8, dst: *mut u8, row_bytes: usize, rows: usize, pitch: usize) {
+/// `src` は `rows` 行分（最終行は `row_bytes` バイト）読み出せ、`dst` も同様に
+/// 書き込める必要がある。`rows` が 0 の場合はアクセスしない。
+unsafe fn copy_rows(
+    src: *const u8,
+    dst: *mut u8,
+    row_bytes: usize,
+    rows: usize,
+    src_pitch: usize,
+    dst_pitch: usize,
+) {
     for row in 0..rows {
         unsafe {
             std::ptr::copy_nonoverlapping(
-                src.add(row * row_bytes),
-                dst.add(row * pitch),
+                src.add(row * src_pitch),
+                dst.add(row * dst_pitch),
                 row_bytes,
             );
         }
@@ -224,8 +259,11 @@ impl RateControlMode {
 
 /// エンコーダ設定
 ///
-/// VPL の mfxVideoParam / mfxInfoMFX / mfxFrameInfo に対応する。
+/// ほとんどのフィールドは VPL の mfxVideoParam / mfxInfoMFX / mfxFrameInfo に対応する。
 /// フィールド名は VPL API の構造体メンバ名に準拠する。
+///
+/// ただし `width` / `height` は coded サイズではなく表示サイズ（crop サイズ）を表す。
+/// coded サイズは [`Encoder::coded_size`] で取得する。
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     // --- アダプタ選択 ---
@@ -237,9 +275,13 @@ pub struct EncoderConfig {
     pub codec: CodecConfig,
 
     // --- フレーム情報 (mfxFrameInfo) ---
-    /// フレーム幅（ピクセル、16 の倍数にアライメントされる）
+    /// 表示フレーム幅（ピクセル）
+    ///
+    /// この値は入力フレームフォーマットが NV12 / P010 / YUY2 の場合は偶数であること。
     pub width: u32,
-    /// フレーム高さ（ピクセル、16 の倍数にアライメントされる）
+    /// 表示フレーム高さ（ピクセル）
+    ///
+    /// この値は入力フレームフォーマットが NV12 / P010 の場合は偶数であること。
     pub height: u32,
     /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth / Shift を決定する）
     pub frame_format: FrameFormat,
@@ -309,7 +351,7 @@ pub struct EncoderConfig {
     pub initial_delay_in_kb: Option<u16>,
     /// ビットストリームバッファサイズ（KB 単位、mfxInfoMFX.BufferSizeInKB）
     ///
-    /// None の場合は width * height * 4 / 1024 に切り上げて自動計算する。
+    /// None の場合はエンコーダーが自動計算する。
     pub buffer_size_in_kb: Option<u16>,
     /// ターゲットビットレート（kbps、mfxInfoMFX.TargetKbps）
     ///
@@ -718,6 +760,80 @@ pub struct EncodeOptions {
     pub frame_type: u16,
 }
 
+/// [`Encoder::encode`] に渡すフレーム
+///
+/// [`EncoderConfig::frame_format`] に対応する variant を選ぶ。
+/// `SemiPlanar` の Y プレーンは [`EncoderConfig::height`] 行、UV プレーンはその半分の行数、
+/// `Packed` は 1 プレーンで [`EncoderConfig::height`] 行を持つ。
+/// 各プレーンのデータ長は、行数を `rows` として `rows * pitch` バイト以上必要である。
+/// 各プレーンの `pitch` は `FrameFormat::bytes_per_row(width)` 以上の値であること。
+/// P010 の 10bit 値は 16bit ワードの上位 10bit に格納する（[`FrameFormat::P010`]）。
+#[derive(Debug, Clone, Copy)]
+pub enum FrameData<'a> {
+    /// Semi-Planar YUV 4:2:0 (NV12 / P010)
+    SemiPlanar {
+        /// Y プレーン
+        y: &'a [u8],
+        /// Y プレーンの行間のバイト数（パディングを含む）
+        y_pitch: usize,
+        /// UV プレーン（インターリーブ）
+        uv: &'a [u8],
+        /// UV プレーンの行間のバイト数（パディングを含む）
+        uv_pitch: usize,
+    },
+    /// パック形式 (YUY2 / BGRA / AYUV / Y410)
+    Packed {
+        /// フレームデータ
+        data: &'a [u8],
+        /// 行間のバイト数（パディングを含む）
+        pitch: usize,
+    },
+}
+
+/// プレーンのデータ長が指定行数分あることを検証する
+fn validate_plane(
+    data: &[u8],
+    pitch: usize,
+    rows: usize,
+    row_bytes: usize,
+    name: &str,
+) -> Result<(), Error> {
+    if pitch < row_bytes {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!("{name} plane pitch ({pitch}) is less than bytes per row ({row_bytes})"),
+        ));
+    }
+    let required = plane_span(rows, pitch, row_bytes).ok_or_else(|| {
+        Error::new_custom_owned(
+            "Encoder::encode",
+            format!("{name} plane size calculation overflowed"),
+        )
+    })?;
+    if data.len() < required {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!(
+                "{name} plane data is too small (got {}, need at least {required})",
+                data.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// プレーンが必要とするバイト数を返す
+///
+/// 最終行の後ろのパディングは含まない。
+fn plane_span(rows: usize, pitch: usize, row_bytes: usize) -> Option<usize> {
+    if rows == 0 {
+        return Some(0);
+    }
+    rows.checked_sub(1)?
+        .checked_mul(pitch)?
+        .checked_add(row_bytes)
+}
+
 /// ピクチャータイプ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PictureType {
@@ -744,7 +860,7 @@ pub enum PictureType {
 pub struct EncoderStats {
     /// [`Encoder::encode`] が VPL に受理させたフレームの通算回数
     ///
-    /// フレームサイズの検証など、VPL に渡す前に拒否した呼び出しは計上しない。
+    /// フレームサイズの検証など、エンコード API に渡す前に拒否した呼び出しは計上しない。
     pub total_encode_count: Counter,
 
     /// [`EncodeHandler::on_encoded`] に `Ok` を渡した通算回数
@@ -987,6 +1103,10 @@ pub struct Encoder<H: EncodeHandler> {
     /// エンコードするコーデック種別
     codec: VideoCodecType,
     frame_format: FrameFormat,
+    /// 入力バッファの表示幅 (`EncoderConfig::width`)
+    width: usize,
+    /// 入力バッファの表示高さ (`EncoderConfig::height`)
+    height: usize,
     write_ivf_headers: bool,
     bitstream_buffer_size: usize,
     /// Init / Reset で VPL へ渡す拡張バッファの本体
@@ -1025,18 +1145,54 @@ impl<H: EncodeHandler> Encoder<H> {
     ///
     /// 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
     /// 初期化に失敗した場合、[`Error::function`] は `MFXVideoENCODE_Init` になる。
-    /// 初期化に成功しても、エンコードに失敗する組み合わせがある。
+    /// また、初期化に成功しても、エンコードに失敗する組み合わせがある。
     ///
     /// 事前に対応を判定する場合は [`crate::supported_codecs`] が返す
     /// [`crate::EncodingInfo::profiles`] の
     /// [`crate::MemoryTypeCapabilities::color_formats`] を参照する。
     /// ただし、ケーパビリティ照会の結果は初期化やエンコードの成功を保証しない。
+    ///
+    /// # エラー
+    ///
+    /// 以下の場合はエラーを返す。
+    ///
+    /// - `width` / `height` が 0
+    /// - `framerate_den` が 0
+    /// - 16 の倍数に切り上げた幅または高さが `u16::MAX` を超える
+    /// - 入力フォーマットが NV12 / P010 であり、`width` または `height` が奇数
+    /// - 入力フォーマットが YUY2 であり、`width` が奇数
+    /// - VPL の関数がエラーを返す
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
             return Err(Error::new_custom(
                 "Encoder::new",
                 "width and height must be non-zero",
+            ));
+        }
+        // 4:2:0 は幅と高さ、4:2:2 は幅が偶数でなければならない
+        if matches!(
+            config.frame_format,
+            FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Yuy2
+        ) && !config.width.is_multiple_of(2)
+        {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "{:?} requires an even width (got {})",
+                    config.frame_format, config.width
+                ),
+            ));
+        }
+        if matches!(config.frame_format, FrameFormat::Nv12 | FrameFormat::P010)
+            && !config.height.is_multiple_of(2)
+        {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "{:?} requires an even height (got {})",
+                    config.frame_format, config.height
+                ),
             ));
         }
         if config.framerate_den == 0 {
@@ -1076,6 +1232,7 @@ impl<H: EncodeHandler> Encoder<H> {
         frame_info.FrameRateExtD = config.framerate_den;
         frame_info.AspectRatioW = config.aspect_ratio_w.unwrap_or(0);
         frame_info.AspectRatioH = config.aspect_ratio_h.unwrap_or(0);
+        // 内部サーフェスの Width/Height は 16 の倍数に切り上げ、CropW/CropH は表示サイズにする
         {
             let fi = unsafe { &mut frame_info.__bindgen_anon_1.__bindgen_anon_1 };
             fi.Width = aligned_width as u16;
@@ -1088,7 +1245,8 @@ impl<H: EncodeHandler> Encoder<H> {
         let gop_pic_size = config.gop_pic_size.unwrap_or(0);
         let codec = codec_type(&config.codec);
 
-        // ビットストリームバッファサイズ（指定がなければ 4 バイト/ピクセルで自動計算する）
+        // 未指定時は 16 の倍数に切り上げた幅 x 高さの画素数に 4 バイトを掛け、
+        // 1024 バイト単位に切り上げて KB 単位で設定する
         let pixel_count = aligned_width as u64 * aligned_height as u64;
         let auto_buffer_bytes = pixel_count.saturating_mul(4);
         let auto_buffer_kb = align_up(auto_buffer_bytes.min(u32::MAX as u64) as u32, 1024) / 1024;
@@ -1271,6 +1429,42 @@ impl<H: EncodeHandler> Encoder<H> {
         clear_ext_param(&mut video_param);
         frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
 
+        // Init が警告でパラメータを補正した場合に備え、GetVideoParam の実効値が
+        // 要求値と一致することを確認する。
+        let fi = unsafe { frame_info.__bindgen_anon_1.__bindgen_anon_1 };
+        let requested_format = config.frame_format;
+        if fi.CropX != 0
+            || fi.CropY != 0
+            || fi.CropW != config.width as u16
+            || fi.CropH != config.height as u16
+            || fi.Width < fi.CropW
+            || fi.Height < fi.CropH
+            || frame_info.FourCC != requested_format.fourcc()
+            || frame_info.ChromaFormat != requested_format.chroma_format()
+            || frame_info.BitDepthLuma != requested_format.bit_depth()
+            || frame_info.BitDepthChroma != requested_format.bit_depth()
+            || frame_info.Shift != requested_format.frame_info_shift()
+        {
+            let _ = lib.mfx_video_encode_close(session_ptr);
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "effective frame info mismatch: CropX={}, CropY={}, CropW={}, CropH={}, Width={}, Height={}, FourCC={:#x}, ChromaFormat={}, BitDepthLuma={}, BitDepthChroma={}, Shift={}",
+                    fi.CropX,
+                    fi.CropY,
+                    fi.CropW,
+                    fi.CropH,
+                    fi.Width,
+                    fi.Height,
+                    frame_info.FourCC,
+                    frame_info.ChromaFormat,
+                    frame_info.BitDepthLuma,
+                    frame_info.BitDepthChroma,
+                    frame_info.Shift,
+                ),
+            ));
+        }
+
         // VP9 の場合、WriteIVFHeaders の実効値が要求値と完全一致することを検証する。
         // 一致しない場合（UNKNOWN を含む）は oneVPL が要求を尊重しなかったことを意味するため、
         // エンコーダをクローズしてエラーを返す。
@@ -1315,6 +1509,8 @@ impl<H: EncodeHandler> Encoder<H> {
             frame_info,
             codec,
             frame_format: config.frame_format,
+            width: config.width as usize,
+            height: config.height as usize,
             write_ivf_headers,
             bitstream_buffer_size,
             ext_buffers,
@@ -1542,7 +1738,7 @@ impl<H: EncodeHandler> Encoder<H> {
         Ok(Some(SequenceParams { vps, sps, pps }))
     }
 
-    /// エンコーダが要求する coded フレームサイズ（`FrameInfo::Width/Height`）を取得する
+    /// 内部サーフェスのサイズを返す
     pub fn coded_size(&self) -> (usize, usize) {
         let fi = unsafe { self.frame_info.__bindgen_anon_1.__bindgen_anon_1 };
         (usize::from(fi.Width), usize::from(fi.Height))
@@ -1565,35 +1761,21 @@ impl<H: EncodeHandler> Encoder<H> {
     }
 
     /// フレームをエンコードする
+    ///
+    /// `frame` は [`EncoderConfig::frame_format`] に対応する [`FrameData`] であること。
+    /// 各プレーンの `pitch` とデータ長は [`FrameData`] の契約を満たすこと。
+    ///
+    /// # エラー
+    ///
+    /// 入力フォーマットと frame の variant の不一致、`pitch` 不足、データ長不足の場合はエラーになる。
     pub fn encode(
         &mut self,
-        frame_data: &[u8],
+        frame: FrameData<'_>,
         user_data: H::UserData,
         options: &EncodeOptions,
     ) -> Result<(), Error> {
-        // フレームサイズを検証する
-        let (coded_width, coded_height) = self.coded_size();
-        let expected = self
-            .frame_format
-            .frame_size(coded_width, coded_height)
-            .ok_or_else(|| {
-                Error::new_custom("Encoder::encode", "frame size calculation overflowed")
-            })?;
-        if frame_data.len() < expected {
-            return Err(Error::new_custom_owned(
-                "Encoder::encode",
-                format!(
-                    "frame data is too small for coded size {}x{} (got {}, need at least {})",
-                    coded_width,
-                    coded_height,
-                    frame_data.len(),
-                    expected
-                ),
-            ));
-        }
-
         let frame_seq = self.frame_count;
-        // 公開 API 向けのタイムスタンプは従来どおり frame_rate 由来で計算する。
+        // 公開 API 向けのタイムスタンプは frame_rate 由来で計算する。
         let presentation_timestamp = frame_seq
             .checked_mul(self.framerate_den)
             .ok_or_else(|| Error::new_custom("Encoder::encode", "timestamp overflowed"))?;
@@ -1612,15 +1794,15 @@ impl<H: EncodeHandler> Encoder<H> {
         // Map して CPU から書き込めるようにする
         frame_surface.map_write()?;
 
-        // フレームデータを内部サーフェスにコピーする
+        // フレームデータを検証して内部サーフェスにコピーする
         unsafe {
             (*frame_surface.as_ptr()).Data.TimeStamp = frame_seq;
             self.frame_format.copy_to_surface_planes(
-                &frame_data[..expected],
+                frame,
                 &(*frame_surface.as_ptr()).Data,
-                coded_width,
-                coded_height,
-            );
+                self.width,
+                self.height,
+            )?;
         }
 
         // Unmap して書き込み完了を通知する
@@ -2123,52 +2305,6 @@ mod tests {
         assert_eq!(FrameFormat::from_fourcc(0xDEAD_BEEF), None);
     }
 
-    /// 各形式のフレームサイズが 1 画素あたりのバイト数と一致すること
-    #[test]
-    fn frame_format_frame_size_matches_bytes_per_pixel() {
-        // 4x4 画素で検証する
-        let cases = [
-            // YUV 4:2:0 8bit: Y + UV/2
-            (FrameFormat::Nv12, 4 * 4 * 3 / 2),
-            // YUV 4:2:0 10bit: 1 サンプル 2 バイトで Y + UV/2
-            (FrameFormat::P010, 4 * 4 * 3),
-            // YUY2: 2 バイト/画素
-            (FrameFormat::Yuy2, 4 * 4 * 2),
-            // BGRA / AYUV / Y410: 4 バイト/画素
-            (FrameFormat::Bgra, 4 * 4 * 4),
-            (FrameFormat::Ayuv, 4 * 4 * 4),
-            (FrameFormat::Y410, 4 * 4 * 4),
-        ];
-        for (format, expected) in cases {
-            assert_eq!(
-                format.frame_size(4, 4),
-                Some(expected),
-                "{format:?} の 4x4 のフレームサイズが不一致"
-            );
-        }
-    }
-
-    /// フレームサイズの計算がオーバーフローした場合は `None` を返すこと
-    #[test]
-    fn frame_format_frame_size_returns_none_on_overflow() {
-        // width * height 自体がオーバーフローするケース
-        for format in FrameFormat::all() {
-            assert_eq!(
-                format.frame_size(usize::MAX, 2),
-                None,
-                "{format:?} のフレームサイズがオーバーフロー時に None にならない"
-            );
-        }
-        // width * height は収まるが、形式ごとの乗算がオーバーフローするケース
-        for format in FrameFormat::all() {
-            assert_eq!(
-                format.frame_size(usize::MAX / 2, 2),
-                None,
-                "{format:?} の形式ごとの乗算がオーバーフロー時に None にならない"
-            );
-        }
-    }
-
     /// 1 行あたりのバイト数が形式ごとの 1 画素あたりのバイト数と一致すること
     #[test]
     fn frame_format_bytes_per_row_matches_bytes_per_pixel() {
@@ -2232,6 +2368,162 @@ mod tests {
                 shift,
                 "{format:?} の mfxFrameInfo.Shift が不一致"
             );
+        }
+    }
+
+    /// コピーが UV の行数と UV ピッチを使い、表示範囲外を変更しないこと
+    #[test]
+    fn copy_to_surface_planes_uses_uv_pitch_and_rows() {
+        let width = 4;
+        let height = 4;
+        let row_bytes = width;
+        let y_pitch = 6;
+        let uv_pitch = 8;
+        let dst_pitch = 5;
+
+        let mut y_src = vec![0u8; y_pitch * height];
+        for row in 0..height {
+            for col in 0..row_bytes {
+                y_src[row * y_pitch + col] = (row * 10 + col) as u8;
+            }
+        }
+        let mut uv_src = vec![0u8; uv_pitch * (height / 2)];
+        for row in 0..height / 2 {
+            for col in 0..row_bytes {
+                uv_src[row * uv_pitch + col] = (0x40 + row * 10 + col) as u8;
+            }
+        }
+
+        let mut y_dst = vec![0xAAu8; dst_pitch * height];
+        let mut uv_dst = vec![0xBBu8; dst_pitch * (height / 2)];
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 0;
+        data.__bindgen_anon_2.PitchLow = dst_pitch as u16;
+        data.__bindgen_anon_3.Y = y_dst.as_mut_ptr();
+        data.__bindgen_anon_4.UV = uv_dst.as_mut_ptr();
+
+        let frame = FrameData::SemiPlanar {
+            y: &y_src,
+            y_pitch,
+            uv: &uv_src,
+            uv_pitch,
+        };
+        unsafe {
+            FrameFormat::Nv12
+                .copy_to_surface_planes(frame, &data, width, height)
+                .expect("コピーに失敗した");
+        }
+
+        for row in 0..height {
+            assert_eq!(
+                &y_dst[row * dst_pitch..row * dst_pitch + row_bytes],
+                &y_src[row * y_pitch..row * y_pitch + row_bytes],
+                "Y の {row} 行目が一致しない"
+            );
+            assert!(
+                y_dst[row * dst_pitch + row_bytes..(row + 1) * dst_pitch]
+                    .iter()
+                    .all(|&byte| byte == 0xAA),
+                "Y の {row} 行目のパディングが変更されている"
+            );
+        }
+        for row in 0..height / 2 {
+            assert_eq!(
+                &uv_dst[row * dst_pitch..row * dst_pitch + row_bytes],
+                &uv_src[row * uv_pitch..row * uv_pitch + row_bytes],
+                "UV の {row} 行目が一致しない"
+            );
+            assert!(
+                uv_dst[row * dst_pitch + row_bytes..(row + 1) * dst_pitch]
+                    .iter()
+                    .all(|&byte| byte == 0xBB),
+                "UV の {row} 行目のパディングが変更されている"
+            );
+        }
+    }
+
+    /// コピー先のピッチが 1 行のバイト数未満ならエラーになること
+    #[test]
+    fn copy_to_surface_planes_rejects_short_destination_pitch() {
+        let width = 4;
+        let height = 4;
+        let row_bytes = width;
+        let dst_pitch = row_bytes - 1;
+        let y_src = vec![0u8; row_bytes * height];
+        let uv_src = vec![0u8; row_bytes * (height / 2)];
+        let mut y_dst = vec![0u8; dst_pitch * height];
+        let mut uv_dst = vec![0u8; dst_pitch * (height / 2)];
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 0;
+        data.__bindgen_anon_2.PitchLow = dst_pitch as u16;
+        data.__bindgen_anon_3.Y = y_dst.as_mut_ptr();
+        data.__bindgen_anon_4.UV = uv_dst.as_mut_ptr();
+        let frame = FrameData::SemiPlanar {
+            y: &y_src,
+            y_pitch: row_bytes,
+            uv: &uv_src,
+            uv_pitch: row_bytes,
+        };
+        let error = unsafe {
+            FrameFormat::Nv12
+                .copy_to_surface_planes(frame, &data, width, height)
+                .expect_err("コピー先のピッチ不足は拒否されること")
+        };
+        assert!(
+            error.to_string().contains("destination pitch"),
+            "エラーメッセージに destination pitch が含まれること: {error}"
+        );
+    }
+
+    /// パック形式のコピーが形式ごとのポインタとピッチを使うこと
+    #[test]
+    fn copy_to_surface_planes_uses_packed_plane_pointer() {
+        let width = 4;
+        let height = 2;
+        for format in [FrameFormat::Yuy2, FrameFormat::Bgra, FrameFormat::Ayuv] {
+            let row_bytes = format
+                .bytes_per_row(width)
+                .expect("行バイト数が取得できない");
+            let src_pitch = row_bytes + 2;
+            let dst_pitch = row_bytes + 1;
+            let mut src = vec![0u8; src_pitch * height];
+            for row in 0..height {
+                for col in 0..row_bytes {
+                    src[row * src_pitch + col] = (row * 10 + col) as u8;
+                }
+            }
+            let mut dst = vec![0xAAu8; dst_pitch * height];
+            let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+            data.PitchHigh = 0;
+            data.__bindgen_anon_2.PitchLow = dst_pitch as u16;
+            match format {
+                FrameFormat::Yuy2 => data.__bindgen_anon_3.Y = dst.as_mut_ptr(),
+                FrameFormat::Bgra => data.__bindgen_anon_5.B = dst.as_mut_ptr(),
+                FrameFormat::Ayuv => data.__bindgen_anon_5.V = dst.as_mut_ptr(),
+                _ => unreachable!(),
+            }
+            let frame = FrameData::Packed {
+                data: &src,
+                pitch: src_pitch,
+            };
+            unsafe {
+                format
+                    .copy_to_surface_planes(frame, &data, width, height)
+                    .expect("コピーに失敗した");
+            }
+            for row in 0..height {
+                assert_eq!(
+                    &dst[row * dst_pitch..row * dst_pitch + row_bytes],
+                    &src[row * src_pitch..row * src_pitch + row_bytes],
+                    "{format:?} の {row} 行目が一致しない"
+                );
+                assert!(
+                    dst[row * dst_pitch + row_bytes..(row + 1) * dst_pitch]
+                        .iter()
+                        .all(|&byte| byte == 0xAA),
+                    "{format:?} の {row} 行目のパディングが変更されている"
+                );
+            }
         }
     }
 
