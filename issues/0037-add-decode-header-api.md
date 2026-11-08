@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-09
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-decode-header-api
 - Polished: {YYYY-MM-DD}
@@ -50,6 +50,36 @@ WebRTC の受信経路などで、新しい sequence のキーフレームをデ
 3. `decode_header` が入力を消費せず、同じ AU を `decode()` に流せることをテストで固定する。
 4. 256x160 / 320x240 と、coded サイズと表示サイズが異なる 318x238 のキーフレームで、それぞれの coded / 表示サイズが返ることをテストで固定する。
 5. `CHANGES.md` と `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新する。
+
+## 解決方法
+
+`Decoder::decode_header` と `StreamInfo` を追加し、SPS / PPS / sequence header を含むデータから解像度とフレームレートを取得できるようにした。
+
+### 変更内容
+
+- `Decoder::decode_header` を追加した
+- `StreamInfo` と `Framerate` を公開した
+  - `StreamInfo` は `codec` / `coded_width` / `coded_height` / `width` / `height` / `framerate` (`Option<Framerate>`) を持つ
+  - フレームレートの情報が無い場合は `framerate` が `None` になる
+- `Decoder::initialize` と `decode_header` でヘッダ解析処理を共通化した
+- テストを追加した
+  - H.264 / HEVC / AV1 の 256x160 / 320x240 / 318x238 で coded / 表示サイズとフレームレートを検証する
+  - SPS / PPS / sequence header を含まないデータではエラーになることを検証する
+  - `decode_header` が入力を消費せず、同じ AU を `decode` に流せることを検証する
+  - デコーダー初期化後に別ストリームのヘッダを解析できることを検証する
+  - `decode_header` がデコード統計とコールバックに影響しないことを検証する
+- `CHANGES.md` / `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新した
+
+### 確認
+
+Intel GPU を搭載した実機で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` | pass (lib 56 件、adapter 6 件、codec_info 1 件、roundtrip 65 件、doctest 2 件) |
+| `DOCS_RS=1 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | pass |
 
 ## 参考
 
