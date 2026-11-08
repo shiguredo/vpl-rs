@@ -303,6 +303,8 @@ impl ValueRange {
 
 /// フレームの色形式
 ///
+/// エンコーダーの入力と、エンコード・デコードのケーパビリティ照会で使う。
+///
 /// ref: libvpl api/vpl/mfxstructures.h (MFX_FOURCC_P010 / MFX_FOURCC_AYUV / MFX_FOURCC_Y410 / mfxY410)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
@@ -403,20 +405,6 @@ impl FrameFormat {
         match self {
             FrameFormat::P010 | FrameFormat::Y410 => 10,
             FrameFormat::Nv12 | FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv => 8,
-        }
-    }
-
-    /// 指定幅のフレームの 1 行あたりの最小バイト数を返す
-    ///
-    /// オーバーフロー時は `None` を返す。
-    pub fn bytes_per_row(self, width: usize) -> Option<usize> {
-        match self {
-            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
-            FrameFormat::Nv12 => Some(width),
-            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
-            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
-            // 1 画素 4 バイト
-            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
         }
     }
 }
@@ -570,50 +558,6 @@ pub fn supported_codecs(adapter: AdapterSelector) -> Result<Vec<CodecInfo>, Erro
     }
 
     Ok(result)
-}
-
-/// 指定したコーデックとプロファイルで使われる Width / Height の Step を返す
-///
-/// `profile_id` はビットストリームのヘッダから得た `mfxInfoMFX.CodecProfile` である。
-/// 指定プロファイルの System メモリの Step が見つからない場合はエラーを返す。
-pub(crate) fn decoder_frame_step(
-    codecs: &[CodecInfo],
-    codec: VideoCodecType,
-    profile_id: u32,
-) -> Result<(u32, u32), Error> {
-    let decoding = codecs
-        .iter()
-        .find(|info| info.codec == codec)
-        .and_then(|info| info.decoding.as_ref())
-        .ok_or_else(|| {
-            Error::new_custom_owned(
-                "Decoder::initialize",
-                format!("no decoding capabilities for {codec:?}"),
-            )
-        })?;
-
-    let target_profile = VideoProfile::from_mfx_profile(codec, profile_id);
-    let profile = decoding
-        .profiles
-        .iter()
-        .find(|profile| profile.profile == target_profile)
-        .ok_or_else(|| {
-            Error::new_custom_owned(
-                "Decoder::initialize",
-                format!("no profile capabilities for {target_profile:?}"),
-            )
-        })?;
-    let memory_type = profile
-        .memory_types
-        .iter()
-        .find(|memory_type| memory_type.memory_type == MemoryType::System)
-        .ok_or_else(|| {
-            Error::new_custom_owned(
-                "Decoder::initialize",
-                format!("no system memory capabilities for {codec:?} profile {target_profile:?}"),
-            )
-        })?;
-    Ok((memory_type.width.step, memory_type.height.step))
 }
 
 /// mfxImplDescription からコーデック情報の一覧を構築する
@@ -1459,83 +1403,5 @@ mod tests {
             encoding.max_codec_level, None,
             "エンコードの max_codec_level が None ではない: {encoding:?}"
         );
-    }
-
-    /// 指定プロファイルの System メモリの Step を返すこと
-    #[test]
-    fn decoder_frame_step_returns_profile_step() {
-        let codec_info = CodecInfo {
-            codec: VideoCodecType::H264,
-            decoding: Some(DecodingInfo {
-                max_codec_level: None,
-                profiles: vec![ProfileCapabilities {
-                    profile: VideoProfile::H264(H264Profile::High),
-                    memory_types: vec![MemoryTypeCapabilities {
-                        memory_type: MemoryType::System,
-                        width: ValueRange {
-                            min: 16,
-                            max: 4096,
-                            step: 16,
-                        },
-                        height: ValueRange {
-                            min: 16,
-                            max: 4096,
-                            step: 32,
-                        },
-                        color_formats: Vec::new(),
-                    }],
-                }],
-            }),
-            encoding: None,
-        };
-
-        assert_eq!(
-            decoder_frame_step(
-                &[codec_info],
-                VideoCodecType::H264,
-                sys::MFX_PROFILE_AVC_HIGH
-            )
-            .expect("Step の取得に失敗した"),
-            (16, 32),
-            "プロファイルの System メモリの Step が返らない"
-        );
-    }
-
-    /// 1 行あたりのバイト数が形式ごとの 1 画素あたりのバイト数と一致すること
-    #[test]
-    fn frame_format_bytes_per_row_matches_bytes_per_pixel() {
-        let cases = [
-            (FrameFormat::Nv12, 320),
-            (FrameFormat::P010, 640),
-            (FrameFormat::Yuy2, 640),
-            (FrameFormat::Bgra, 1280),
-            (FrameFormat::Ayuv, 1280),
-            (FrameFormat::Y410, 1280),
-        ];
-        for (format, expected) in cases {
-            assert_eq!(
-                format.bytes_per_row(320),
-                Some(expected),
-                "{format:?} の行あたりのバイト数が不一致"
-            );
-        }
-        // 1 画素 1 バイトの Nv12 は乗算がないためオーバーフローしない
-        assert_eq!(
-            FrameFormat::Nv12.bytes_per_row(usize::MAX),
-            Some(usize::MAX)
-        );
-        for format in [
-            FrameFormat::P010,
-            FrameFormat::Yuy2,
-            FrameFormat::Bgra,
-            FrameFormat::Ayuv,
-            FrameFormat::Y410,
-        ] {
-            assert_eq!(
-                format.bytes_per_row(usize::MAX),
-                None,
-                "{format:?} の行あたりのバイト数がオーバーフロー時に None にならない"
-            );
-        }
     }
 }
