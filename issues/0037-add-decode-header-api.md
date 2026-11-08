@@ -48,7 +48,7 @@ WebRTC の受信経路などで、新しい sequence のキーフレームをデ
 1. `Decoder::decode_header` が H.264 / HEVC / AV1 のキーフレームから `StreamInfo` を返す。
 2. SPS/PPS / sequence header を含まないデータではエラーを返すことをテストで固定する。
 3. `decode_header` が入力を消費せず、同じ AU を `decode()` に流せることをテストで固定する。
-4. 256x160 と 320x240 のキーフレームで、それぞれの coded / 表示サイズが返ることをテストで固定する。
+4. 256x160 / 320x240 と、coded サイズと表示サイズが異なる 318x238 のキーフレームで、それぞれの coded / 表示サイズが返ることをテストで固定する。
 5. `CHANGES.md` と `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新する。
 
 ## 参考

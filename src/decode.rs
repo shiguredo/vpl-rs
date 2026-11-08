@@ -125,23 +125,20 @@ pub struct StreamInfo {
     pub codec: VideoCodecType,
     /// coded 幅 (ピクセル)
     ///
-    /// 表示幅以上の値になり、VPL 実装のアラインメントに切り上げられた値になる。
+    /// VPL が返すアライン済みのフレーム幅
     pub coded_width: usize,
     /// coded 高さ (ピクセル)
     ///
-    /// 表示高さ以上の値になり、VPL 実装のアラインメントに切り上げられた値になる。
+    /// VPL が返すアライン済みのフレーム高さ
     pub coded_height: usize,
     /// 表示幅 (ピクセル)
-    ///
-    /// クロップ後の表示領域の幅である。
     pub width: usize,
     /// 表示高さ (ピクセル)
-    ///
-    /// クロップ後の表示領域の高さである。
     pub height: usize,
     /// フレームレート
     ///
     /// ビットストリームにフレームレートの情報が無い場合は `None`。
+    /// `Some` である場合、`framerate.num` と `framerate.den` は必ず 0 以外の値になる
     pub framerate: Option<Framerate>,
 }
 
@@ -433,7 +430,8 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// ビットストリームのヘッダからストリーム情報を取得する
     ///
-    /// `data` の先頭から SPS / PPS / sequence header を解析し、解像度とフレームレートを返す。
+    /// `data` の先頭から走査して SPS / PPS / sequence header を探し、解像度と
+    /// フレームレートを返す。
     /// `data` は消費しないため、解析した同じアクセスユニットをそのまま
     /// [`Decoder::decode`] に渡せる。
     ///
@@ -465,7 +463,6 @@ impl<H: DecodeHandler> Decoder<H> {
     /// ヘッダを解析できなかった場合とデコーダの初期化に失敗した場合に `Err` を返す。
     /// 成功するとデコードできる状態になる。
     fn initialize(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
-        // DecodeHeader でビットストリームから解像度などのパラメータを読み取る
         let mut video_param = self.read_video_param_from_header(bs)?;
 
         // デコーダを初期化する。警告を返すことがあるが初期化自体は成功している
@@ -498,9 +495,7 @@ impl<H: DecodeHandler> Decoder<H> {
 
     /// ビットストリームのヘッダを解析し、解析結果が入ったデコーダパラメータを返す
     ///
-    /// 解像度・クロップサイズ・フレームレートは、解析した値になる。
-    /// ヘッダを解析できなかった場合の [`Error::function`] は
-    /// `MFXVideoDECODE_DecodeHeader` になる。
+    /// 解像度・表示サイズ・フレームレートは、解析した値になる。
     fn read_video_param_from_header(
         &self,
         bs: &mut sys::mfxBitstream,

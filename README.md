@@ -35,6 +35,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
 - パラメータのサポート可否検証 (MFXVideoENCODE_Query)
 - エンコーダーからの SPS / PPS / VPS 取得 (MP4 / RTP 用のパラメータセット)
+- デコーダーのキーフレームのヘッダから解像度とフレームレートを取得 (`Decoder::decode_header`)
 - コーデックケーパビリティ照会 (プロファイル別・メモリタイプ別の解像度範囲 / 最大コーデックレベル / 対応色形式)
 
 ## 動作要件
@@ -256,17 +257,18 @@ while let Ok(result) = rx.try_recv() {
 }
 ```
 
-### ヘッダから解像度を取得する
+### ヘッダからのストリーム情報の取得
 
 SPS / PPS / sequence header を含むビットストリーム (通常はキーフレーム) から、デコードを開始する前にストリームの解像度とフレームレートを取得できます。
-`Decoder::decode_header()` は SPS / PPS / sequence header を解析し、`StreamInfo` を返します。
+`Decoder::decode_header()` は SPS / PPS / sequence header を探して解析し、`StreamInfo` を返します。
 入力を消費しないため、解析したデータをそのまま `decode()` に渡せます。
 
 ```rust
+// keyframe は SPS / PPS / sequence header を含むキーフレームのアクセスユニット
+let keyframe = vec![0u8; 1024];
 let info = decoder.decode_header(&keyframe)?;
 println!(
-    "codec: {:?}, coded: {}x{}, display: {}x{}",
-    info.codec,
+    "coded: {}x{}, display: {}x{}",
     info.coded_width,
     info.coded_height,
     info.width,
@@ -280,6 +282,7 @@ if let Some(framerate) = info.framerate {
 decoder.decode(&keyframe, "frame-0")?;
 ```
 
+- `codec` はデコーダーに指定したコーデック種別です
 - `coded_width` / `coded_height` は VPL 実装が内部サーフェスを確保するサイズで、実装のアラインメントに切り上げられた値です
 - `width` / `height` は表示サイズです。デコード結果の `DecodedFrame::width()` / `DecodedFrame::height()` と一致します
 - `framerate` はフレームレートで、`Framerate` の `num` / `den` の比で表されます。約分されているとは限りません。ビットストリームに情報が無い場合は `None` になります
