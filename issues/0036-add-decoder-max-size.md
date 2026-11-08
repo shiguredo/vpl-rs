@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-11-04
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-08
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-decoder-max-size
 - Polished: {YYYY-MM-DD}
@@ -58,6 +58,12 @@ WebRTC などで解像度が途中で変わるストリームを、デコーダ�
 3. `DecodedFrame.resolution_changed` が追加され、最初のフレームは `false`、サイズが変わったフレームで `true`、以降は `false` になることをテストで固定する。
 4. max を超えるストリームを流した場合に、黙って成功せずエラーになることをテストで固定する。
 5. `CHANGES.md` と `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新する。
+
+## 解決方法
+
+`max_width` / `max_height` による解像度変更の継続は VPL の実装依存であり、iHD 26 系では `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM` が返るため、デコーダーの再作成なしでは扱えないことを確認した。
+
+そのため、0036 の実装は取り消した。max 内の解像度変更を扱うには、エラー時の flush、新しいパラメータでの再初期化、同じアクセスユニットの再投入を含む別の設計が必要になる。本 issue は未対応として close する。
 
 ## 参考
 
