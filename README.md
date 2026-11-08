@@ -30,6 +30,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - ビルド時に GitHub から libvpl ヘッダーを自動取得
 - エンコード入力フォーマット選択 (NV12 / P010 / YUY2 / BGRA / AYUV / Y410)
 - デコード出力はストリームのネイティブ形式 (8bit は NV12、10bit は P010)
+- デコーダーの最大サイズ指定と解像度変更の検出
 - フレーム単位のエンコードオプション (IDR フレーム強制)
 - CBR / VBR / CQP / ICQ / QVBR / LA / AVBR / VCM / LA_ICQ / LA_HRD レート制御モード
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
@@ -233,7 +234,10 @@ use shiguredo_vpl::{
 use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
-let config = DecoderConfig::new(adapter, VideoCodecType::H264);
+let mut config = DecoderConfig::new(adapter, VideoCodecType::H264);
+// 解像度変更に備えて内部サーフェスの最大サイズを指定する
+config.max_width = Some(640);
+config.max_height = Some(480);
 
 let (tx, rx) = mpsc::channel();
 let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
@@ -251,10 +255,30 @@ decoder.finish()?;
 // コールバック経由でデコード結果を受け取る
 while let Ok(result) = rx.try_recv() {
     let frame = result?;
-    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, user_data: {:?}",
-        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.user_data());
+    println!(
+        "decoded: {}x{}, resolution changed: {}, Y plane: {} bytes, UV plane: {} bytes, user_data: {:?}",
+        frame.width(),
+        frame.height(),
+        frame.resolution_changed(),
+        frame.y().len(),
+        frame.uv().len(),
+        frame.user_data(),
+    );
 }
 ```
+
+`DecoderConfig::max_width` / `max_height` を指定すると、そのサイズ以上の内部サーフェスを確保します。
+最大サイズ内の解像度変更はデコーダーを再作成せずに扱えます。
+
+- `max_width` / `max_height` は表示サイズとして指定する
+- 内部サーフェスは VPL のアラインメントにより指定値より大きくなることがある
+- 未指定の場合は最初のビットストリームのサイズを使用する
+- 指定した最大サイズが最初のストリームの表示サイズより小さい場合は初期化に失敗する
+- 内部サーフェスのサイズを超える coded サイズのストリームはデコードがエラーになる
+  - 指定値をわずかに超える解像度でも、内部サーフェスに収まればデコードできることがある
+- メモリ消費量は最大サイズに比例する
+- 最大サイズ内の解像度変更では、出力フレームの `width()` / `height()` が新しい表示サイズになる
+- 解像度が変わった最初のフレームで `DecodedFrame::resolution_changed()` が `true` になり、それ以外のフレームは `false` になる (最初の出力フレームも `false`)
 
 ## サポートコーデック
 

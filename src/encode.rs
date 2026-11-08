@@ -54,6 +54,83 @@ pub enum CodecConfig {
     Av1(Av1EncoderConfig),
 }
 
+/// mfxFrameData から 1 行あたりのバイト数 (ピッチ) を取り出す
+///
+/// VPL はピッチを `PitchHigh` と `PitchLow` の 2 つの 16bit 値に分けて保持する。
+/// finalPitch = (PitchHigh << 16) + PitchLow
+///
+/// ref: libvpl api/vpl/mfxstructures.h (mfxFrameData::PitchHigh / PitchLow)
+///
+/// # Safety
+///
+/// `data` は VPL が初期化した有効な `mfxFrameData` である必要がある。
+/// `PitchLow` は共用体のメンバなので、`Pitch` と同じ領域が初期化されている必要がある。
+unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
+    unsafe { ((data.PitchHigh as usize) << 16) + (data.__bindgen_anon_2.PitchLow as usize) }
+}
+
+/// [`Encoder::encode`] に渡すフレーム
+///
+/// [`EncoderConfig::frame_format`] に対応する variant を選ぶ。
+/// `SemiPlanar` の Y プレーンは [`EncoderConfig::height`] 行、UV プレーンはその半分の行数、
+/// `Packed` は 1 プレーンで [`EncoderConfig::height`] 行を持つ。
+/// 各プレーンのデータ長は、行数を `rows` として `rows * pitch` バイト以上必要である。
+/// 各プレーンの `pitch` は `FrameFormat::bytes_per_row(width)` 以上の値であること。
+/// P010 の 10bit 値は 16bit ワードの上位 10bit に格納する（[`FrameFormat::P010`]）。
+#[derive(Debug, Clone, Copy)]
+pub enum FrameData<'a> {
+    /// Semi-Planar YUV 4:2:0 (NV12 / P010)
+    SemiPlanar {
+        /// Y プレーン
+        y: &'a [u8],
+        /// Y プレーンの行間のバイト数（パディングを含む）
+        y_pitch: usize,
+        /// UV プレーン（インターリーブ）
+        uv: &'a [u8],
+        /// UV プレーンの行間のバイト数（パディングを含む）
+        uv_pitch: usize,
+    },
+    /// パック形式 (YUY2 / BGRA / AYUV / Y410)
+    Packed {
+        /// フレームデータ
+        data: &'a [u8],
+        /// 行間のバイト数（パディングを含む）
+        pitch: usize,
+    },
+}
+
+/// プレーンのデータ長が指定行数分あることを検証する
+fn validate_plane(
+    data: &[u8],
+    pitch: usize,
+    rows: usize,
+    row_bytes: usize,
+    name: &str,
+) -> Result<(), Error> {
+    if pitch < row_bytes {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!("{name} plane pitch ({pitch}) is less than bytes per row ({row_bytes})"),
+        ));
+    }
+    let required = rows.checked_mul(pitch).ok_or_else(|| {
+        Error::new_custom_owned(
+            "Encoder::encode",
+            format!("{name} plane size calculation overflowed"),
+        )
+    })?;
+    if data.len() < required {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!(
+                "{name} plane data is too small (got {}, need at least {required})",
+                data.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl FrameFormat {
     /// フレームデータをコピーする
     ///
@@ -141,20 +218,6 @@ impl FrameFormat {
         Ok(())
     }
 
-    /// 指定幅のフレームの 1 行あたりの最小バイト数を返す
-    ///
-    /// オーバーフロー時は `None` を返す。
-    pub fn bytes_per_row(self, width: usize) -> Option<usize> {
-        match self {
-            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
-            FrameFormat::Nv12 => Some(width),
-            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
-            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
-            // 1 画素 4 バイト
-            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
-        }
-    }
-
     /// `mfxFrameInfo.Shift` に設定する値を返す
     ///
     /// VPL の仕様では、10bit サンプルを 16bit ワードに格納する形式について、Shift が 0 の場合は
@@ -173,21 +236,6 @@ impl FrameFormat {
             | FrameFormat::Y410 => 0,
         }
     }
-}
-
-/// mfxFrameData から 1 行あたりのバイト数 (ピッチ) を取り出す
-///
-/// VPL はピッチを `PitchHigh` と `PitchLow` の 2 つの 16bit 値に分けて保持する。
-/// finalPitch = (PitchHigh << 16) + PitchLow
-///
-/// ref: libvpl api/vpl/mfxstructures.h (mfxFrameData::PitchHigh / PitchLow)
-///
-/// # Safety
-///
-/// `data` は VPL が初期化した有効な `mfxFrameData` である必要がある。
-/// `PitchLow` は共用体のメンバなので、`Pitch` と同じ領域が初期化されている必要がある。
-unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
-    unsafe { ((data.PitchHigh as usize) << 16) + (data.__bindgen_anon_2.PitchLow as usize) }
 }
 
 /// コピー元の行を 1 行ずつコピー先のピッチに従ってコピーする
@@ -758,80 +806,6 @@ pub struct EncodeOptions {
     /// 0 の場合はエンコーダが自動決定する。
     /// `frame_type` モジュールの定数をビット OR で組み合わせて指定する。
     pub frame_type: u16,
-}
-
-/// [`Encoder::encode`] に渡すフレーム
-///
-/// [`EncoderConfig::frame_format`] に対応する variant を選ぶ。
-/// `SemiPlanar` の Y プレーンは [`EncoderConfig::height`] 行、UV プレーンはその半分の行数、
-/// `Packed` は 1 プレーンで [`EncoderConfig::height`] 行を持つ。
-/// 各プレーンのデータ長は、行数を `rows` として `rows * pitch` バイト以上必要である。
-/// 各プレーンの `pitch` は `FrameFormat::bytes_per_row(width)` 以上の値であること。
-/// P010 の 10bit 値は 16bit ワードの上位 10bit に格納する（[`FrameFormat::P010`]）。
-#[derive(Debug, Clone, Copy)]
-pub enum FrameData<'a> {
-    /// Semi-Planar YUV 4:2:0 (NV12 / P010)
-    SemiPlanar {
-        /// Y プレーン
-        y: &'a [u8],
-        /// Y プレーンの行間のバイト数（パディングを含む）
-        y_pitch: usize,
-        /// UV プレーン（インターリーブ）
-        uv: &'a [u8],
-        /// UV プレーンの行間のバイト数（パディングを含む）
-        uv_pitch: usize,
-    },
-    /// パック形式 (YUY2 / BGRA / AYUV / Y410)
-    Packed {
-        /// フレームデータ
-        data: &'a [u8],
-        /// 行間のバイト数（パディングを含む）
-        pitch: usize,
-    },
-}
-
-/// プレーンのデータ長が指定行数分あることを検証する
-fn validate_plane(
-    data: &[u8],
-    pitch: usize,
-    rows: usize,
-    row_bytes: usize,
-    name: &str,
-) -> Result<(), Error> {
-    if pitch < row_bytes {
-        return Err(Error::new_custom_owned(
-            "Encoder::encode",
-            format!("{name} plane pitch ({pitch}) is less than bytes per row ({row_bytes})"),
-        ));
-    }
-    let required = plane_span(rows, pitch, row_bytes).ok_or_else(|| {
-        Error::new_custom_owned(
-            "Encoder::encode",
-            format!("{name} plane size calculation overflowed"),
-        )
-    })?;
-    if data.len() < required {
-        return Err(Error::new_custom_owned(
-            "Encoder::encode",
-            format!(
-                "{name} plane data is too small (got {}, need at least {required})",
-                data.len()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// プレーンが必要とするバイト数を返す
-///
-/// 最終行の後ろのパディングは含まない。
-fn plane_span(rows: usize, pitch: usize, row_bytes: usize) -> Option<usize> {
-    if rows == 0 {
-        return Some(0);
-    }
-    rows.checked_sub(1)?
-        .checked_mul(pitch)?
-        .checked_add(row_bytes)
 }
 
 /// ピクチャータイプ
@@ -2247,12 +2221,11 @@ fn codec_profile(codec: &CodecConfig) -> u16 {
 
 /// alignment の倍数に切り上げる
 ///
-/// オーバーフロー時は alignment 境界に丸めた最大値を返す。
+/// 切り上げが `u32` の範囲を超える場合は、alignment の倍数で `u32` に収まる最大値を返す。
 fn align_up(value: u32, alignment: u32) -> u32 {
-    match value.checked_add(alignment - 1) {
-        Some(v) => v & !(alignment - 1),
-        None => !(alignment - 1),
-    }
+    value
+        .checked_next_multiple_of(alignment)
+        .unwrap_or_else(|| u32::MAX - (u32::MAX % alignment))
 }
 
 /// bool を MFX_CODINGOPTION_* の値へ変換する
@@ -2305,40 +2278,20 @@ mod tests {
         assert_eq!(FrameFormat::from_fourcc(0xDEAD_BEEF), None);
     }
 
-    /// 1 行あたりのバイト数が形式ごとの 1 画素あたりのバイト数と一致すること
+    /// 切り上げが u32 の範囲を超える場合は alignment の倍数で最大の値を返すこと
     #[test]
-    fn frame_format_bytes_per_row_matches_bytes_per_pixel() {
-        let cases = [
-            (FrameFormat::Nv12, 320),
-            (FrameFormat::P010, 640),
-            (FrameFormat::Yuy2, 640),
-            (FrameFormat::Bgra, 1280),
-            (FrameFormat::Ayuv, 1280),
-            (FrameFormat::Y410, 1280),
-        ];
-        for (format, expected) in cases {
+    fn align_up_overflow_returns_aligned_max() {
+        for alignment in [16, 1024] {
+            let aligned = align_up(u32::MAX, alignment);
             assert_eq!(
-                format.bytes_per_row(320),
-                Some(expected),
-                "{format:?} の行あたりのバイト数が不一致"
+                aligned % alignment,
+                0,
+                "オーバーフロー時の戻り値が alignment {alignment} の倍数でない: {aligned}"
             );
-        }
-        // 1 画素 1 バイトの Nv12 は乗算がないためオーバーフローしない
-        assert_eq!(
-            FrameFormat::Nv12.bytes_per_row(usize::MAX),
-            Some(usize::MAX)
-        );
-        for format in [
-            FrameFormat::P010,
-            FrameFormat::Yuy2,
-            FrameFormat::Bgra,
-            FrameFormat::Ayuv,
-            FrameFormat::Y410,
-        ] {
             assert_eq!(
-                format.bytes_per_row(usize::MAX),
-                None,
-                "{format:?} の行あたりのバイト数がオーバーフロー時に None にならない"
+                aligned,
+                u32::MAX - (u32::MAX % alignment),
+                "オーバーフロー時の戻り値が alignment {alignment} の最大値でない"
             );
         }
     }
@@ -2442,6 +2395,16 @@ mod tests {
         }
     }
 
+    /// mfxFrameData の PitchHigh / PitchLow からピッチを計算すること
+    #[test]
+    fn frame_data_pitch_combines_pitch_high_and_pitch_low() {
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 1;
+        data.__bindgen_anon_2.PitchLow = 2;
+        // finalPitch = (1 << 16) + 2
+        assert_eq!(unsafe { frame_data_pitch(&data) }, 65538);
+    }
+
     /// コピー先のピッチが 1 行のバイト数未満ならエラーになること
     #[test]
     fn copy_to_surface_planes_rejects_short_destination_pitch() {
@@ -2525,16 +2488,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// ピッチが PitchHigh と PitchLow を合わせた 32bit の値になること
-    #[test]
-    fn frame_data_pitch_combines_pitch_high_and_pitch_low() {
-        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
-        data.PitchHigh = 1;
-        data.__bindgen_anon_2.PitchLow = 2;
-        // finalPitch = (1 << 16) + 2
-        assert_eq!(unsafe { frame_data_pitch(&data) }, 65538);
     }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {

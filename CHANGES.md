@@ -11,6 +11,11 @@
 
 ## develop
 
+- [CHANGE] `DecoderConfig` に `max_width` / `max_height` を追加する
+  - 指定した最大サイズ以上の内部サーフェスを確保し、最大サイズ内の解像度変更をデコーダーの再作成なしで扱えるようにする
+  - 最大サイズは表示サイズとして指定する。内部サーフェスは実装記述の Width / Height の Step に切り上げるため、指定値より大きくなることがある
+  - `DecoderConfig` を構造体リテラルで構築する既存コードは `max_width` / `max_height` の明示指定が必須になりコンパイル不能になる
+  - @melpon
 - [CHANGE] プロファイル型とコーデック識別型を統合する
   - `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` に統合する
   - `DecoderCodec` を削除し、`DecoderConfig` のコーデックを `VideoCodecType` で指定するよう変更する
@@ -53,6 +58,9 @@
 - [ADD] エンコーダーから SPS / PPS / VPS を取得する API を追加する
   - `Encoder::get_sequence_params` でスタートコードを含まない NAL / OBU を取得できる
   - `SequenceParams` を公開し、AV1 は Sequence Header OBU、VP9 は `None` を返す
+  - @melpon
+- [ADD] `DecodedFrame` に `resolution_changed` を追加する
+  - 直前の出力フレームから解像度が変わった最初のフレームで `true` を返す
   - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
