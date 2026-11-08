@@ -54,6 +54,11 @@
   - `Encoder::get_sequence_params` でスタートコードを含まない NAL / OBU を取得できる
   - `SequenceParams` を公開し、AV1 は Sequence Header OBU、VP9 は `None` を返す
   - @melpon
+- [ADD] デコーダーでビットストリームのヘッダから解像度を取得する API を追加する
+  - `Decoder::decode_header` で SPS / PPS / sequence header を含むデータから `StreamInfo` を取得できる
+  - `StreamInfo` は `codec` / `coded_width` / `coded_height` / `width` / `height` / `framerate` (`Option<Framerate>`) を持つ
+  - `Decoder::decode_header` は入力を消費しないため、同じアクセスユニットをそのまま `decode` に渡せる
+  - @melpon
 - [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
   - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
   - @melpon

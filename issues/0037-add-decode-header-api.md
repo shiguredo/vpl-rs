@@ -11,12 +11,11 @@
 
 WebRTC の受信経路などで、新しい sequence のキーフレームをデコーダーに流す前に、そのストリームの解像度を取得できるようにする。
 
-0036 の max サイズと組み合わせ、max を超える場合にデコーダーを作り直す判断を、フレームを失う前にできるようにする。
+キーフレームの時点で解像度が分かるため、フレームを失う前にデコーダーの作り直しや受信経路の切り替えを判断できる。
 
 ## 現状
 
 - `Decoder::initialize` は内部で `MFXVideoDECODE_DecodeHeader` を呼んでいるが、公開 API は無い
-- `DecoderConfig` に max サイズは無い (0036 で追加する)
 - `DecodedFrame` のサイズは出力フレームからのみ分かる
 - `MFXVideoDECODE_GetVideoParam` を毎フレーム呼べば検出できるが、コストがかかる
 - webrtc-rs の `EncodedImageRef::frame_type()` でキーフレームかどうかは分かるが、sora-rust-sdk の VPL デコーダーアダプターはそれを使っていない
@@ -36,24 +35,20 @@ WebRTC の受信経路などで、新しい sequence のキーフレームをデ
 - `StreamInfo` は次の情報を持つ
   - `codec`
   - `coded_width` / `coded_height` (`FrameInfo.Width` / `Height`)
-  - `crop_width` / `crop_height` (`CropW` / `CropH`)
-  - `framerate_num` / `framerate_den`
+  - `width` / `height` (`CropW` / `CropH`)
+  - `framerate: Option<Framerate>` (ビットストリームに情報が無い場合は `None`)
 - SPS/PPS / sequence header を含まないデータ (P/B フレーム単体) ではエラーを返す。rustdoc に明記する
-- 呼び出しはキーフレームのときだけ行う
+- 呼び出しはパラメータセットを含むデータ (通常はキーフレーム) のときに行う
   - WebRTC では `EncodedImage::frame_type() == VideoFrameType::Key` で判定できる
   - 毎フレーム呼ぶ必要はない
-- 0036 の max と組み合わせる
-  - `crop_width` / `crop_height` を max と比較する
-  - 超えていたら、より大きい max で `Decoder` を作り直す
-  - そのキーフレームの AU を新しいデコーダーに流す
 - `Decoder::initialize` の `DecodeHeader` 呼び出しを共通化し、`decode_header` と同じ変換を使う
 
 ## 完了条件
 
 1. `Decoder::decode_header` が H.264 / HEVC / AV1 のキーフレームから `StreamInfo` を返す。
-2. キーフレーム以外のデータではエラーを返すことをテストで固定する。
+2. SPS/PPS / sequence header を含まないデータではエラーを返すことをテストで固定する。
 3. `decode_header` が入力を消費せず、同じ AU を `decode()` に流せることをテストで固定する。
-4. 256x160 と 320x240 のキーフレームで、それぞれの coded / crop サイズが返ることをテストで固定する。
+4. 256x160 と 320x240 のキーフレームで、それぞれの coded / 表示サイズが返ることをテストで固定する。
 5. `CHANGES.md` と `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新する。
 
 ## 参考
@@ -61,4 +56,3 @@ WebRTC の受信経路などで、新しい sequence のキーフレームをデ
 - VPL の `MFXVideoDECODE_DecodeHeader`
 - webrtc-rs の `EncodedImageRef::frame_type()` と `VideoFrameType`
 - sora-rust-sdk の `VplVideoDecoder::decode` (`EncodedImageRef` を受け取る)
-- 0036 (max サイズ)

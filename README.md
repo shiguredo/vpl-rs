@@ -256,6 +256,36 @@ while let Ok(result) = rx.try_recv() {
 }
 ```
 
+### ヘッダから解像度を取得する
+
+SPS / PPS / sequence header を含むビットストリーム (通常はキーフレーム) から、デコードを開始する前にストリームの解像度とフレームレートを取得できます。
+`Decoder::decode_header()` は SPS / PPS / sequence header を解析し、`StreamInfo` を返します。
+入力を消費しないため、解析したデータをそのまま `decode()` に渡せます。
+
+```rust
+let info = decoder.decode_header(&keyframe)?;
+println!(
+    "codec: {:?}, coded: {}x{}, display: {}x{}",
+    info.codec,
+    info.coded_width,
+    info.coded_height,
+    info.width,
+    info.height,
+);
+if let Some(framerate) = info.framerate {
+    println!("framerate: {}/{}", framerate.num, framerate.den);
+}
+
+// 同じキーフレームをそのままデコードできる
+decoder.decode(&keyframe, "frame-0")?;
+```
+
+- `coded_width` / `coded_height` は VPL 実装が内部サーフェスを確保するサイズで、実装のアラインメントに切り上げられた値です
+- `width` / `height` は表示サイズです。デコード結果の `DecodedFrame::width()` / `DecodedFrame::height()` と一致します
+- `framerate` はフレームレートで、`Framerate` の `num` / `den` の比で表されます。約分されているとは限りません。ビットストリームに情報が無い場合は `None` になります
+- `data` には SPS / PPS / sequence header が必要です。これらは通常キーフレームに含まれます
+- `Decoder::decode` と同じスレッドで、`Decoder::decode` と直列になるように呼んでください
+
 ## サポートコーデック
 
 ### エンコード

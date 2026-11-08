@@ -107,6 +107,44 @@ impl<'a, T> DecodedFrame<'a, T> {
     }
 }
 
+/// フレームレート
+///
+/// `num / den` でフレームレートを表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framerate {
+    /// 分子
+    pub num: u32,
+    /// 分母
+    pub den: u32,
+}
+
+/// ストリームのコーデック・解像度・フレームレートを表す情報
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// ストリームのコーデック種別
+    pub codec: VideoCodecType,
+    /// coded 幅 (ピクセル)
+    ///
+    /// 表示幅以上の値になり、VPL 実装のアラインメントに切り上げられた値になる。
+    pub coded_width: usize,
+    /// coded 高さ (ピクセル)
+    ///
+    /// 表示高さ以上の値になり、VPL 実装のアラインメントに切り上げられた値になる。
+    pub coded_height: usize,
+    /// 表示幅 (ピクセル)
+    ///
+    /// クロップ後の表示領域の幅である。
+    pub width: usize,
+    /// 表示高さ (ピクセル)
+    ///
+    /// クロップ後の表示領域の高さである。
+    pub height: usize,
+    /// フレームレート
+    ///
+    /// ビットストリームにフレームレートの情報が無い場合は `None`。
+    pub framerate: Option<Framerate>,
+}
+
 /// デコーダーの統計値
 ///
 /// [`Decoder::stats`] が返す統計値である。値はデコード処理の進行に伴って
@@ -306,6 +344,48 @@ fn call_decode_frame_async_with_retry(
     }
 }
 
+/// 入力データを参照する `mfxBitstream` を構築する
+///
+/// 返る `mfxBitstream` の `Data` は `data` を指すため、`data` より長く保持してはならない。
+/// データ長が `u32::MAX` を超える場合は `function` を関数名に持つ `Error` を返す。
+fn create_bitstream(data: &[u8], function: &'static str) -> Result<sys::mfxBitstream, Error> {
+    let data_len = u32::try_from(data.len()).map_err(|_| {
+        Error::new_custom_owned(
+            function,
+            format!("bitstream length {} exceeds u32::MAX", data.len()),
+        )
+    })?;
+    let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
+    // VPL API は書き込み可能なポインタを要求するが、入力データを書き換えないためキャストする
+    bs.Data = data.as_ptr() as *mut u8;
+    bs.DataLength = data_len;
+    bs.MaxLength = data_len;
+    Ok(bs)
+}
+
+/// ヘッダ解析済みの `mfxVideoParam` から `StreamInfo` を構築する
+fn stream_info_from_video_param(
+    codec: VideoCodecType,
+    video_param: &sys::mfxVideoParam,
+) -> StreamInfo {
+    let mfx = unsafe { video_param.__bindgen_anon_1.mfx };
+    let frame_info = mfx.FrameInfo;
+    let fi = unsafe { frame_info.__bindgen_anon_1.__bindgen_anon_1 };
+    // フレームレートの情報が無い場合、VPL は 0/0 を返す
+    let framerate = match (frame_info.FrameRateExtN, frame_info.FrameRateExtD) {
+        (0, _) | (_, 0) => None,
+        (num, den) => Some(Framerate { num, den }),
+    };
+    StreamInfo {
+        codec,
+        coded_width: usize::from(fi.Width),
+        coded_height: usize::from(fi.Height),
+        width: usize::from(fi.CropW),
+        height: usize::from(fi.CropH),
+        framerate,
+    }
+}
+
 impl<H: DecodeHandler> Decoder<H> {
     /// デコーダを作成する
     ///
@@ -351,35 +431,42 @@ impl<H: DecodeHandler> Decoder<H> {
         &self.stats
     }
 
+    /// ビットストリームのヘッダからストリーム情報を取得する
+    ///
+    /// `data` の先頭から SPS / PPS / sequence header を解析し、解像度とフレームレートを返す。
+    /// `data` は消費しないため、解析した同じアクセスユニットをそのまま
+    /// [`Decoder::decode`] に渡せる。
+    ///
+    /// デコーダーの初期化前後を問わず呼べる。[`Decoder::new`] の直後でも呼べる。
+    ///
+    /// # 前提
+    ///
+    /// `data` は SPS / PPS / sequence header を含む必要がある。これらは通常
+    /// キーフレームのアクセスユニットに含まれる。
+    ///
+    /// # エラー
+    ///
+    /// ヘッダを解析できなかった場合に `Err` を返す。VPL が返したエラーの
+    /// [`Error::function`] は `MFXVideoDECODE_DecodeHeader` になる。
+    /// データ長が `u32::MAX` を超える場合も `Err` を返す。
+    ///
+    /// # 呼び出しスレッド
+    ///
+    /// [`Decoder::decode`] と同じスレッドで、[`Decoder::decode`] と直列になるように
+    /// 呼ぶこと。コールバック ([`DecodeHandler::on_decoded`]) から呼び出してはならない。
+    pub fn decode_header(&self, data: &[u8]) -> Result<StreamInfo, Error> {
+        let mut bs = create_bitstream(data, "Decoder::decode_header")?;
+        let video_param = self.read_video_param_from_header(&mut bs)?;
+        Ok(stream_info_from_video_param(self.codec, &video_param))
+    }
+
     /// ビットストリームからヘッダを解析してデコーダを初期化する
     ///
-    /// `MFXVideoDECODE_DecodeHeader` でビットストリームの SPS/PPS 等を解析し、
-    /// `MFXVideoDECODE_Init` でデコーダを初期化する。
-    /// `IOPattern = OUT_SYSTEM_MEMORY` を使用し、Map/Unmap でデータにアクセスする。
-    ///
-    /// AsyncDepth は設定値またはデフォルト 4 を使用する。
-    /// libvpl のガイドでは、1 は最小メモリだが性能が低く、4 は高スループット寄りの推奨値とされる。
+    /// ヘッダを解析できなかった場合とデコーダの初期化に失敗した場合に `Err` を返す。
+    /// 成功するとデコードできる状態になる。
     fn initialize(&mut self, bs: &mut sys::mfxBitstream) -> Result<(), Error> {
-        let codec_id = self.codec.to_codec_id();
-
-        // デコーダパラメータを設定する
-        let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
-        video_param.IOPattern = sys::MFX_IOPATTERN_OUT_SYSTEM_MEMORY as u16;
-        video_param.AsyncDepth = self.async_depth;
-        unsafe {
-            let mfx = &mut video_param.__bindgen_anon_1.mfx;
-            mfx.CodecId = codec_id;
-            mfx.FrameInfo.FourCC = sys::MFX_FOURCC_NV12;
-            mfx.FrameInfo.ChromaFormat = sys::MFX_CHROMAFORMAT_YUV420 as u16;
-            mfx.FrameInfo.PicStruct = sys::MFX_PICSTRUCT_PROGRESSIVE as u16;
-        }
-
         // DecodeHeader でビットストリームから解像度などのパラメータを読み取る
-        self.session.lib().mfx_video_decode_decode_header(
-            self.session.as_ptr(),
-            bs,
-            &mut video_param,
-        )?;
+        let mut video_param = self.read_video_param_from_header(bs)?;
 
         // デコーダを初期化する。警告を返すことがあるが初期化自体は成功している
         self.session
@@ -389,6 +476,42 @@ impl<H: DecodeHandler> Decoder<H> {
         self.initialized = true;
 
         Ok(())
+    }
+
+    /// デコーダのパラメータを構築する
+    ///
+    /// `CodecId` / `IOPattern` / `AsyncDepth` と、`FrameInfo` の出力形式を設定した
+    /// `mfxVideoParam` を返す。
+    fn create_decode_video_param(&self) -> sys::mfxVideoParam {
+        let mut video_param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
+        video_param.IOPattern = sys::MFX_IOPATTERN_OUT_SYSTEM_MEMORY as u16;
+        video_param.AsyncDepth = self.async_depth;
+        unsafe {
+            let mfx = &mut video_param.__bindgen_anon_1.mfx;
+            mfx.CodecId = self.codec.to_codec_id();
+            mfx.FrameInfo.FourCC = sys::MFX_FOURCC_NV12;
+            mfx.FrameInfo.ChromaFormat = sys::MFX_CHROMAFORMAT_YUV420 as u16;
+            mfx.FrameInfo.PicStruct = sys::MFX_PICSTRUCT_PROGRESSIVE as u16;
+        }
+        video_param
+    }
+
+    /// ビットストリームのヘッダを解析し、解析結果が入ったデコーダパラメータを返す
+    ///
+    /// 解像度・クロップサイズ・フレームレートは、解析した値になる。
+    /// ヘッダを解析できなかった場合の [`Error::function`] は
+    /// `MFXVideoDECODE_DecodeHeader` になる。
+    fn read_video_param_from_header(
+        &self,
+        bs: &mut sys::mfxBitstream,
+    ) -> Result<sys::mfxVideoParam, Error> {
+        let mut video_param = self.create_decode_video_param();
+        self.session.lib().mfx_video_decode_decode_header(
+            self.session.as_ptr(),
+            bs,
+            &mut video_param,
+        )?;
+        Ok(video_param)
     }
 
     /// 圧縮されたビットストリームデータをデコードする
@@ -401,17 +524,7 @@ impl<H: DecodeHandler> Decoder<H> {
     /// `decode()` 呼び出しとフレーム出力は 1:1 に対応しない場合がある。
     /// user_data は Worker スレッド内で frame_seq の一致により管理される。
     pub fn decode(&mut self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
-        let mut bs: sys::mfxBitstream = unsafe { std::mem::zeroed() };
-        let data_len = u32::try_from(data.len()).map_err(|_| {
-            Error::new_custom_owned(
-                "Decoder::decode",
-                format!("bitstream length {} exceeds u32::MAX", data.len()),
-            )
-        })?;
-        // VPL API は *mut を要求するが入力データを書き換えないためキャストする
-        bs.Data = data.as_ptr() as *mut u8;
-        bs.DataLength = data_len;
-        bs.MaxLength = data_len;
+        let mut bs = create_bitstream(data, "Decoder::decode")?;
 
         // 未初期化の場合は初期化する。初期化エラー時に QueueFrame を送信しない。
         if !self.initialized {
