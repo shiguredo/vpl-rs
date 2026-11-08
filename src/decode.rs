@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use crate::codec_info::VideoCodecType;
+use crate::codec_info::{VideoCodecType, decoder_frame_step, supported_codecs};
 use crate::stats::{Counter, Gauge};
 use crate::vpl::{FrameSurface, Session, VplLibrary};
 use crate::{AdapterSelector, Error, sys};
@@ -14,6 +14,19 @@ const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 ///
 /// デコードするビットストリームのコーデックと使用するアダプタを指定する。
 /// 解像度やフレームレートはビットストリームのヘッダから自動的に検出される。
+///
+/// # 最大サイズ
+///
+/// [`DecoderConfig::max_width`] / [`DecoderConfig::max_height`] を指定すると、
+/// そのサイズ以上の内部サーフェスを確保する。指定値は表示サイズとして扱い、
+/// 内部サーフェスは VPL のアラインメントにより指定値より大きくなることがある。
+/// 未指定の場合は最初のビットストリームのサイズを使用する。メモリ消費量は
+/// 最大サイズに比例する。
+///
+/// 指定した最大サイズが最初のビットストリームの表示サイズより小さい場合は初期化に失敗する。
+/// 内部サーフェスのサイズとして表現できる範囲を超える場合も初期化に失敗する。
+/// 内部サーフェスのサイズを超える coded サイズのストリームはデコードがエラーになる。
+/// 指定値をわずかに超える解像度でも、内部サーフェスに収まればデコードできることがある。
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
     /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
@@ -25,6 +38,10 @@ pub struct DecoderConfig {
     /// 1 = 最小メモリだが性能が低い。4 = 高スループット寄りの推奨値。
     /// None の場合は 4（推奨値）を使用する。
     pub async_depth: Option<u16>,
+    /// 内部サーフェスの最大幅（ピクセル）
+    pub max_width: Option<u32>,
+    /// 内部サーフェスの最大高さ（ピクセル）
+    pub max_height: Option<u32>,
 }
 
 impl DecoderConfig {
@@ -36,6 +53,8 @@ impl DecoderConfig {
             adapter,
             codec,
             async_depth: None,
+            max_width: None,
+            max_height: None,
         }
     }
 }
@@ -63,6 +82,7 @@ pub struct DecodedFrame<'a, T> {
     pitch: usize,
     width: usize,
     height: usize,
+    resolution_changed: bool,
     user_data: T,
 }
 
@@ -94,6 +114,15 @@ impl<'a, T> DecodedFrame<'a, T> {
     /// フレームのクロップ高さを返す
     pub fn height(&self) -> usize {
         self.height
+    }
+
+    /// 直前の出力フレームから解像度が変わったかどうかを返す
+    ///
+    /// デコーダーが出力した最初のフレームは false になる。直前の出力フレームと
+    /// クロップサイズ (`width()` / `height()`) が異なる最初のフレームで true になり、
+    /// サイズが変わるまで以降のフレームは false になる。
+    pub fn resolution_changed(&self) -> bool {
+        self.resolution_changed
     }
 
     /// デコード時に渡した値を取得する
@@ -211,7 +240,7 @@ where
 /// 出力フォーマットはストリームのネイティブ形式で決まる。NV12 / P010 以外の出力には
 /// 未対応で、デコード時にエラーになる。詳細は [`DecodedFrame`] を参照。
 /// 最初の [`Decoder::decode`] 呼び出し時にビットストリームのヘッダ (SPS/PPS 等) を解析して
-/// 自動的に初期化される。
+/// 自動的に初期化される。最大サイズ内の解像度変更はデコーダーの再作成なしで処理する。
 ///
 /// VPL の内部割り当て (`surface_work=NULL`) を使用するため、アプリケーション側での
 /// サーフェスプール管理は不要。
@@ -230,9 +259,14 @@ where
 /// `Send` のみ実装し、`Sync` は実装しない（生ポインタにより自動的に `!Sync`）。
 pub struct Decoder<H: DecodeHandler> {
     session: Session,
+    adapter: AdapterSelector,
     codec: VideoCodecType,
     /// mfxVideoParam.AsyncDepth に設定する値
     async_depth: u16,
+    /// 設定で指定された内部サーフェスの最大幅
+    max_width: Option<u32>,
+    /// 設定で指定された内部サーフェスの最大高さ
+    max_height: Option<u32>,
     /// DecodeHeader + Init が完了しているか
     initialized: bool,
     /// 入力フレームの連番
@@ -306,6 +340,50 @@ fn call_decode_frame_async_with_retry(
     }
 }
 
+/// 指定された最大サイズを実装の Step に切り上げ、最初のストリームのサイズと比較する
+///
+/// 表示サイズより小さい場合、Step に切り上げられない場合、切り上げ結果が coded サイズより
+/// 小さい場合、`u16` に収まらない場合はエラーを返す。
+fn resolve_frame_dimension(
+    name: &str,
+    dimension: &str,
+    requested: u32,
+    display: u16,
+    coded: u16,
+    step: u32,
+) -> Result<u16, Error> {
+    if requested < u32::from(display) {
+        return Err(Error::new_custom_owned(
+            "Decoder::initialize",
+            format!("{name} ({requested}) is less than the stream display {dimension} ({display})"),
+        ));
+    }
+    let aligned = requested.checked_next_multiple_of(step).ok_or_else(|| {
+        Error::new_custom_owned(
+            "Decoder::initialize",
+            format!("failed to align {name} ({requested}) to step ({step})"),
+        )
+    })?;
+    let aligned = u16::try_from(aligned).map_err(|_| {
+        Error::new_custom_owned(
+            "Decoder::initialize",
+            format!(
+                "aligned {name} ({aligned}) exceeds u16::MAX ({}), requested: {requested}, step: {step}",
+                u16::MAX
+            ),
+        )
+    })?;
+    if aligned < coded {
+        return Err(Error::new_custom_owned(
+            "Decoder::initialize",
+            format!(
+                "aligned {name} ({aligned}) is less than the stream coded {dimension} ({coded})"
+            ),
+        ));
+    }
+    Ok(aligned)
+}
+
 impl<H: DecodeHandler> Decoder<H> {
     /// デコーダを作成する
     ///
@@ -336,8 +414,11 @@ impl<H: DecodeHandler> Decoder<H> {
 
         Ok(Decoder {
             session,
+            adapter: config.adapter,
             codec: config.codec,
             async_depth: config.async_depth.unwrap_or(4),
+            max_width: config.max_width,
+            max_height: config.max_height,
             initialized: false,
             frame_count: 0,
             worker_tx,
@@ -349,6 +430,68 @@ impl<H: DecodeHandler> Decoder<H> {
     /// デコーダーの統計値を取得する
     pub fn stats(&self) -> &DecoderStats {
         &self.stats
+    }
+
+    /// 設定された最大サイズを `mfxVideoParam` に反映する
+    ///
+    /// 最大サイズが未指定の場合は何もしない。
+    /// 最大サイズがストリームの表示サイズや coded サイズと矛盾する場合、Step に切り上げられない場合、
+    /// `u16` の範囲を超える場合はエラーを返す。
+    /// `CropW` / `CropH` はストリームの表示サイズを表すため変更しない。
+    fn apply_max_size(&self, video_param: &mut sys::mfxVideoParam) -> Result<(), Error> {
+        let max_width = self.max_width;
+        let max_height = self.max_height;
+        if max_width.is_none() && max_height.is_none() {
+            return Ok(());
+        }
+
+        // 実装記述の Width / Height の Step に切り上げ、最初のストリームの
+        // 表示サイズと coded サイズを検証してから FrameInfo に設定する。
+
+        let (display_width, display_height, coded_width, coded_height, profile_id) = unsafe {
+            let mfx = &video_param.__bindgen_anon_1.mfx;
+            let info = &mfx.FrameInfo.__bindgen_anon_1.__bindgen_anon_1;
+            (
+                info.CropW,
+                info.CropH,
+                info.Width,
+                info.Height,
+                mfx.CodecProfile,
+            )
+        };
+
+        let codecs = supported_codecs(self.adapter)?;
+        let (width_step, height_step) =
+            decoder_frame_step(&codecs, self.codec, u32::from(profile_id))?;
+        unsafe {
+            let info = &mut video_param
+                .__bindgen_anon_1
+                .mfx
+                .FrameInfo
+                .__bindgen_anon_1
+                .__bindgen_anon_1;
+            if let Some(max_width) = max_width {
+                info.Width = resolve_frame_dimension(
+                    "max_width",
+                    "width",
+                    max_width,
+                    display_width,
+                    coded_width,
+                    width_step,
+                )?;
+            }
+            if let Some(max_height) = max_height {
+                info.Height = resolve_frame_dimension(
+                    "max_height",
+                    "height",
+                    max_height,
+                    display_height,
+                    coded_height,
+                    height_step,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// ビットストリームからヘッダを解析してデコーダを初期化する
@@ -380,6 +523,9 @@ impl<H: DecodeHandler> Decoder<H> {
             bs,
             &mut video_param,
         )?;
+
+        // 最大サイズが指定されている場合は、内部サーフェスのサイズをその値に上書きする。
+        self.apply_max_size(&mut video_param)?;
 
         // デコーダを初期化する。警告を返すことがあるが初期化自体は成功している
         self.session
@@ -596,6 +742,8 @@ fn run_sync_worker<H: DecodeHandler>(
     stats: Arc<DecoderStats>,
 ) {
     let mut pending_map: HashMap<u64, H::UserData> = HashMap::new();
+    // 直前の出力フレームのクロップサイズ。解像度変更の判定に使う。
+    let mut last_output_size: Option<(usize, usize)> = None;
     while let Ok(command) = worker_rx.recv() {
         match command {
             WorkerCommand::QueueFrame {
@@ -624,6 +772,7 @@ fn run_sync_worker<H: DecodeHandler>(
                     session_handle,
                     sync_data,
                     &mut pending_map,
+                    &mut last_output_size,
                     &mut handler,
                     &stats,
                 ) {
@@ -706,6 +855,7 @@ fn sync_and_callback<H: DecodeHandler>(
     session_handle: usize,
     sync_data: DecodeSyncData,
     pending_map: &mut HashMap<u64, H::UserData>,
+    last_output_size: &mut Option<(usize, usize)>,
     handler: &mut H,
     stats: &DecoderStats,
 ) -> Result<(), crate::Error> {
@@ -740,10 +890,23 @@ fn sync_and_callback<H: DecodeHandler>(
     // pending を消費して結果を通知できる状態になった
     stats.in_flight_frames.dec();
 
+    // VPL は解像度変更を出力サーフェスの CropW / CropH に反映するため、
+    // 直前の出力サイズと比較して変更を判定する。
+    let output_size = decoded_surface_size(&frame_surface);
+    let resolution_changed = last_output_size.is_some_and(|previous| previous != output_size);
+
     // デコードされたフレームデータを読み取る
-    let frame = read_decoded_surface(&frame_surface, user_data)?;
+    let frame = read_decoded_surface(&frame_surface, user_data, output_size, resolution_changed)?;
+    *last_output_size = Some(output_size);
     notify_decoded(handler, stats, Ok(frame));
     Ok(())
+}
+
+/// 出力サーフェスのクロップサイズ (幅, 高さ) を返す
+fn decoded_surface_size(frame_surface: &FrameSurface) -> (usize, usize) {
+    let surface = unsafe { &*frame_surface.as_ptr() };
+    let fi = unsafe { &surface.Info.__bindgen_anon_1.__bindgen_anon_1 };
+    (fi.CropW as usize, fi.CropH as usize)
 }
 
 /// デコード結果として扱える色形式かどうか
@@ -759,6 +922,8 @@ fn is_supported_decoded_format(fourcc: u32, chroma_format: u16) -> bool {
 fn read_decoded_surface<'a, T>(
     frame_surface: &'a FrameSurface,
     user_data: T,
+    (crop_w, crop_h): (usize, usize),
+    resolution_changed: bool,
 ) -> Result<DecodedFrame<'a, T>, Error> {
     let surface = unsafe { &*frame_surface.as_ptr() };
     let fourcc = surface.Info.FourCC;
@@ -772,10 +937,6 @@ fn read_decoded_surface<'a, T>(
         ));
     }
 
-    let (crop_w, crop_h) = unsafe {
-        let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
-        (fi.CropW as usize, fi.CropH as usize)
-    };
     let pitch = unsafe { surface.Data.__bindgen_anon_2.Pitch as usize };
     let y_ptr = unsafe { surface.Data.__bindgen_anon_3.Y };
     let uv_ptr = unsafe { surface.Data.__bindgen_anon_4.UV };
@@ -819,6 +980,7 @@ fn read_decoded_surface<'a, T>(
         pitch,
         width: crop_w,
         height: crop_h,
+        resolution_changed,
         user_data,
     })
 }
@@ -1093,6 +1255,63 @@ mod tests {
         assert!(
             !is_supported_decoded_format(sys::MFX_FOURCC_NV12, sys::MFX_CHROMAFORMAT_YUV444 as u16),
             "ChromaFormat が 4:2:0 以外の NV12 が受け付けられている"
+        );
+    }
+
+    /// 最大サイズを実装が返した Step の倍数に切り上げること
+    #[test]
+    fn resolve_frame_dimension_rounds_up() {
+        for (requested, display, coded, expected) in [
+            (1u32, 1u16, 16u16, 16u16),
+            (17, 17, 32, 32),
+            (478, 478, 480, 480),
+            (638, 638, 640, 640),
+            (640, 640, 640, 640),
+            (1080, 1080, 1088, 1088),
+        ] {
+            assert_eq!(
+                resolve_frame_dimension("max_width", "width", requested, display, coded, 16)
+                    .expect("Step への切り上げに失敗した"),
+                expected,
+                "{requested} (coded {coded}) の切り上げ結果が {expected} でない"
+            );
+        }
+    }
+
+    /// 最大サイズが 0 の場合は表示サイズより小さいエラーにすること
+    #[test]
+    fn resolve_frame_dimension_rejects_zero_requested() {
+        let error = resolve_frame_dimension("max_width", "width", 0u32, 320u16, 320u16, 16)
+            .expect_err("0 は拒否されること");
+        assert_eq!(
+            error.status_message(),
+            Some("max_width (0) is less than the stream display width (320)"),
+            "0 を拒否するメッセージであること"
+        );
+    }
+
+    /// Step への切り上げ結果が coded サイズより小さい場合はエラーにすること
+    #[test]
+    fn resolve_frame_dimension_rejects_smaller_than_coded() {
+        let error = resolve_frame_dimension("max_width", "width", 624u32, 624u16, 640u16, 16)
+            .expect_err("coded サイズより小さい値は拒否されること");
+        assert_eq!(
+            error.status_message(),
+            Some("aligned max_width (624) is less than the stream coded width (640)"),
+            "coded サイズより小さい値を拒否するメッセージであること"
+        );
+    }
+
+    /// Step への切り上げ結果が u16 に収まらない場合はエラーにすること
+    #[test]
+    fn resolve_frame_dimension_rejects_out_of_range() {
+        let error =
+            resolve_frame_dimension("max_width", "width", 65_530u32, 65_530u16, 65_530u16, 16)
+                .expect_err("u16 を超える値は拒否されること");
+        assert_eq!(
+            error.status_message(),
+            Some("aligned max_width (65536) exceeds u16::MAX (65535), requested: 65530, step: 16"),
+            "u16 を超える値を拒否するメッセージであること"
         );
     }
 }

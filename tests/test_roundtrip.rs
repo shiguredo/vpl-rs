@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use helpers::test_adapter;
 use shiguredo_vpl::{
-    Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder, DecoderConfig, EncodeOptions,
-    EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameData,
-    FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, MemoryType,
-    PictureType, RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile,
+    Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder, DecoderConfig, DecoderStats,
+    EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler,
+    FrameData, FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile,
+    MemoryType, PictureType, RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile,
     Vp9EncoderConfig, Vp9Profile, ffi, frame_type, supported_codecs,
 };
 
@@ -19,7 +19,21 @@ struct DecodedFrameInfo {
     pitch: usize,
     width: usize,
     height: usize,
+    resolution_changed: bool,
     user_data: usize,
+}
+
+/// コールバックで受け取ったフレームからテスト用の情報を構築する
+fn decoded_frame_info(frame: &DecodedFrame<'_, usize>) -> DecodedFrameInfo {
+    DecodedFrameInfo {
+        y_data: frame.y().to_vec(),
+        uv_data: frame.uv().to_vec(),
+        pitch: frame.pitch(),
+        width: frame.width(),
+        height: frame.height(),
+        resolution_changed: frame.resolution_changed(),
+        user_data: *frame.user_data(),
+    }
 }
 
 /// デコード結果のプレーンサイズが width / height / pitch と整合していることを検証する
@@ -313,18 +327,76 @@ type DecoderAndReceiver = (
     mpsc::Receiver<Result<usize, Error>>,
 );
 
-/// デコード結果をコールバックで受信するデコーダと受信用チャネルを生成するヘルパー
-fn create_decoder(codec: VideoCodecType) -> DecoderAndReceiver {
-    let (tx, rx) = mpsc::channel::<Result<usize, Error>>();
+/// デコード結果を変換して送信するデコーダと受信用チャネルを生成するヘルパー
+fn create_decoder_with<F, T>(
+    config: DecoderConfig,
+    convert: F,
+) -> (
+    Decoder<FnDecodeHandler<usize>>,
+    mpsc::Receiver<Result<T, Error>>,
+)
+where
+    F: for<'a> Fn(&DecodedFrame<'a, usize>) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<T, Error>>();
     let decoder = Decoder::new(
-        DecoderConfig::new(test_adapter(), codec),
+        config,
         FnDecodeHandler::new(move |result| {
-            tx.send(result.map(|frame| *frame.user_data()))
-                .expect("デコード結果の送信に失敗した");
+            tx.send(result.map(|frame| convert(&frame)))
+                .expect("デコード結果コールバックの送信に失敗した");
         }),
     )
     .expect("デコーダーの生成に失敗した");
     (decoder, rx)
+}
+
+/// デコード結果をコールバックで受信するデコーダと受信用チャネルを生成するヘルパー
+fn create_decoder(codec: VideoCodecType) -> DecoderAndReceiver {
+    create_decoder_with(DecoderConfig::new(test_adapter(), codec), |frame| {
+        *frame.user_data()
+    })
+}
+
+/// 指定した設定のデコーダと、デコード結果をフレーム情報として受信するチャネルを生成するヘルパー
+fn create_decoder_with_config(
+    config: DecoderConfig,
+) -> (
+    Decoder<FnDecodeHandler<usize>>,
+    mpsc::Receiver<Result<DecodedFrameInfo, Error>>,
+) {
+    create_decoder_with(config, decoded_frame_info)
+}
+
+/// 最大サイズ付きでビットストリーム列をデコードし、結果と統計値を返す
+fn decode_with_max_size(
+    codec: VideoCodecType,
+    bitstreams: &[Vec<u8>],
+    max_width: u32,
+    max_height: u32,
+) -> (Vec<DecodedFrameInfo>, DecoderStats) {
+    let mut config = DecoderConfig::new(test_adapter(), codec);
+    config.max_width = Some(max_width);
+    config.max_height = Some(max_height);
+    let (mut decoder, rx) = create_decoder_with_config(config);
+
+    for (index, bitstream) in bitstreams.iter().enumerate() {
+        decoder
+            .decode(bitstream, index)
+            .expect("デコードに失敗した");
+    }
+    decoder.finish().expect("finish に失敗した");
+
+    let mut frames = Vec::new();
+    for _ in 0..bitstreams.len() {
+        frames.push(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("デコード結果コールバックの受信がタイムアウトした")
+                .expect("デコードに失敗した"),
+        );
+    }
+    let stats = decoder.stats().clone();
+    (frames, stats)
 }
 
 /// エンコードしてフレーム一覧とフレームごとのビットストリームを返すヘルパー
@@ -390,6 +462,42 @@ fn encode_with_encoder(
     (encoded_frames, bitstreams)
 }
 
+/// 解像度の異なるビットストリームとエンコード結果を指定順に連結する
+///
+/// `segments` の各要素は `(width, height, num_frames)` で、それぞれの解像度で
+/// `num_frames` 枚をエンコードして連結する。
+fn encode_resolution_sequence_with_frames(
+    codec: CodecConfig,
+    gop_ref_dist: Option<u16>,
+    segments: &[(u32, u32, usize)],
+) -> (Vec<Vec<u8>>, Vec<EncodedFrame<usize>>) {
+    let mut bitstreams = Vec::new();
+    let mut encoded_frames = Vec::new();
+    for &(width, height, num_frames) in segments {
+        let frames: Vec<Vec<u8>> = (0..num_frames)
+            .map(|index| generate_dummy_nv12(width as usize, height as usize, index))
+            .collect();
+        let mut config = test_encoder_config(codec.clone(), width, height);
+        config.gop_ref_dist = gop_ref_dist;
+        let (mut segment_frames, mut segment) = encode(config, &frames);
+        bitstreams.append(&mut segment);
+        encoded_frames.append(&mut segment_frames);
+    }
+    (bitstreams, encoded_frames)
+}
+
+/// 解像度の異なるビットストリームを指定順に連結する
+///
+/// `segments` の各要素は `(width, height, num_frames)` で、それぞれの解像度で
+/// `num_frames` 枚をエンコードして連結する。
+fn encode_resolution_sequence(
+    codec: CodecConfig,
+    gop_ref_dist: Option<u16>,
+    segments: &[(u32, u32, usize)],
+) -> Vec<Vec<u8>> {
+    encode_resolution_sequence_with_frames(codec, gop_ref_dist, segments).0
+}
+
 /// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
 fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
     let num_frames = bitstreams.len();
@@ -398,18 +506,7 @@ fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedF
     let mut decoder = Decoder::new(
         config,
         FnDecodeHandler::new(move |result| {
-            let info = result.map(|frame| {
-                let y_data = frame.y().to_vec();
-                let uv_data = frame.uv().to_vec();
-                DecodedFrameInfo {
-                    y_data,
-                    uv_data,
-                    pitch: frame.pitch(),
-                    width: frame.width(),
-                    height: frame.height(),
-                    user_data: *frame.user_data(),
-                }
-            });
+            let info = result.map(|frame| decoded_frame_info(&frame));
             tx.send(info)
                 .expect("デコード結果コールバックの送信に失敗した");
         }),
@@ -514,13 +611,35 @@ fn assert_coded_size(coded: (usize, usize), width: usize, height: usize) {
 ///
 /// 320x240 / 30fps / 1Mbps / GOP 30 の共通設定を使うテストで利用する。
 fn h264_test_config() -> EncoderConfig {
+    h264_config_with_size(320, 240)
+}
+
+/// 指定した解像度の H.264 CBR テスト用エンコーダ設定を返す
+fn h264_config_with_size(width: u32, height: u32) -> EncoderConfig {
+    test_encoder_config(h264_high_codec(), width, height)
+}
+
+/// H.264 High プロファイルのコーデック設定を返す
+fn h264_high_codec() -> CodecConfig {
+    CodecConfig::H264(H264EncoderConfig {
+        profile: Some(H264Profile::High),
+    })
+}
+
+/// HEVC Main プロファイルのコーデック設定を返す
+fn hevc_main_codec() -> CodecConfig {
+    CodecConfig::Hevc(HevcEncoderConfig {
+        profile: Some(HevcProfile::Main),
+    })
+}
+
+/// 指定したコーデックのテスト用エンコーダ設定を返す
+fn test_encoder_config(codec: CodecConfig, width: u32, height: u32) -> EncoderConfig {
     let mut config = EncoderConfig::new(
         test_adapter(),
-        CodecConfig::H264(H264EncoderConfig {
-            profile: Some(H264Profile::High),
-        }),
-        320,
-        240,
+        codec,
+        width,
+        height,
         FrameFormat::Nv12,
         30,
         1,
@@ -632,18 +751,7 @@ fn roundtrip_b_frames(
     let mut decoder = Decoder::new(
         decoder_config,
         FnDecodeHandler::new(move |result| {
-            let info = result.map(|frame| {
-                let y_data = frame.y().to_vec();
-                let uv_data = frame.uv().to_vec();
-                DecodedFrameInfo {
-                    y_data,
-                    uv_data,
-                    pitch: frame.pitch(),
-                    width: frame.width(),
-                    height: frame.height(),
-                    user_data: *frame.user_data(),
-                }
-            });
+            let info = result.map(|frame| decoded_frame_info(&frame));
             tx.send(info)
                 .expect("デコード結果コールバックの送信に失敗した");
         }),
@@ -978,6 +1086,354 @@ fn test_decode_user_data_callback() {
             *appeared,
             "user_data {index} がコールバックに出現しなかった"
         );
+    }
+}
+
+/// 解像度列に沿って出力フレームのサイズ・pitch・resolution_changed を検証する
+///
+/// `segments` の各要素は `(width, height, num_frames)` で、入力順に出力されることを前提とする。
+fn assert_resolution_sequence_frames(
+    frames: &[DecodedFrameInfo],
+    segments: &[(u32, u32, usize)],
+    min_pitch: usize,
+) {
+    let total_frames: usize = segments.iter().map(|(_, _, num_frames)| num_frames).sum();
+    assert_eq!(frames.len(), total_frames, "出力フレーム数が一致しない");
+
+    let mut offset = 0;
+    for (segment_index, &(width, height, num_frames)) in segments.iter().enumerate() {
+        for local_index in 0..num_frames {
+            let index = offset + local_index;
+            let frame = &frames[index];
+            assert_eq!(
+                frame.user_data, index,
+                "解像度変更後も user_data が入力順に対応すること"
+            );
+            assert_eq!(
+                frame.width, width as usize,
+                "フレーム {index} の width が不一致"
+            );
+            assert_eq!(
+                frame.height, height as usize,
+                "フレーム {index} の height が不一致"
+            );
+            assert_eq!(
+                frame.resolution_changed,
+                segment_index != 0 && local_index == 0,
+                "フレーム {index} の resolution_changed が不一致"
+            );
+            assert!(
+                frame.pitch >= min_pitch,
+                "フレーム {index} の pitch が {min_pitch} 未満: {}",
+                frame.pitch
+            );
+            assert_decoded_frame_layout(frame, &format!("フレーム {index}"));
+        }
+        offset += num_frames;
+    }
+}
+
+/// 最大サイズ内で縮小した後に拡大してもデコードできることを検証する
+///
+/// 320x240 → 256x160 → 320x240 の 30 フレームを最大サイズ 640x480 でデコードし、
+/// すべてのフレームが出力されることと、縮小・拡大の両方で resolution_changed が
+/// true になることを確認する。
+#[test]
+fn test_decoder_max_size_shrink_and_expand() {
+    let frames_per_stream = 10;
+    let segments = [
+        (320u32, 240u32, frames_per_stream),
+        (256, 160, frames_per_stream),
+        (320, 240, frames_per_stream),
+    ];
+    let bitstreams = encode_resolution_sequence(h264_high_codec(), None, &segments);
+    let (frames, _) = decode_with_max_size(VideoCodecType::H264, &bitstreams, 640, 480);
+
+    assert_resolution_sequence_frames(&frames, &segments, 640);
+}
+
+/// 最大サイズが最初のストリームより大きい場合に内部サーフェスが拡大されることを検証する
+///
+/// 256x160 の 10 フレーム → 320x240 の 10 フレームを最大サイズ 640x480 でデコードする。
+/// 内部サーフェスの幅が 640 以上であることを pitch 640 以上で確認する。
+#[test]
+fn test_decoder_max_size_extends_initial_surface() {
+    let frames_per_stream = 10;
+    let segments = [
+        (256u32, 160u32, frames_per_stream),
+        (320, 240, frames_per_stream),
+    ];
+    let bitstreams = encode_resolution_sequence(h264_high_codec(), None, &segments);
+    let (frames, _) = decode_with_max_size(VideoCodecType::H264, &bitstreams, 640, 480);
+
+    assert_resolution_sequence_frames(&frames, &segments, 640);
+}
+
+/// HEVC でも最大サイズ内の解像度変更を扱えることを検証する
+#[test]
+fn test_decoder_max_size_hevc_extends_initial_surface() {
+    let frames_per_stream = 10;
+    let segments = [
+        (256u32, 160u32, frames_per_stream),
+        (320, 240, frames_per_stream),
+    ];
+    let bitstreams = encode_resolution_sequence(hevc_main_codec(), None, &segments);
+    let (frames, _) = decode_with_max_size(VideoCodecType::Hevc, &bitstreams, 640, 480);
+
+    assert_resolution_sequence_frames(&frames, &segments, 640);
+}
+
+/// B フレーム有効時でも解像度変更を扱え、統計値が矛盾しないことを検証する
+#[test]
+fn test_decoder_max_size_b_frames_stats() {
+    let frames_per_stream = 15;
+    let segments = [
+        (256u32, 160u32, frames_per_stream),
+        (320, 240, frames_per_stream),
+    ];
+    let (bitstreams, encoded_frames) =
+        encode_resolution_sequence_with_frames(h264_high_codec(), Some(3), &segments);
+    let b_count = encoded_frames
+        .iter()
+        .filter(|frame| frame.picture_type() == PictureType::B)
+        .count();
+    assert!(
+        b_count >= 1,
+        "B ピクチャが 1 枚以上生成されること (実際は {b_count} 枚)"
+    );
+    let (frames, stats) = decode_with_max_size(VideoCodecType::H264, &bitstreams, 640, 480);
+
+    let mut seen = vec![0usize; bitstreams.len()];
+    for frame in &frames {
+        assert!(
+            frame.user_data < bitstreams.len(),
+            "user_data {} が入力範囲外",
+            frame.user_data
+        );
+        seen[frame.user_data] += 1;
+        let (width, height) = if frame.user_data < frames_per_stream {
+            (256, 160)
+        } else {
+            (320, 240)
+        };
+        assert_eq!(
+            frame.width, width,
+            "user_data {} の width が不一致",
+            frame.user_data
+        );
+        assert_eq!(
+            frame.height, height,
+            "user_data {} の height が不一致",
+            frame.user_data
+        );
+        assert!(
+            frame.pitch >= 640,
+            "user_data {} の pitch が 640 未満: {}",
+            frame.user_data,
+            frame.pitch
+        );
+        assert_decoded_frame_layout(frame, &format!("user_data {}", frame.user_data));
+    }
+    for (index, count) in seen.iter().enumerate() {
+        assert_eq!(*count, 1, "user_data {index} が 1 回だけ通知されること");
+    }
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.resolution_changed)
+            .count(),
+        1,
+        "解像度変更が 1 回だけ通知されること"
+    );
+    assert_eq!(
+        stats.total_decode_count.get(),
+        bitstreams.len() as u64,
+        "decode 回数が統計値と一致しない"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        bitstreams.len() as u64,
+        "出力フレーム数が統計値と一致しない"
+    );
+    assert_eq!(stats.total_error_count.get(), 0, "エラーが記録されている");
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "in-flight フレームが残っている"
+    );
+}
+
+/// 最大サイズを超える解像度変更がエラーになることを検証する
+///
+/// 最初のストリームの 10 フレームは正常にデコードできること、次の 10 フレームは
+/// 正常フレームとして通知されず、decode と finish の両方がエラーになることを確認する。
+fn assert_resolution_change_over_limit_fails(
+    config: DecoderConfig,
+    first_size: (u32, u32),
+    second_size: (u32, u32),
+) {
+    let frames_per_stream = 10;
+    let bitstreams = encode_resolution_sequence(
+        h264_high_codec(),
+        None,
+        &[
+            (first_size.0, first_size.1, frames_per_stream),
+            (second_size.0, second_size.1, frames_per_stream),
+        ],
+    );
+
+    let (mut decoder, rx) = create_decoder_with_config(config);
+
+    // 最初のストリームは正常に投入できる
+    for (index, bitstream) in bitstreams.iter().take(frames_per_stream).enumerate() {
+        decoder
+            .decode(bitstream, index)
+            .expect("最初のストリームのデコードに失敗した");
+    }
+
+    let mut decode_errors = Vec::new();
+    for (index, bitstream) in bitstreams.iter().enumerate().skip(frames_per_stream) {
+        if let Err(error) = decoder.decode(bitstream, index) {
+            decode_errors.push(error);
+        }
+    }
+    assert!(
+        !decode_errors.is_empty(),
+        "解像度が大きくなった場合に decode がエラーを返さなかった"
+    );
+    for error in &decode_errors {
+        assert_eq!(
+            error.function(),
+            "MFXVideoDECODE_DecodeFrameAsync",
+            "解像度変更のエラーはデコード処理のコンテキストを持つこと"
+        );
+        let status_code = error.status_code();
+        assert!(
+            status_code == Some(ffi::mfxStatus_MFX_ERR_DEVICE_FAILED)
+                || status_code == Some(ffi::mfxStatus_MFX_ERR_INCOMPATIBLE_VIDEO_PARAM),
+            "解像度変更のエラーは MFX_ERR_DEVICE_FAILED または \
+             MFX_ERR_INCOMPATIBLE_VIDEO_PARAM であること (実際は {status_code:?})"
+        );
+    }
+
+    // 消費されたフレームはエラーとして通知されるため、finish も成功しない
+    decoder
+        .finish()
+        .expect_err("解像度が大きくなった後の finish はエラーを返すこと");
+
+    // Drop で残留フレームがエラー通知されるため、デコーダーを破棄してから回収する
+    drop(decoder);
+
+    let mut ok_count = 0usize;
+    let mut error_count = 0usize;
+    while let Ok(result) = rx.recv_timeout(Duration::from_millis(200)) {
+        match result {
+            Ok(frame) => {
+                ok_count += 1;
+                assert!(
+                    frame.user_data < frames_per_stream,
+                    "2 つ目のストリームのフレームが Ok で通知された: user_data={}",
+                    frame.user_data
+                );
+                assert!(
+                    frame.width <= first_size.0 as usize && frame.height <= first_size.1 as usize,
+                    "最初のストリームより大きいフレームが正常に通知された: {}x{}",
+                    frame.width,
+                    frame.height
+                );
+                assert_decoded_frame_layout(&frame, &format!("user_data {}", frame.user_data));
+            }
+            Err(_) => error_count += 1,
+        }
+    }
+    assert_eq!(
+        ok_count + error_count,
+        frames_per_stream * 2,
+        "すべての入力フレームが 1 回ずつ通知されること"
+    );
+    assert_eq!(
+        ok_count, frames_per_stream,
+        "最初のストリームのフレームだけが Ok で通知されること"
+    );
+    assert!(
+        error_count >= frames_per_stream,
+        "大きくなった解像度のフレームがすべてエラー通知されること (エラー数: {error_count})"
+    );
+}
+
+/// 最大サイズを 320x240 にした場合に、640x480 のストリームがエラーになることを検証する
+#[test]
+fn test_decoder_max_size_exceeded_returns_error() {
+    let mut config = DecoderConfig::new(test_adapter(), VideoCodecType::H264);
+    config.max_width = Some(320);
+    config.max_height = Some(240);
+    assert_resolution_change_over_limit_fails(config, (256, 160), (640, 480));
+}
+
+/// 最大サイズ未指定で最初のストリームより大きい解像度に変わった場合にエラーになることを検証する
+#[test]
+fn test_decoder_without_max_size_rejects_larger_resolution() {
+    let config = DecoderConfig::new(test_adapter(), VideoCodecType::H264);
+    assert_resolution_change_over_limit_fails(config, (256, 160), (320, 240));
+}
+
+/// 最大サイズが最初のストリームの表示サイズより小さい場合は初期化に失敗することを検証する
+///
+/// 320x240 のストリームに対して 256x160 の最大サイズを指定し、初期化がエラーになることを確認する。
+#[test]
+fn test_decoder_max_size_smaller_than_stream_fails() {
+    let bitstreams = encode_test_bitstreams(h264_test_config(), 1);
+
+    let mut config = DecoderConfig::new(test_adapter(), VideoCodecType::H264);
+    config.max_width = Some(256);
+    config.max_height = Some(160);
+    let (mut decoder, _rx) = create_decoder_with_config(config);
+
+    let error = decoder
+        .decode(&bitstreams[0], 0)
+        .expect_err("最初のストリームより小さい最大サイズは初期化に失敗すること");
+    assert_eq!(
+        error.function(),
+        "Decoder::initialize",
+        "初期化エラーは Decoder::initialize のコンテキストを持つこと"
+    );
+    assert_eq!(
+        error.status_message(),
+        Some("max_width (256) is less than the stream display width (320)"),
+        "表示サイズより小さい max_width を示すエラーメッセージであること"
+    );
+}
+
+/// 表示サイズをそのまま最大サイズに指定できることを検証する
+///
+/// 638x478 のストリームに対して最大サイズ 638x478 を指定し、Step への切り上げを経て
+/// デコードでき、pitch が 640 以上になることを確認する。
+#[test]
+fn test_decoder_max_size_accepts_unaligned_display_size() {
+    let width = 638u32;
+    let height = 478u32;
+    let num_frames = 3;
+    let input_frames: Vec<Vec<u8>> = (0..num_frames)
+        .map(|index| generate_dummy_nv12(width as usize, height as usize, index))
+        .collect();
+    let (_, bitstreams) = encode(h264_config_with_size(width, height), &input_frames);
+
+    let (frames, _) = decode_with_max_size(VideoCodecType::H264, &bitstreams, width, height);
+
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.user_data, index, "user_data が入力順に対応すること");
+        assert_eq!(frame.width, width as usize, "width が不一致");
+        assert_eq!(frame.height, height as usize, "height が不一致");
+        assert!(
+            !frame.resolution_changed,
+            "解像度が変わっていないフレームの resolution_changed は false であること"
+        );
+        assert!(
+            frame.pitch >= 640,
+            "Step 切り上げ後の最大サイズ 640 以上の pitch であること: {}",
+            frame.pitch
+        );
+        assert_decoded_frame_layout(frame, &format!("フレーム {index}"));
     }
 }
 
