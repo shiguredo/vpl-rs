@@ -129,7 +129,8 @@ pub mod ffi {
 pub use adapter::{AdapterInfo, AdapterSelector, MediaAdapterType, PciAddress, list_adapters};
 pub use codec_info::*;
 pub use decode::{
-    DecodeHandler, DecodedFrame, Decoder, DecoderConfig, DecoderStats, FnDecodeHandler,
+    DecodeHandler, DecodedFrame, Decoder, DecoderConfig, DecoderStats, FnDecodeHandler, Framerate,
+    StreamInfo,
 };
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
