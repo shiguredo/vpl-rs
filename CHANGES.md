@@ -75,6 +75,11 @@
 
 ### misc
 
+- [ADD] エンコード→デコードの恒等性を検証するテストを追加する
+  - 主要な入力フォーマットとコーデックの組み合わせで Y / U / V の PSNR と色バー領域のクロマ平均を検証する
+  - ルマの分散・フレーム間差分・BGRA 入力のルマ相関のサニティチェックを追加する
+  - 重複していたカラーバー PSNR と AYUV / 10bit のルマ PSNR だけを検証するテストを整理する
+  - @melpon
 - [ADD] silent pass していたテストを修正する
   - `frame_surface_gpu_required` でテスト用エンコーダーを初期化し、早期 return を assert に置き換える
   - `test_list_adapters_sorted_and_deduped` に空 Vec の自動パスを防ぐ assert を追加する
