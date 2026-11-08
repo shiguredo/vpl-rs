@@ -8,7 +8,7 @@ use shiguredo_vpl::{
     Av1EncoderConfig, Av1Profile, CodecConfig, DecodedFrame, Decoder, DecoderConfig, EncodeOptions,
     EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameData,
     FrameFormat, H264EncoderConfig, H264Profile, HevcEncoderConfig, HevcProfile, MemoryType,
-    PictureType, RateControlMode, ReconfigureParams, VideoCodecType, VideoProfile,
+    PictureType, RateControlMode, ReconfigureParams, StreamInfo, VideoCodecType, VideoProfile,
     Vp9EncoderConfig, Vp9Profile, ffi, frame_type, supported_codecs,
 };
 
@@ -390,13 +390,17 @@ fn encode_with_encoder(
     (encoded_frames, bitstreams)
 }
 
-/// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
-fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
-    let num_frames = bitstreams.len();
-    let config = DecoderConfig::new(test_adapter(), decoder_codec);
+/// デコード結果を [DecodedFrameInfo] として受信するデコーダと受信用チャネルのペア
+type InfoDecoderAndReceiver = (
+    Decoder<FnDecodeHandler<usize>>,
+    mpsc::Receiver<Result<DecodedFrameInfo, Error>>,
+);
+
+/// デコード結果を [DecodedFrameInfo] として受信するデコーダと受信用チャネルを生成する
+fn create_info_decoder(codec: VideoCodecType) -> InfoDecoderAndReceiver {
     let (tx, rx) = mpsc::channel::<Result<DecodedFrameInfo, Error>>();
-    let mut decoder = Decoder::new(
-        config,
+    let decoder = Decoder::new(
+        DecoderConfig::new(test_adapter(), codec),
         FnDecodeHandler::new(move |result| {
             let info = result.map(|frame| {
                 let y_data = frame.y().to_vec();
@@ -415,14 +419,16 @@ fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedF
         }),
     )
     .expect("デコーダの生成に失敗した");
+    (decoder, rx)
+}
 
-    for (index, bs) in bitstreams.iter().enumerate() {
-        decoder.decode(bs, index).expect("デコードに失敗した");
-    }
-    decoder.finish().expect("finish に失敗した");
-
+/// デコード結果を指定件数だけ受信する
+fn receive_decoded_frames(
+    rx: &mpsc::Receiver<Result<DecodedFrameInfo, Error>>,
+    count: usize,
+) -> Vec<DecodedFrameInfo> {
     let mut decoded_frames = Vec::new();
-    for _ in 0..num_frames {
+    for _ in 0..count {
         let result = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("デコード結果コールバックの受信がタイムアウトした");
@@ -435,6 +441,37 @@ fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedF
     }
 
     decoded_frames
+}
+
+/// 生成済みデコーダでビットストリームをデコードして結果を回収する
+fn decode_with_decoder(
+    mut decoder: Decoder<FnDecodeHandler<usize>>,
+    rx: mpsc::Receiver<Result<DecodedFrameInfo, Error>>,
+    bitstreams: &[Vec<u8>],
+) -> Vec<DecodedFrameInfo> {
+    for (index, bs) in bitstreams.iter().enumerate() {
+        decoder.decode(bs, index).expect("デコードに失敗した");
+    }
+    decoder.finish().expect("finish に失敗した");
+
+    receive_decoded_frames(&rx, bitstreams.len())
+}
+
+/// デコーダーの統計値のスナップショットを返す
+fn stats_snapshot(decoder: &Decoder<FnDecodeHandler<usize>>) -> (u64, u64, u64, u64) {
+    let stats = decoder.stats();
+    (
+        stats.total_decode_count.get(),
+        stats.total_output_frame_count.get(),
+        stats.total_error_count.get(),
+        stats.in_flight_frames.get(),
+    )
+}
+
+/// デコードしてフレーム一覧を返すヘルパー（フレームごとに decode を呼ぶ）
+fn decode(decoder_codec: VideoCodecType, bitstreams: &[Vec<u8>]) -> Vec<DecodedFrameInfo> {
+    let (decoder, rx) = create_info_decoder(decoder_codec);
+    decode_with_decoder(decoder, rx, bitstreams)
 }
 
 /// エンコード→デコードのラウンドトリップを検証するヘルパー
@@ -495,6 +532,10 @@ fn coded_size_for(config: &EncoderConfig) -> (usize, usize) {
 }
 
 /// coded サイズが表示サイズ以上で、16 の倍数であることを検証する
+///
+/// 実機の mfx-gen は 16 の倍数にアラインするため、その前提で検証する。
+/// VPL 仕様の最小アラインメントは 8 であり、別の実装では 16 の倍数にならない
+/// 可能性がある。
 fn assert_coded_size(coded: (usize, usize), width: usize, height: usize) {
     assert!(
         coded.0 >= width,
@@ -508,6 +549,37 @@ fn assert_coded_size(coded: (usize, usize), width: usize, height: usize) {
     );
     assert_eq!(coded.0 % 16, 0, "coded 幅 {} が 16 の倍数でない", coded.0);
     assert_eq!(coded.1 % 16, 0, "coded 高さ {} が 16 の倍数でない", coded.1);
+}
+
+/// [StreamInfo] の coded サイズが表示サイズ以上で、VPL 仕様の最小アラインメント
+/// (8 の倍数) を満たすことを検証する
+///
+/// `mfxFrameInfo.Width` / `Height` の最小アラインメントは 8 と定義されている。
+fn assert_stream_info_coded_size(info: &StreamInfo, label: &str) {
+    assert!(
+        info.coded_width >= info.width,
+        "{label}: coded_width {} が width {} より小さい",
+        info.coded_width,
+        info.width
+    );
+    assert!(
+        info.coded_height >= info.height,
+        "{label}: coded_height {} が height {} より小さい",
+        info.coded_height,
+        info.height
+    );
+    assert_eq!(
+        info.coded_width % 8,
+        0,
+        "{label}: coded_width {} が 8 の倍数でない",
+        info.coded_width
+    );
+    assert_eq!(
+        info.coded_height % 8,
+        0,
+        "{label}: coded_height {} が 8 の倍数でない",
+        info.coded_height
+    );
 }
 
 /// H.264 CBR のテスト用エンコーダ設定を返す
@@ -529,6 +601,85 @@ fn h264_test_config() -> EncoderConfig {
     config.target_kbps = Some(1000);
     config.gop_pic_size = Some(30);
     config
+}
+
+/// ヘッダ解析テスト用のエンコーダ設定を返す
+///
+/// 指定コーデックを Main プロファイル / CBR / GOP 30 でエンコードする設定である。
+/// 先頭フレームがキーフレーム、2 フレーム目が P フレームになる。
+fn header_test_config(codec: VideoCodecType, width: u32, height: u32) -> EncoderConfig {
+    let codec_config = match codec {
+        VideoCodecType::H264 => CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::Main),
+        }),
+        VideoCodecType::Hevc => CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        }),
+        VideoCodecType::Av1 => CodecConfig::Av1(Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        }),
+        VideoCodecType::Vp9 => panic!("VP9 はヘッダ解析テストの対象外である"),
+    };
+    let mut config = EncoderConfig::new(
+        test_adapter(),
+        codec_config,
+        width,
+        height,
+        FrameFormat::Nv12,
+        30,
+        1,
+        RateControlMode::Cbr,
+    );
+    config.target_kbps = Some(1000);
+    config.gop_pic_size = Some(30);
+    config
+}
+
+/// エンコード結果がキーフレームであることを検証する
+fn assert_keyframe(encoded: &EncodedFrame<usize>, label: &str) {
+    assert!(
+        matches!(encoded.picture_type(), PictureType::Idr | PictureType::I),
+        "{label}: ピクチャータイプがキーフレームでない: {:?}",
+        encoded.picture_type()
+    );
+}
+
+/// 指定コーデック・解像度のキーフレームのビットストリームを生成する
+fn encode_header_test_keyframe(codec: VideoCodecType, width: u32, height: u32) -> Vec<u8> {
+    let config = header_test_config(codec, width, height);
+    let input_frames = [generate_dummy_nv12(width as usize, height as usize, 0)];
+    let (encoded_frames, bitstreams) = encode(config, &input_frames);
+    assert_keyframe(&encoded_frames[0], &format!("{codec:?} {width}x{height}"));
+    bitstreams
+        .into_iter()
+        .next()
+        .expect("キーフレームのビットストリームが無い")
+}
+
+/// 指定コーデック・解像度のキーフレームと後続フレームのビットストリームを生成する
+///
+/// 返る 2 要素は (キーフレーム, 非キーフレーム) である。
+fn encode_header_test_stream(codec: VideoCodecType, width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
+    let config = header_test_config(codec, width, height);
+    let input_frames: Vec<Vec<u8>> = (0..2)
+        .map(|index| generate_dummy_nv12(width as usize, height as usize, index))
+        .collect();
+    let (encoded_frames, bitstreams) = encode(config, &input_frames);
+    assert_keyframe(&encoded_frames[0], &format!("{codec:?} {width}x{height}"));
+    assert_eq!(
+        encoded_frames[1].picture_type(),
+        PictureType::P,
+        "{codec:?} {width}x{height}: 2 フレーム目が P フレームでない"
+    );
+
+    let mut bitstreams = bitstreams.into_iter();
+    let keyframe = bitstreams
+        .next()
+        .expect("キーフレームのビットストリームが無い");
+    let delta = bitstreams
+        .next()
+        .expect("後続フレームのビットストリームが無い");
+    (keyframe, delta)
 }
 
 /// カラーバーを使ったラウンドトリップで PSNR を検証するヘルパー
@@ -977,6 +1128,227 @@ fn test_decode_user_data_callback() {
         assert!(
             *appeared,
             "user_data {index} がコールバックに出現しなかった"
+        );
+    }
+}
+
+/// キーフレームのヘッダから coded / 表示サイズとフレームレートを取得できること
+///
+/// 256x160 と 320x240 では coded サイズと表示サイズが一致し、318x238 では
+/// coded サイズが表示サイズより大きくなる。
+#[test]
+fn test_decode_header_reports_stream_info() {
+    for codec in [
+        VideoCodecType::H264,
+        VideoCodecType::Hevc,
+        VideoCodecType::Av1,
+    ] {
+        let (decoder, rx) = create_info_decoder(codec);
+        for (width, height) in [(256u32, 160u32), (320u32, 240u32), (318u32, 238u32)] {
+            let keyframe = encode_header_test_keyframe(codec, width, height);
+            let stats_before = stats_snapshot(&decoder);
+
+            // 最初の decode の前 (未初期化の状態) でもヘッダを解析できること
+            let info = decoder.decode_header(&keyframe).unwrap_or_else(|error| {
+                panic!("{codec:?} {width}x{height}: ヘッダの解析に失敗した: {error}")
+            });
+
+            // ヘッダ解析はデコード統計とコールバックに影響しないこと
+            assert_eq!(
+                stats_snapshot(&decoder),
+                stats_before,
+                "{codec:?} {width}x{height}: ヘッダ解析でデコード統計が変化した"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "{codec:?} {width}x{height}: ヘッダ解析でコールバックが発生した"
+            );
+
+            // codec は DecoderConfig で指定した値がそのまま返る
+            assert_eq!(
+                info.codec, codec,
+                "{codec:?} {width}x{height}: codec が DecoderConfig の指定と一致しない"
+            );
+            assert_eq!(
+                info.width, width as usize,
+                "{codec:?} {width}x{height}: 表示サイズの幅が一致しない"
+            );
+            assert_eq!(
+                info.height, height as usize,
+                "{codec:?} {width}x{height}: 表示サイズの高さが一致しない"
+            );
+            assert_stream_info_coded_size(&info, &format!("{codec:?} {width}x{height}"));
+
+            // 表示サイズが VPL のアラインメント (8 の倍数) に揃っていない場合、
+            // coded サイズは表示サイズより大きくなる。coded と表示を取り違えると
+            // この assert が失敗する。
+            if width % 8 != 0 || height % 8 != 0 {
+                assert!(
+                    info.coded_width > info.width,
+                    "{codec:?} {width}x{height}: coded_width {} が width {} より大きくない",
+                    info.coded_width,
+                    info.width
+                );
+                assert!(
+                    info.coded_height > info.height,
+                    "{codec:?} {width}x{height}: coded_height {} が height {} より大きくない",
+                    info.coded_height,
+                    info.height
+                );
+            }
+
+            // H.264 の 318x238 は coded 320x240 になることが既存テストで確認されている
+            if codec == VideoCodecType::H264 && (width, height) == (318, 238) {
+                assert_eq!(info.coded_width, 320, "H.264: coded_width が 320 でない");
+                assert_eq!(info.coded_height, 240, "H.264: coded_height が 240 でない");
+            }
+
+            // ビットストリームにフレームレートの情報が無い場合 (AV1) は None になる
+            match info.framerate {
+                Some(framerate) => {
+                    // 約分されているとは限らないため、比がエンコーダー設定の 30fps と等しいことを検証する
+                    assert_eq!(
+                        u64::from(framerate.num),
+                        u64::from(framerate.den) * 30,
+                        "{codec:?} {width}x{height}: フレームレートがエンコーダー設定の 30fps と一致しない"
+                    );
+                }
+                None => assert_eq!(
+                    codec,
+                    VideoCodecType::Av1,
+                    "{codec:?} {width}x{height}: フレームレートの情報が無いのは AV1 だけであること"
+                ),
+            }
+        }
+    }
+}
+
+/// SPS / PPS / sequence header を含まないフレーム単体ではエラーになること
+#[test]
+fn test_decode_header_rejects_frame_without_sequence_header() {
+    for codec in [
+        VideoCodecType::H264,
+        VideoCodecType::Hevc,
+        VideoCodecType::Av1,
+    ] {
+        let (_keyframe, delta) = encode_header_test_stream(codec, 320, 240);
+        let (decoder, _rx) = create_info_decoder(codec);
+
+        let result = decoder.decode_header(&delta);
+        let error = result.expect_err(&format!(
+            "{codec:?}: パラメータセットを含まないフレームで decode_header が成功した"
+        ));
+        // 返るエラーコードは VPL 実装依存のため、特定のコードは固定しない
+        assert_eq!(
+            error.function(),
+            "MFXVideoDECODE_DecodeHeader",
+            "{codec:?}: エラーの発生元が MFXVideoDECODE_DecodeHeader でない"
+        );
+    }
+}
+
+/// decode_header が入力を消費せず、同じキーフレームを decode に流せること
+#[test]
+fn test_decode_header_does_not_consume_access_unit() {
+    for codec in [
+        VideoCodecType::H264,
+        VideoCodecType::Hevc,
+        VideoCodecType::Av1,
+    ] {
+        let (keyframe, delta) = encode_header_test_stream(codec, 320, 240);
+        let (decoder, rx) = create_info_decoder(codec);
+        let info = decoder
+            .decode_header(&keyframe)
+            .unwrap_or_else(|error| panic!("{codec:?}: ヘッダの解析に失敗した: {error}"));
+
+        // decode_header に渡したキーフレームをそのまま decode に流す
+        let decoded_frames = decode_with_decoder(decoder, rx, &[keyframe, delta]);
+
+        // ヘッダ解析に使ったキーフレームが入力 0 としてデコードされていること
+        let keyframe_frame = decoded_frames
+            .iter()
+            .find(|frame| frame.user_data == 0)
+            .unwrap_or_else(|| panic!("{codec:?}: キーフレームのデコード結果が無い"));
+        assert_eq!(
+            keyframe_frame.width, info.width,
+            "{codec:?}: デコード結果の幅がヘッダの width と一致しない"
+        );
+        assert_eq!(
+            keyframe_frame.height, info.height,
+            "{codec:?}: デコード結果の高さがヘッダの height と一致しない"
+        );
+        assert!(
+            decoded_frames.iter().any(|frame| frame.user_data == 1),
+            "{codec:?}: 2 フレーム目のデコード結果が無い"
+        );
+    }
+}
+
+/// デコーダーの初期化後にも別のストリームのヘッダを解析できること
+///
+/// 320x240 のストリーム A でデコーダーを初期化した後、256x160 のストリーム B の
+/// キーフレームから B の解像度を取得できることを検証する。B のアクセスユニットは
+/// 旧デコーダーに流さず、A の後続フレームだけでデコードを継続する。
+#[test]
+fn test_decode_header_after_initialization() {
+    for codec in [
+        VideoCodecType::H264,
+        VideoCodecType::Hevc,
+        VideoCodecType::Av1,
+    ] {
+        let (keyframe_a, delta_a) = encode_header_test_stream(codec, 320, 240);
+        let keyframe_b = encode_header_test_keyframe(codec, 256, 160);
+        let (mut decoder, rx) = create_info_decoder(codec);
+
+        let info_a = decoder
+            .decode_header(&keyframe_a)
+            .unwrap_or_else(|error| panic!("{codec:?}: ストリーム A の解析に失敗した: {error}"));
+        assert_eq!(info_a.codec, codec, "ストリーム A の codec が一致しない");
+        assert_eq!(info_a.width, 320, "ストリーム A の表示幅が一致しない");
+        assert_eq!(info_a.height, 240, "ストリーム A の表示高さが一致しない");
+
+        // 最初の decode でデコーダーが初期化される
+        decoder.decode(&keyframe_a, 0).unwrap_or_else(|error| {
+            panic!("{codec:?}: ストリーム A のデコードに失敗した: {error}")
+        });
+
+        // 初期化後でも、別ストリーム B のキーフレームを解析できること
+        let info_b = decoder
+            .decode_header(&keyframe_b)
+            .unwrap_or_else(|error| panic!("{codec:?}: ストリーム B の解析に失敗した: {error}"));
+        assert_eq!(info_b.codec, codec, "ストリーム B の codec が一致しない");
+        assert_eq!(info_b.width, 256, "ストリーム B の表示幅が一致しない");
+        assert_eq!(info_b.height, 160, "ストリーム B の表示高さが一致しない");
+        assert_ne!(info_b, info_a, "ストリーム A と B の解析結果が同じ");
+
+        // パラメータセットを含まないフレームでも呼べる。返るエラーコードは
+        // VPL 実装依存なので、エラーになってもデコードを継続できることだけを検証する。
+        decoder.decode_header(&delta_a).expect_err(&format!(
+            "{codec:?}: パラメータセットを含まないフレームで decode_header が成功した"
+        ));
+
+        // ストリーム A の後続フレームだけをデコードして完了できること
+        decoder.decode(&delta_a, 1).unwrap_or_else(|error| {
+            panic!("{codec:?}: ストリーム A の 2 フレーム目のデコードに失敗した: {error}")
+        });
+        decoder
+            .finish()
+            .unwrap_or_else(|error| panic!("{codec:?}: finish に失敗した: {error}"));
+
+        let decoded_frames = receive_decoded_frames(&rx, 2);
+        for frame in &decoded_frames {
+            assert_eq!(
+                frame.width, 320,
+                "{codec:?}: ストリーム A のデコード結果の幅が一致しない"
+            );
+            assert_eq!(
+                frame.height, 240,
+                "{codec:?}: ストリーム A のデコード結果の高さが一致しない"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "{codec:?}: ヘッダ解析で余分なコールバックが発生した"
         );
     }
 }

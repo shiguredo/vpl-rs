@@ -1,6 +1,6 @@
 ---
 name: shiguredo-vpl
-description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
+description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、decode_header によるキーフレームのヘッダからの解像度取得、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
 ---
 
 # shiguredo_vpl クレート
@@ -29,7 +29,7 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
 - `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
-- `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
+- `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `Framerate` / `StreamInfo` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
 - `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameData<'_>` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `stats` — `Counter` / `Gauge`
@@ -392,6 +392,26 @@ while let Ok(result) = rx.try_recv() {
   空のビットストリームも登録に成功すれば計上する。
 - `Decoder` を `Drop` すると worker スレッドへ `Stop` が送られ、未消費の `user_data` は `MFX_ERR_ABORTED` のエラー結果として `on_decoded` に通知される。
 
+### ビットストリームのヘッダ解析 (`decode_header`)
+
+- `Decoder::decode_header(&self, data: &[u8]) -> Result<StreamInfo, Error>` は、SPS / PPS / sequence header を含むアクセスユニットから解像度とフレームレートを解析して返す。
+- `StreamInfo` は `codec: VideoCodecType` / `coded_width` / `coded_height` / `width` / `height` (`usize`) / `framerate: Option<Framerate>` を持つ。 `codec` は `DecoderConfig` で指定したコーデック種別になる。
+- `coded_width` / `coded_height` は VPL 実装が内部サーフェスを確保するサイズで、実装のアラインメントに切り上げられた値になる。 `width` / `height` は表示サイズで、デコード結果の `DecodedFrame::width()` / `height()` と一致する。
+- フレームレートは `Framerate` の `num / den` の比で表される。 約分されているとは限らないため、必ず比として扱う。 ビットストリームに情報が無い場合は `None`。
+- `Decoder::new` の直後 (最初の `decode` の前) でも呼べる。 `MFXVideoDECODE_DecodeHeader` はデコーダーの初期化前後どちらでも呼べる。
+- `data` は消費しないため、解析したデータをそのまま `decode()` に渡せる。
+- `decode()` と同じスレッドで直列に呼ぶ。 `on_decoded` コールバックの中から呼んではならない。
+
+```rust
+let info = decoder.decode_header(&keyframe)?;
+println!("size: {}x{}", info.width, info.height);
+if let Some(framerate) = info.framerate {
+    println!("framerate: {}/{}", framerate.num, framerate.den);
+}
+// 同じキーフレームをそのままデコードできる
+decoder.decode(&keyframe, 0usize)?;
+```
+
 ### `DecodedFrame<'_, T>` の使い方
 
 ```rust
@@ -499,6 +519,9 @@ for codec in supported_codecs(adapter)? {
 - 出力形式はストリームのネイティブ形式で決まり、選択する API はない。
 - `DecodeHeader` 後の FourCC 上書きはプロファイル依存で、YUY2 出力は確認できていない。
 - NV12 / P010 以外の出力は未対応で、デコード時にエラーになる。
+- `decode_header` は H.264 / HEVC / AV1 のキーフレームで解像度を返す。 測定条件: 256x160 / 320x240 / 318x238、CBR 1000 kbps、GOP 30、Main プロファイル。 256x160 と 320x240 では coded サイズと表示サイズが一致し、318x238 では coded サイズが表示サイズより大きくなった。 H.264 の 318x238 は coded 320x240 / 表示 318x238 だった。
+- `decode_header` のフレームレートは、測定条件: 256x160 / 320x240、CBR 1000 kbps、GOP 30、Main プロファイルで、H.264 が 60/2、HEVC が 30/1、AV1 が 0/0 になった。 AV1 のエンコーダー出力は sequence header に timing info を含まない。
+- `decode_header` に P フレーム単体を渡すと、H.264 / HEVC / AV1 のいずれも `MFX_ERR_MORE_DATA` になった。 測定条件: 320x240、CBR 1000 kbps、GOP 30、Main プロファイル。
 
 ### 再確認方法
 
