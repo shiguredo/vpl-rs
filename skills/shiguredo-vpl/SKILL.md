@@ -1,6 +1,6 @@
 ---
 name: shiguredo-vpl
-description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、デコーダーの最大サイズ指定と解像度変更の検出、DecodedFrame の pitch 付き借用 Y/UV プレーン、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
+description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
 ---
 
 # shiguredo_vpl クレート
@@ -251,7 +251,7 @@ pub trait EncodeHandler: Send + 'static {
 
 ### `Encoder::encode` / `finish` のセマンティクス
 
-- `encode(&mut self, frame: FrameData<'_>, user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame` は `EncoderConfig::frame_format` に対応する variant を選ぶ。 `y_pitch` / `uv_pitch` / `pitch` は `FrameFormat::bytes_per_row(width)` 以上であること。 `SemiPlanar` は Y が `height * y_pitch` バイト、UV が `(height / 2) * uv_pitch` バイト、`Packed` は `height * pitch` バイト必要。 形式と variant の不一致、 `pitch` 不足、データ長不足はエラーになる。
+- `encode(&mut self, frame: FrameData<'_>, user_data: H::UserData, options: &EncodeOptions) -> Result<(), Error>`。 `frame` は `EncoderConfig::frame_format` に対応する variant を選ぶ。 `y_pitch` / `uv_pitch` / `pitch` は `FrameFormat::bytes_per_row(width)` 以上であること。 `SemiPlanar` は Y が `(height - 1) * y_pitch + bytes_per_row(width)` バイト、UV が `(height / 2 - 1) * uv_pitch + bytes_per_row(width)` バイト、`Packed` は `(height - 1) * pitch + bytes_per_row(width)` バイト必要。 形式と variant の不一致、 `pitch` 不足、データ長不足はエラーになる。
 - `finish(&mut self) -> Result<(), Error>` は EOS シグナル + バリア。 null surface でドレインを呼び切り、worker に `WaitIdle` を送って **すべてのハンドラ呼び出しが完了するまでブロック** する。 戻ったときには `on_encoded` がすべて呼ばれ終わっている。
 - `Encoder` を `Drop` すると worker スレッドへ `Stop` が送られ、 ペンディング中のフレームはすべて `MFX_ERR_ABORTED` のエラー結果として `on_encoded` に通知される。 失敗フレームを取りこぼさない設計。
 - `EncodedFrame<T>` から取れる情報: `data() -> &[u8]` / `into_data() -> Vec<u8>` / `timestamp() -> u64` / `picture_type() -> PictureType` / `user_data() -> &T` / `into_user_data() -> T`。
@@ -346,10 +346,7 @@ use shiguredo_vpl::{
 use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
-let mut config = DecoderConfig::new(adapter, VideoCodecType::H264);
-// 解像度変更に備えて内部サーフェスの最大サイズを指定する
-config.max_width = Some(640);
-config.max_height = Some(480);
+let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 
 // DecodedFrame は借用ベース。コールバック内で Vec にコピーしてから外へ渡す
 let (tx, rx) = mpsc::channel();
@@ -361,7 +358,6 @@ let handler = FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, u64>, E
             frame.pitch(),
             frame.width(),
             frame.height(),
-            frame.resolution_changed(),
         )
     });
     let _ = tx.send(copied);
@@ -374,17 +370,15 @@ decoder.decode(&bitstream_data, /* user_data */ 0u64)?;
 decoder.finish()?;
 
 while let Ok(result) = rx.try_recv() {
-    let (_y, _uv, _pitch, _w, _h, _changed) = result?;
+    let (_y, _uv, _pitch, _w, _h) = result?;
 }
 ```
 
 押さえておく挙動:
 
-- `DecoderConfig` の必須項目は `adapter` と `codec` のみで、`DecoderConfig::new` で生成する。残りのフィールドは `Option<_>`。解像度・フレームレートはビットストリームヘッダ (SPS/PPS など) から自動検出される。
+- `DecoderConfig` は `#[non_exhaustive]`。 必須は `adapter` と `codec` のみ。 解像度・フレームレートはビットストリームヘッダ (SPS/PPS など) から自動検出される。
 - `async_depth: Option<u16>` を持つ。 `None` の場合は 4。 エンコーダと同じ意味。
-- `max_width` / `max_height` (ともに `Option<u32>`) で内部サーフェスの最大サイズを指定できる。表示サイズとして扱い、内部サーフェスは指定値以上のサイズで確保される。VPL のアラインメントにより指定値より大きくなることがある。未指定の場合は最初のストリームのサイズを使う。指定した最大サイズが最初のストリームの表示サイズより小さい場合は初期化に失敗する。メモリ消費量は最大サイズに比例する。
-- 最大サイズ内の解像度変更はデコーダーを再作成せずに扱う。出力フレームの `width()` / `height()` が新しい表示サイズになり、変更後の最初のフレームで `DecodedFrame::resolution_changed()` が `true` になる。内部サーフェスのサイズを超える解像度変更はエラーになる。指定値をわずかに超える解像度でも、内部サーフェスに収まればデコードできることがある。
-- 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 `DecodeHeader` が `MFX_ERR_MORE_DATA` などを返した場合は、そのエラーが `decode()` の戻り値として返る。
+- 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 ヘッダ未到達のうちは `MFX_ERR_MORE_DATA` を内部で吸収して何も出さない (`initialized` フラグで管理)。
 - 出力フォーマットはストリームのネイティブ形式で決まる (8bit は NV12、10bit は P010)。 出力形式を選択する API はない。 4:4:4 ストリームのデコードは未対応。 `IOPattern = OUT_SYSTEM_MEMORY` は変わらない。
 - サーフェスは VPL の **内部割り当て** (`surface_work = NULL`)。 アプリ側でサーフェスプールを持つ必要はなく、`FrameSurface` の Drop で `Release` が自動的に呼ばれる。
 - worker スレッド名は `vpl-decoder-sync`。 `user_data` は入力ビットストリームの `TimeStamp` に載せた連番と、 出力フレームの `TimeStamp` の**完全一致**で対応付く (Encoder と同じ方式)。 B フレームの表示順並び替えがあっても正しい入力フレームに戻る。 なお、 1 フレームが複数の `decode()` 呼び出しに分割して供給されるケースでは、 出力フレームの TimeStamp がどの呼び出しの連番になるかが VPL 実装依存のため、 user_data の対応付けは保証されない (分割入力で未消費の連番が残留した場合、 `finish()` が残留チェックエラーを返す)。
@@ -409,14 +403,12 @@ impl<'a, T> DecodedFrame<'a, T> {
     pub fn pitch(&self) -> usize;
     pub fn width(&self) -> usize;
     pub fn height(&self) -> usize;
-    pub fn resolution_changed(&self) -> bool;
     pub fn user_data(&self) -> &T;
     pub fn into_user_data(self) -> T;
 }
 ```
 
 - `y()` / `uv()` は **ピッチ込みの生サーフェス**。 8bit は各行の先頭 `width()` バイト、 P010 は各行の先頭 `width() * 2` バイトのみが有効データで、残りはパディング。 P010 は各サンプルが 16bit ワードで上位 10bit が有効。 `pitch() != width()` が普通なので、 そのまま `width * height * 3 / 2` バイトのバッファにコピーすると壊れる。 行ごとにコピーする。
-- `resolution_changed()` は、直前の出力フレームからクロップサイズが変わった場合にのみ `true` を返す。最初の出力フレームは `false`。
 - スライスのライフタイム `'a` は `on_decoded` 呼び出し中のみ。 コールバックの外に持ち出そうとするとコンパイルエラーになる。 外で使いたいなら `to_vec()` でコピーする。
 - VPL から返るサーフェスが不正 (null プレーン / `crop = 0` / `pitch < crop_w`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
 
@@ -543,7 +535,6 @@ for codec in supported_codecs(adapter)? {
 - **`MFX_WRN_*` の解釈**: `Init` / `Reset` 系では警告は「成功」扱い。 自分でラッパーを書くときは `check_mfx_allow_warn` の方を使う。
 - **ハンドラはワーカースレッドから呼ばれる**: `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は `vpl-encoder-sync` / `vpl-decoder-sync` のワーカースレッドから呼ばれる。 ハンドラ実装は `Send + 'static`。 メインスレッドへ届けるなら mpsc などのチャネルにブリッジする。
 - **`DecodedFrame` の借用**: `DecodedFrame<'_, T>` の `y()` / `uv()` スライスはコールバック呼び出し中のみ有効。 外に持ち出すには `to_vec()` などでコピーする必要がある。 `pitch() != width()` が普通で、 単純連結すると壊れる。
-- **解像度変更と最大サイズ**: `DecoderConfig::max_width` / `max_height` を指定しない場合、デコーダーは最初のストリームのサイズで内部サーフェスを確保する。途中で解像度が大きくなると `MFX_ERR_DEVICE_FAILED` などで失敗し、消費済みの AU は失われる。解像度が変わり得るストリームでは最大サイズを指定し、`DecodedFrame::resolution_changed()` で変更を検出する。
 - **`user_data` の対応付け**: `Decoder` は入力 `decode()` の連番 (`TimeStamp`) と出力フレームの `TimeStamp` を完全一致で対応付ける。 出力フレームの TimeStamp がどの入力にも一致しない (= 供給不足) 場合は worker 内で drain 扱いとなり破棄される。 1 入力で複数枚出ることはないが、 元入力との 1:1 対応を確実にするには `decode` 1 回ごとに `user_data` を必ず供給する。
 - **動作 OS の制約**: 実機サポートは Linux x86_64 + Intel GPU のみ。 Linux x86_64 以外のターゲットでは `compile_error!` により crate 自体がビルドできない。
 - **静的リンク**: 実行時に libvpl 共有ライブラリは不要だが、 ビルド時に対応 GPU ドライバ (Intel Media Driver / iHD) が動作環境にないと実機テストは通らない。
