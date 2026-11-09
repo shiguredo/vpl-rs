@@ -29,7 +29,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - libvpl を static link してビルド (CMake で自動ビルド)
 - ビルド時に GitHub から libvpl ヘッダーを自動取得
 - エンコード入力フォーマット選択 (NV12 / P010 / YUY2 / BGRA / AYUV / Y410)
-- デコード出力はストリームのネイティブ形式 (8bit は NV12、10bit は P010)
+- デコード出力はストリームのネイティブ形式 (4:2:0 は NV12 / P010、4:4:4 は AYUV / Y410)
 - フレーム単位のエンコードオプション (IDR フレーム強制)
 - CBR / VBR / CQP / ICQ / QVBR / LA / AVBR / VCM / LA_ICQ / LA_HRD レート制御モード
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
@@ -228,8 +228,8 @@ if let Some(params) = params {
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, Decoder, DecoderConfig, DecodedFrame, Error, FnDecodeHandler, FrameData,
-    VideoCodecType, list_adapters,
+    AdapterSelector, Decoder, DecoderConfig, FnDecodeHandler, FrameData, VideoCodecType,
+    list_adapters,
 };
 use std::sync::mpsc;
 

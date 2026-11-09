@@ -66,6 +66,9 @@ pub struct DecodedFrame<'a, T> {
 
 impl<'a, T> DecodedFrame<'a, T> {
     /// デコード出力の色形式を返す
+    ///
+    /// 返る値は [FrameFormat::Nv12] / [FrameFormat::P010] / [FrameFormat::Ayuv] /
+    /// [FrameFormat::Y410] のいずれかである。
     pub fn frame_format(&self) -> FrameFormat {
         self.frame_format
     }
@@ -850,6 +853,7 @@ fn sync_and_callback<H: DecodeHandler>(
 /// デコード出力として扱える色形式を返す
 ///
 /// FourCC と ChromaFormat の組が、対応する [`FrameFormat`] の組と一致しない場合は `None` を返す。
+/// [`FrameFormat`] で表現できても、YUY2 と BGRA はデコード出力としては扱わないため `None` を返す。
 fn decoded_frame_format(fourcc: u32, chroma_format: u16) -> Option<FrameFormat> {
     let format = FrameFormat::from_fourcc(fourcc)?;
     if format.chroma_format() != chroma_format {
@@ -913,10 +917,10 @@ fn read_decoded_surface<'a, T>(
         ));
     }
 
-    // 最終行のパディングも含めたフレーム全体のサイズを計算する
-    let frame_size = pitch
+    // Y プレーンの長さ (パック形式ではフレーム全体の長さ) を計算する
+    let plane_size = pitch
         .checked_mul(crop_h)
-        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "frame size overflowed"))?;
+        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "plane size overflowed"))?;
 
     let data = unsafe {
         match format {
@@ -939,7 +943,7 @@ fn read_decoded_surface<'a, T>(
                     Error::new_custom("Decoder::sync_worker", "UV plane size overflowed")
                 })?;
                 FrameData::SemiPlanar {
-                    y: std::slice::from_raw_parts(y_ptr, frame_size),
+                    y: std::slice::from_raw_parts(y_ptr, plane_size),
                     y_pitch: pitch,
                     uv: std::slice::from_raw_parts(uv_ptr, uv_size),
                     uv_pitch: pitch,
@@ -955,7 +959,7 @@ fn read_decoded_surface<'a, T>(
                     ));
                 }
                 FrameData::Packed {
-                    data: std::slice::from_raw_parts(v_ptr, frame_size),
+                    data: std::slice::from_raw_parts(v_ptr, plane_size),
                     pitch,
                 }
             }
@@ -969,12 +973,14 @@ fn read_decoded_surface<'a, T>(
                     ));
                 }
                 FrameData::Packed {
-                    data: std::slice::from_raw_parts(y410_ptr, frame_size),
+                    data: std::slice::from_raw_parts(y410_ptr, plane_size),
                     pitch,
                 }
             }
             // `decoded_frame_format` はデコード出力として扱える形式だけを返す
-            FrameFormat::Yuy2 | FrameFormat::Bgra => unreachable!(),
+            FrameFormat::Yuy2 | FrameFormat::Bgra => {
+                unreachable!("decoded_frame_format が除外した形式: {format:?}")
+            }
         }
     };
 

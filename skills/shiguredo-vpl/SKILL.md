@@ -28,9 +28,9 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 `src/lib.rs` から再エクスポートされる API:
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
-- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
+- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `FrameData<'_>` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
 - `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `Framerate` / `StreamInfo` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameData<'_>` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `stats` — `Counter` / `Gauge`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
@@ -390,7 +390,7 @@ decoder.decode(&bitstream_data, /* user_data */ 0u64)?;
 decoder.finish()?;
 
 while let Ok(result) = rx.try_recv() {
-    let (_y, _uv, _pitch, _w, _h) = result?;
+    let (_format, _data, _w, _h) = result?;
 }
 ```
 
