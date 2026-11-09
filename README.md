@@ -228,7 +228,7 @@ if let Some(params) = params {
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, Decoder, DecoderConfig, DecodedFrame, Error, FnDecodeHandler,
+    AdapterSelector, Decoder, DecoderConfig, DecodedFrame, Error, FnDecodeHandler, FrameData,
     VideoCodecType, list_adapters,
 };
 use std::sync::mpsc;
@@ -238,7 +238,15 @@ let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 
 let (tx, rx) = mpsc::channel();
 let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
-    tx.send(result).expect("failed to send callback result");
+    // DecodedFrame は借用データを含むため、コールバック内でコピーする
+    let info = result.map(|frame| {
+        let data_len = match frame.data() {
+            FrameData::SemiPlanar { y, uv, .. } => y.len() + uv.len(),
+            FrameData::Packed { data, .. } => data.len(),
+        };
+        (frame.frame_format(), frame.width(), frame.height(), data_len)
+    });
+    tx.send(info).expect("failed to send callback result");
 }))?;
 
 // ビットストリームデータをデコード (value で任意のユーザーデータを紐付け可能)
@@ -251,9 +259,8 @@ decoder.finish()?;
 
 // コールバック経由でデコード結果を受け取る
 while let Ok(result) = rx.try_recv() {
-    let frame = result?;
-    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, user_data: {:?}",
-        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.user_data());
+    let (format, width, height, data_len) = result?;
+    println!("decoded: {width}x{height}, format: {format:?}, data: {data_len} bytes");
 }
 ```
 
@@ -334,16 +341,18 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 ### デコード出力フォーマット
 
 デコード出力の形式はストリームのネイティブ形式で決まります。出力形式を選択する API はありません。
+実際の出力形式は `DecodedFrame::frame_format()` で取得でき、画素データは `DecodedFrame::data()` が返す `FrameData` で取得します。
 
-| フォーマット | 説明 |
-|---|---|
-| NV12 | 8bit ストリームの出力 (Semi-Planar YUV 4:2:0 8bit) |
-| P010 | 10bit ストリームの出力 (Semi-Planar YUV 4:2:0 10bit、16bit ワードの上位 10bit) |
+| フォーマット | 説明 | `FrameData` の variant |
+|---|---|---|
+| NV12 | 8bit ストリームの出力 (Semi-Planar YUV 4:2:0 8bit) | `FrameData::SemiPlanar` |
+| P010 | 10bit ストリームの出力 (Semi-Planar YUV 4:2:0 10bit、16bit ワードの上位 10bit) | `FrameData::SemiPlanar` |
+| AYUV | 8bit 4:4:4 ストリームの出力 (Packed YUV 4:4:4 8bit、バイト順は V, U, Y, A) | `FrameData::Packed` |
+| Y410 | 10bit 4:4:4 ストリームの出力 (Packed YUV 4:4:4 10bit、下位から U 10bit / Y 10bit / V 10bit / A 2bit) | `FrameData::Packed` |
 
 `supported_codecs()` が返す `CodecInfo::decoding` → `DecodingInfo::profiles` → `ProfileCapabilities::memory_types` → `MemoryTypeCapabilities::color_formats` に、プロファイル・メモリタイプごとのデコード出力色形式が入ります。
 
-12bit (P016) や 4:4:4 (AYUV / Y410) など、NV12 / P010 以外の出力は未対応で、デコード時にエラーになります。
-また、`Decoder` から出力フォーマットを取得する API はありません。
+12bit (P016) など、上記以外の出力は未対応で、デコード時にエラーになります。
 
 ## サポートプロファイル
 

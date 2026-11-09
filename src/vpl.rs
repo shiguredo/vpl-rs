@@ -249,6 +249,21 @@ impl VplLibrary {
     }
 }
 
+/// mfxFrameData から 1 行あたりのバイト数 (ピッチ) を取り出す
+///
+/// VPL はピッチを `PitchHigh` と `PitchLow` の 2 つの 16bit 値に分けて保持する。
+/// finalPitch = (PitchHigh << 16) + PitchLow
+///
+/// ref: libvpl api/vpl/mfxstructures.h (mfxFrameData::PitchHigh / PitchLow)
+///
+/// # Safety
+///
+/// `data` は VPL が初期化した有効な `mfxFrameData` である必要がある。
+/// `PitchLow` は共用体のメンバなので、`Pitch` と同じ領域が初期化されている必要がある。
+pub(crate) unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
+    unsafe { ((data.PitchHigh as usize) << 16) + (data.__bindgen_anon_2.PitchLow as usize) }
+}
+
 /// mfxFrameSurface1 の RAII ガード
 ///
 /// Map/Unmap/Release を自動管理する。

@@ -1,4 +1,4 @@
-//! コーデック種別・プロファイル・色形式の定義と、コーデック情報の照会
+//! コーデック種別・プロファイル・色形式・フレームの画素データの定義と、コーデック情報の照会
 
 use crate::vpl::{VplLibrary, VplLoader};
 use crate::{AdapterSelector, Error, sys};
@@ -303,7 +303,7 @@ impl ValueRange {
 
 /// フレームの色形式
 ///
-/// エンコーダーの入力と、エンコード・デコードのケーパビリティ照会で使う。
+/// サンプル形式とメモリレイアウトを表す。
 ///
 /// ref: libvpl api/vpl/mfxstructures.h (MFX_FOURCC_P010 / MFX_FOURCC_AYUV / MFX_FOURCC_Y410 / mfxY410)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +407,37 @@ impl FrameFormat {
             FrameFormat::Nv12 | FrameFormat::Yuy2 | FrameFormat::Bgra | FrameFormat::Ayuv => 8,
         }
     }
+}
+
+/// フレームの画素データ
+///
+/// 画素データのメモリレイアウトを表す。サンプル形式は [`FrameFormat`] で別に指定する。
+///
+/// `SemiPlanar` の Y プレーンはフレームの高さの行数、UV プレーンはその半分の行数、
+/// `Packed` は 1 プレーンでフレームの高さの行数を持つ。
+/// 各プレーンのデータ長は、行数を `rows` として `rows * pitch` バイト以上必要であり、
+/// 各プレーンの `pitch` は `FrameFormat::bytes_per_row(width)` 以上であること。
+/// P010 の 10bit 値は 16bit ワードの上位 10bit に格納する（[`FrameFormat::P010`]）。
+#[derive(Debug, Clone, Copy)]
+pub enum FrameData<'a> {
+    /// Semi-Planar YUV 4:2:0 (NV12 / P010)
+    SemiPlanar {
+        /// Y プレーン
+        y: &'a [u8],
+        /// Y プレーンの行間のバイト数（パディングを含む）
+        y_pitch: usize,
+        /// UV プレーン（インターリーブ）
+        uv: &'a [u8],
+        /// UV プレーンの行間のバイト数（パディングを含む）
+        uv_pitch: usize,
+    },
+    /// パック形式 (YUY2 / BGRA / AYUV / Y410)
+    Packed {
+        /// フレームデータ
+        data: &'a [u8],
+        /// 行間のバイト数（パディングを含む）
+        pitch: usize,
+    },
 }
 
 /// メモリタイプごとのケーパビリティ

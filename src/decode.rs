@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use crate::codec_info::VideoCodecType;
+use crate::codec_info::{FrameData, FrameFormat, VideoCodecType};
 use crate::stats::{Counter, Gauge};
-use crate::vpl::{FrameSurface, Session, VplLibrary};
+use crate::vpl::{FrameSurface, Session, VplLibrary, frame_data_pitch};
 use crate::{AdapterSelector, Error, sys};
 
 /// デバイスビジー時の最大リトライ回数
@@ -42,48 +42,40 @@ impl DecoderConfig {
 
 /// デコードされたフレーム
 ///
-/// デコード出力の形式はストリームのネイティブ形式で決まる。8bit ストリームは
-/// NV12、10bit ストリームは P010 になる。12bit (P016) や 4:4:4 (AYUV / Y410) など
-/// NV12 / P010 以外の出力には未対応で、デコード時にエラーになる。
-/// 出力形式を取得する API はない。
+/// 出力形式はストリームのネイティブ形式で決まる。8bit 4:2:0 は NV12、10bit 4:2:0 は
+/// P010、8bit 4:4:4 は AYUV、10bit 4:4:4 は Y410 になる。形式は
+/// [`DecodedFrame::frame_format`] で取得できる。これら以外の形式 (12bit の P016 など) は
+/// デコード時にエラーになる。
 ///
-/// データはピッチ幅を考慮した生データとして渡される。
-/// `y()` および `uv()` が返すスライスはピッチ幅を含んだサーフェス生データである。
-/// 8bit の場合は各行の先頭 `width()` バイトのみが有効データで、残りはパディングとなる。
-/// P010 の場合は各サンプルが 16bit ワードで、上位 10bit が有効データとなる。
-/// 各行の先頭 `width() * 2` バイトのみが有効データで、残りはパディングとなる。
+/// 画素データは [`DecodedFrame::data`] が返す [`FrameData`] で取得する。
+/// NV12 / P010 は [`FrameData::SemiPlanar`]、AYUV / Y410 は [`FrameData::Packed`] になる。
+/// スライスはピッチ幅を含む生データであり、各行の先頭 `FrameFormat::bytes_per_row(width())`
+/// バイトだけが有効データで、残りはパディングとなる。
 ///
 /// # ライフタイム
 ///
-/// 内部の `y`, `uv` スライスはコールバック呼び出し中のみ有効。
+/// `data()` が返すスライスはコールバック呼び出し中のみ有効。
 /// コールバックの外に持ち出そうとするとコンパイルエラーになる。
 pub struct DecodedFrame<'a, T> {
-    y: &'a [u8],
-    uv: &'a [u8],
-    pitch: usize,
+    data: FrameData<'a>,
+    frame_format: FrameFormat,
     width: usize,
     height: usize,
     user_data: T,
 }
 
 impl<'a, T> DecodedFrame<'a, T> {
-    /// Y プレーンを取得する
-    ///
-    /// 長さは `pitch() * height()` バイト。
-    pub fn y(&self) -> &[u8] {
-        self.y
+    /// デコード出力の色形式を返す
+    pub fn frame_format(&self) -> FrameFormat {
+        self.frame_format
     }
 
-    /// UV プレーンを取得する
+    /// 画素データを返す
     ///
-    /// 長さは `pitch() * height() / 2` バイト。
-    pub fn uv(&self) -> &[u8] {
-        self.uv
-    }
-
-    /// ピッチ（行あたりのバイト数）を返す
-    pub fn pitch(&self) -> usize {
-        self.pitch
+    /// `SemiPlanar` の Y プレーンは `y_pitch * height()` バイト、UV プレーンは
+    /// `uv_pitch * (height() / 2)` バイトである。`Packed` は `pitch * height()` バイトである。
+    pub fn data(&self) -> FrameData<'a> {
+        self.data
     }
 
     /// フレームのクロップ幅を返す
@@ -243,8 +235,9 @@ where
 /// Intel VPL ハードウェアデコーダ
 ///
 /// 圧縮されたビットストリームをデコードする。
-/// 出力フォーマットはストリームのネイティブ形式で決まる。NV12 / P010 以外の出力には
-/// 未対応で、デコード時にエラーになる。詳細は [`DecodedFrame`] を参照。
+/// 出力フォーマットはストリームのネイティブ形式で決まり、[`DecodedFrame::frame_format`] で
+/// 取得できる。NV12 / P010 / AYUV / Y410 以外の出力には未対応で、デコード時にエラーになる。
+/// 詳細は [`DecodedFrame`] を参照。
 /// 最初の [`Decoder::decode`] 呼び出し時にビットストリームのヘッダ (SPS/PPS 等) を解析して
 /// 自動的に初期化される。
 ///
@@ -804,7 +797,7 @@ fn notify_decoded<H: DecodeHandler>(
 /// 出力フレームの TimeStamp (=frame_seq) と完全一致する user_data を消費し、
 /// handler の `on_decoded` を呼び出す。
 ///
-/// `DecodedFrame` 内の y/uv スライスは `on_decoded` 呼び出し中のみ有効。
+/// `DecodedFrame` の `data()` が返すスライスは `on_decoded` 呼び出し中のみ有効。
 ///
 /// `Err` はデータ破損系（`SyncOperation` 失敗・`map_read` 失敗・`read_decoded_surface` の検証エラー）
 /// のみを返す。frame_seq 引き当て失敗はドレインの空フレームや異常出力が原因の正常な破棄として扱い、
@@ -854,13 +847,23 @@ fn sync_and_callback<H: DecodeHandler>(
     Ok(())
 }
 
-/// デコード結果として扱える色形式かどうか
-fn is_supported_decoded_format(fourcc: u32, chroma_format: u16) -> bool {
-    (fourcc == sys::MFX_FOURCC_NV12 || fourcc == sys::MFX_FOURCC_P010)
-        && chroma_format == sys::MFX_CHROMAFORMAT_YUV420 as u16
+/// デコード出力として扱える色形式を返す
+///
+/// FourCC と ChromaFormat の組が、対応する [`FrameFormat`] の組と一致しない場合は `None` を返す。
+fn decoded_frame_format(fourcc: u32, chroma_format: u16) -> Option<FrameFormat> {
+    let format = FrameFormat::from_fourcc(fourcc)?;
+    if format.chroma_format() != chroma_format {
+        return None;
+    }
+    match format {
+        FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Ayuv | FrameFormat::Y410 => {
+            Some(format)
+        }
+        FrameFormat::Yuy2 | FrameFormat::Bgra => None,
+    }
 }
 
-/// デコード済みサーフェスから Y/UV スライスを読み取り `DecodedFrame` を構築する
+/// デコード済みサーフェスから画素データを読み取り `DecodedFrame` を構築する
 ///
 /// Map 済みであることと、戻り値の `DecodedFrame` が生存している間
 /// サーフェスデータが有効であることの保証は呼び出し元の責任。
@@ -871,60 +874,113 @@ fn read_decoded_surface<'a, T>(
     let surface = unsafe { &*frame_surface.as_ptr() };
     let fourcc = surface.Info.FourCC;
     let chroma_format = surface.Info.ChromaFormat;
-    if !is_supported_decoded_format(fourcc, chroma_format) {
-        return Err(Error::new_custom_owned(
+    let format = decoded_frame_format(fourcc, chroma_format).ok_or_else(|| {
+        Error::new_custom_owned(
             "Decoder::sync_worker",
             format!(
                 "unsupported decoded surface format: FourCC={fourcc:#x}, ChromaFormat={chroma_format}"
             ),
-        ));
-    }
+        )
+    })?;
 
     let (crop_w, crop_h) = unsafe {
         let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
         (fi.CropW as usize, fi.CropH as usize)
     };
-    let pitch = unsafe { surface.Data.__bindgen_anon_2.Pitch as usize };
-    let y_ptr = unsafe { surface.Data.__bindgen_anon_3.Y };
-    let uv_ptr = unsafe { surface.Data.__bindgen_anon_4.UV };
-
-    // VPL が返したサーフェスデータの整合性を検証する
-    if y_ptr.is_null() || uv_ptr.is_null() {
-        return Err(Error::new_custom(
-            "Decoder::sync_worker",
-            "decoded surface has null plane pointers",
-        ));
-    }
-
     if crop_w == 0 || crop_h == 0 {
         return Err(Error::new_custom(
             "Decoder::sync_worker",
             "decoded surface has zero crop dimensions",
         ));
     }
-    if pitch < crop_w {
+
+    let row_bytes = format
+        .bytes_per_row(crop_w)
+        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "row bytes overflowed"))?;
+    let pitch = unsafe { frame_data_pitch(&surface.Data) };
+    if pitch < row_bytes {
         return Err(Error::new_custom_owned(
             "Decoder::sync_worker",
-            format!("pitch ({pitch}) is less than crop width ({crop_w})"),
+            format!("pitch ({pitch}) is less than row bytes ({row_bytes})"),
         ));
     }
 
-    // ピッチを考慮したプレーンサイズを計算する
-    let y_size = pitch
-        .checked_mul(crop_h)
-        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "Y plane size overflowed"))?;
-    let uv_height = crop_h / 2;
-    let uv_size = pitch
-        .checked_mul(uv_height)
-        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "UV plane size overflowed"))?;
+    // P010 は 10bit サンプルを 16bit ワードの上位ビットに格納する
+    if format == FrameFormat::P010 && surface.Info.Shift == 0 {
+        return Err(Error::new_custom(
+            "Decoder::sync_worker",
+            "P010 decoded surface has Shift 0",
+        ));
+    }
 
-    let y = unsafe { std::slice::from_raw_parts(y_ptr, y_size) };
-    let uv = unsafe { std::slice::from_raw_parts(uv_ptr, uv_size) };
+    // 最終行のパディングも含めたフレーム全体のサイズを計算する
+    let frame_size = pitch
+        .checked_mul(crop_h)
+        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "frame size overflowed"))?;
+
+    let data = unsafe {
+        match format {
+            FrameFormat::Nv12 | FrameFormat::P010 => {
+                if crop_w % 2 != 0 || crop_h % 2 != 0 {
+                    return Err(Error::new_custom(
+                        "Decoder::sync_worker",
+                        "4:2:0 decoded surface has odd crop dimensions",
+                    ));
+                }
+                let y_ptr = surface.Data.__bindgen_anon_3.Y;
+                let uv_ptr = surface.Data.__bindgen_anon_4.UV;
+                if y_ptr.is_null() || uv_ptr.is_null() {
+                    return Err(Error::new_custom(
+                        "Decoder::sync_worker",
+                        "decoded surface has null plane pointers",
+                    ));
+                }
+                let uv_size = pitch.checked_mul(crop_h / 2).ok_or_else(|| {
+                    Error::new_custom("Decoder::sync_worker", "UV plane size overflowed")
+                })?;
+                FrameData::SemiPlanar {
+                    y: std::slice::from_raw_parts(y_ptr, frame_size),
+                    y_pitch: pitch,
+                    uv: std::slice::from_raw_parts(uv_ptr, uv_size),
+                    uv_pitch: pitch,
+                }
+            }
+            FrameFormat::Ayuv => {
+                // AYUV のメモリ上の並びは V, U, Y, A であり、V ポインタがフレーム先頭を指す
+                let v_ptr = surface.Data.__bindgen_anon_5.V;
+                if v_ptr.is_null() {
+                    return Err(Error::new_custom(
+                        "Decoder::sync_worker",
+                        "decoded surface has null AYUV pointer",
+                    ));
+                }
+                FrameData::Packed {
+                    data: std::slice::from_raw_parts(v_ptr, frame_size),
+                    pitch,
+                }
+            }
+            FrameFormat::Y410 => {
+                // Y410 は `mfxFrameData.Y` ではなく `mfxFrameData.Y410` にフレーム先頭が入る
+                let y410_ptr = surface.Data.__bindgen_anon_4.Y410 as *const u8;
+                if y410_ptr.is_null() {
+                    return Err(Error::new_custom(
+                        "Decoder::sync_worker",
+                        "decoded surface has null Y410 pointer",
+                    ));
+                }
+                FrameData::Packed {
+                    data: std::slice::from_raw_parts(y410_ptr, frame_size),
+                    pitch,
+                }
+            }
+            // `decoded_frame_format` はデコード出力として扱える形式だけを返す
+            FrameFormat::Yuy2 | FrameFormat::Bgra => unreachable!(),
+        }
+    };
 
     Ok(DecodedFrame {
-        y,
-        uv,
-        pitch,
+        data,
+        frame_format: format,
         width: crop_w,
         height: crop_h,
         user_data,
@@ -1174,33 +1230,54 @@ mod tests {
         );
     }
 
-    /// NV12 / P010 をデコード結果として受け付けること
+    /// デコード出力として扱える色形式を FourCC から引けること
     #[test]
-    fn supported_decoded_format_accepts_nv12_and_p010() {
-        for fourcc in [sys::MFX_FOURCC_NV12, sys::MFX_FOURCC_P010] {
-            assert!(
-                is_supported_decoded_format(fourcc, sys::MFX_CHROMAFORMAT_YUV420 as u16),
-                "FourCC {fourcc:#x} が受け付けられない"
+    fn decoded_frame_format_accepts_supported_formats() {
+        for (fourcc, chroma_format, expected) in [
+            (
+                sys::MFX_FOURCC_NV12,
+                sys::MFX_CHROMAFORMAT_YUV420 as u16,
+                FrameFormat::Nv12,
+            ),
+            (
+                sys::MFX_FOURCC_P010,
+                sys::MFX_CHROMAFORMAT_YUV420 as u16,
+                FrameFormat::P010,
+            ),
+            (
+                sys::MFX_FOURCC_AYUV,
+                sys::MFX_CHROMAFORMAT_YUV444 as u16,
+                FrameFormat::Ayuv,
+            ),
+            (
+                sys::MFX_FOURCC_Y410,
+                sys::MFX_CHROMAFORMAT_YUV444 as u16,
+                FrameFormat::Y410,
+            ),
+        ] {
+            assert_eq!(
+                decoded_frame_format(fourcc, chroma_format),
+                Some(expected),
+                "FourCC {fourcc:#x} が {expected:?} として受け付けられない"
             );
         }
     }
 
-    /// 4:4:4 / 12bit など NV12 / P010 以外を拒否すること
+    /// デコード出力として扱えない形式と、色形式が一致しない組を拒否すること
     #[test]
-    fn supported_decoded_format_rejects_other_formats() {
-        for fourcc in [
-            sys::MFX_FOURCC_AYUV,
-            sys::MFX_FOURCC_Y410,
-            sys::MFX_FOURCC_P016,
+    fn decoded_frame_format_rejects_unsupported_formats() {
+        for (fourcc, chroma_format) in [
+            (sys::MFX_FOURCC_P016, sys::MFX_CHROMAFORMAT_YUV420 as u16),
+            (sys::MFX_FOURCC_YUY2, sys::MFX_CHROMAFORMAT_YUV422 as u16),
+            (sys::MFX_FOURCC_RGB4, sys::MFX_CHROMAFORMAT_YUV444 as u16),
+            (sys::MFX_FOURCC_NV12, sys::MFX_CHROMAFORMAT_YUV444 as u16),
+            (sys::MFX_FOURCC_AYUV, sys::MFX_CHROMAFORMAT_YUV420 as u16),
         ] {
-            assert!(
-                !is_supported_decoded_format(fourcc, sys::MFX_CHROMAFORMAT_YUV444 as u16),
+            assert_eq!(
+                decoded_frame_format(fourcc, chroma_format),
+                None,
                 "FourCC {fourcc:#x} が受け付けられている"
             );
         }
-        assert!(
-            !is_supported_decoded_format(sys::MFX_FOURCC_NV12, sys::MFX_CHROMAFORMAT_YUV444 as u16),
-            "ChromaFormat が 4:2:0 以外の NV12 が受け付けられている"
-        );
     }
 }
