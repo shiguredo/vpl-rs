@@ -48,7 +48,6 @@
   - `FrameFormat::bytes_per_row` を公開する
   - `FrameFormat::frame_size` を削除する。入力バッファの行長は `FrameFormat::bytes_per_row` から求める
   - NV12 / P010 の奇数サイズと YUY2 の奇数幅は `Encoder::new` がエラーにする
-  - `Encoder::new` は Init 後の実効フレーム情報が要求値と一致しない場合もエラーにする
   - `Encoder::coded_size` はサーフェスのサイズを返す API として残す
   - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する
@@ -81,6 +80,10 @@
 
 ### misc
 
+- [UPDATE] VPL が返す値の検証方針をユーザー入力と Rust の安全境界に限定する
+  - VPL が返すメタデータの健全性検証を削除し、仕様どおりの値として扱う
+  - `Encoder::new` は実効フレーム情報と VP9 の `WriteIVFHeaders` を要求値と比較しなくなる
+  - @melpon
 - [ADD] エンコード→デコードの恒等性を検証するテストを追加する
   - 同一フォーマット経路は Y / U / V の PSNR、変換経路はルマの PSNR と色バー領域のクロマ平均で検証する
   - ルマの分散・フレーム間差分・色バー間のクロマ平均の広がりと、BGRA 入力のルマ相関・平均・レンジ・分散を検証する

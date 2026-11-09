@@ -1332,10 +1332,6 @@ impl<H: EncodeHandler> Encoder<H> {
             write_ivf_headers_setting,
         );
 
-        // Init 直後に WriteIVFHeaders の実効値が要求値と一致するかを検証するため、
-        // 要求値を MFX_CODINGOPTION_* の値に変換して保持しておく。
-        // 非 VP9 コーデックでは None になる。
-        let write_ivf_headers_value = write_ivf_headers_setting.map(coding_option_value);
         // getter が返す bool は要求値が ON かどうかで決まる
         let write_ivf_headers = write_ivf_headers_setting.unwrap_or(false);
 
@@ -1351,92 +1347,14 @@ impl<H: EncodeHandler> Encoder<H> {
         // Init の呼び出しが終わったので ExtParam をクリアする
         clear_ext_param(&mut video_param);
 
-        // 初期化後に実効パラメータを読み戻す。
-        // VP9 の場合、write_ivf_headers の要求値が oneVPL に尊重されるかを検証するため、
-        // 読み戻し専用の mfxExtVP9Param を attach して GetVideoParam を呼ぶ。
-        //
-        // GetVideoParam は mfxVideoParam に attach した拡張バッファへ実効値を書き戻す。
-        // 読み戻し用バッファの WriteIVFHeaders は zeroed 初期化により UNKNOWN (0) のままにしておき、
-        // 書き戻されなかった場合に下の一致検証で必ず検出できるようにする。
-        // ref:
-        // - libvpl api/vpl/mfxvideo.h (MFXVideoENCODE_GetVideoParam の拡張バッファ説明)
-        let mut ext_vp9_readback: Option<sys::mfxExtVP9Param> = None;
-        if matches!(&config.codec, CodecConfig::Vp9(_)) {
-            let mut vp9_param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
-            vp9_param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
-            vp9_param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
-            ext_vp9_readback = Some(vp9_param);
-        }
-
-        // 読み戻し用の拡張バッファポインタ配列を構築する
-        let mut ext_bufs_readback: Vec<*mut sys::mfxExtBuffer> = Vec::new();
-        if let Some(ref mut vp9) = ext_vp9_readback {
-            ext_bufs_readback.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
-        }
-        attach_ext_param(&mut video_param, &mut ext_bufs_readback);
-
+        // 初期化後の実効 FrameInfo を読み戻す。
+        // 内部サーフェスのサイズは VPL が決めるため、その値を coded_size として保持する。
         lib.mfx_video_encode_get_video_param(session_ptr, &mut video_param)
             .inspect_err(|_| {
                 // GetVideoParam 失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
                 let _ = lib.mfx_video_encode_close(session_ptr);
             })?;
-        // GetVideoParam の呼び出しが終わったので ExtParam をクリアする
-        clear_ext_param(&mut video_param);
         frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
-
-        // Init が警告でパラメータを補正した場合に備え、GetVideoParam の実効値が
-        // 要求値と一致することを確認する。
-        let fi = unsafe { frame_info.__bindgen_anon_1.__bindgen_anon_1 };
-        let requested_format = config.frame_format;
-        if fi.CropX != 0
-            || fi.CropY != 0
-            || fi.CropW != config.width as u16
-            || fi.CropH != config.height as u16
-            || fi.Width < fi.CropW
-            || fi.Height < fi.CropH
-            || frame_info.FourCC != requested_format.fourcc()
-            || frame_info.ChromaFormat != requested_format.chroma_format()
-            || frame_info.BitDepthLuma != requested_format.bit_depth()
-            || frame_info.BitDepthChroma != requested_format.bit_depth()
-            || frame_info.Shift != requested_format.frame_info_shift()
-        {
-            let _ = lib.mfx_video_encode_close(session_ptr);
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "effective frame info mismatch: CropX={}, CropY={}, CropW={}, CropH={}, Width={}, Height={}, FourCC={:#x}, ChromaFormat={}, BitDepthLuma={}, BitDepthChroma={}, Shift={}",
-                    fi.CropX,
-                    fi.CropY,
-                    fi.CropW,
-                    fi.CropH,
-                    fi.Width,
-                    fi.Height,
-                    frame_info.FourCC,
-                    frame_info.ChromaFormat,
-                    frame_info.BitDepthLuma,
-                    frame_info.BitDepthChroma,
-                    frame_info.Shift,
-                ),
-            ));
-        }
-
-        // VP9 の場合、WriteIVFHeaders の実効値が要求値と完全一致することを検証する。
-        // 一致しない場合（UNKNOWN を含む）は oneVPL が要求を尊重しなかったことを意味するため、
-        // エンコーダをクローズしてエラーを返す。
-        if let Some(expected) = write_ivf_headers_value
-            && let Some(vp9) = ext_vp9_readback
-            && vp9.WriteIVFHeaders != expected
-        {
-            let _ = lib.mfx_video_encode_close(session_ptr);
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "VP9 WriteIVFHeaders mismatch: requested {} but got {}",
-                    coding_option_name(expected),
-                    coding_option_name(vp9.WriteIVFHeaders),
-                ),
-            ));
-        }
 
         let bitstream_buffer_size = (buffer_size_in_kb as usize) * 1024;
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -1701,11 +1619,8 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// IVF ヘッダーを出力する設定かどうかを返す
     ///
-    /// `Vp9EncoderConfig::write_ivf_headers` で指定した値（oneVPL へ要求し、初期化時に実効値との一致を検証済みの値）を返す。
+    /// `Vp9EncoderConfig::write_ivf_headers` で指定した要求値を返す。
     /// 非 VP9 コーデックでは常に `false` を返す。
-    ///
-    /// 実効値の一致検証は GetVideoParam が拡張バッファへ実効値を書き戻す挙動に依存している。
-    /// この挙動は libvpl の実装由来で、将来のバージョンで変更される可能性がある。
     pub fn write_ivf_headers(&self) -> bool {
         self.write_ivf_headers
     }
@@ -2073,8 +1988,7 @@ fn sync_and_build_frame<T>(
 /// `SyncOperation` を実行し、VPL が返した `mfxBitstream` から
 /// callback に必要な情報を取り出して `SyncedBitstream` に整形する。
 ///
-/// 取り出し時は `DataOffset` / `DataLength` の範囲検証を行い、
-/// 不正なオフセットでメモリアクセスしないように防御する。
+/// `DataOffset` / `DataLength` がバッファ範囲外の場合は `Err` を返す。
 fn sync_and_collect(
     lib: VplLibrary,
     session_handle: usize,
@@ -2102,7 +2016,9 @@ fn sync_and_collect(
     let offset = bitstream.DataOffset as usize;
     let length = bitstream.DataLength as usize;
 
-    // VPL が返したオフセットと長さがバッファ範囲内か検証する
+    // VPL が返したオフセットと長さをバッファ範囲内のスライスに変換する。
+    // これは VPL の値の正しさを検証するためではなく、範囲外のメモリに
+    // アクセスしないための Rust の安全境界としての確認である。
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::new_custom_owned(
             "Encoder::sync_worker",
@@ -2218,20 +2134,6 @@ fn coding_option_value(enabled: bool) -> u16 {
         sys::MFX_CODINGOPTION_ON as u16
     } else {
         sys::MFX_CODINGOPTION_OFF as u16
-    }
-}
-
-/// MFX_CODINGOPTION_* の数値を記号名へ変換する
-///
-/// CodingOptionValue (mfxstructures.h) の値をエラーメッセージで判読可能にするための表示用関数。
-/// 想定外の値は unknown (0xNN) で表示する。
-fn coding_option_name(value: u16) -> String {
-    match value {
-        v if v == sys::MFX_CODINGOPTION_UNKNOWN as u16 => "MFX_CODINGOPTION_UNKNOWN".to_owned(),
-        v if v == sys::MFX_CODINGOPTION_ON as u16 => "MFX_CODINGOPTION_ON".to_owned(),
-        v if v == sys::MFX_CODINGOPTION_OFF as u16 => "MFX_CODINGOPTION_OFF".to_owned(),
-        v if v == sys::MFX_CODINGOPTION_ADAPTIVE as u16 => "MFX_CODINGOPTION_ADAPTIVE".to_owned(),
-        v => format!("unknown ({v:#x})"),
     }
 }
 

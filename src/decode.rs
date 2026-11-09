@@ -802,8 +802,9 @@ fn notify_decoded<H: DecodeHandler>(
 ///
 /// `DecodedFrame` の `data()` が返すスライスは `on_decoded` 呼び出し中のみ有効。
 ///
-/// `Err` はデータ破損系（`SyncOperation` 失敗・`map_read` 失敗・`read_decoded_surface` の検証エラー）
-/// のみを返す。frame_seq 引き当て失敗はドレインの空フレームや異常出力が原因の正常な破棄として扱い、
+/// `Err` は `SyncOperation` の失敗、`map_read` の失敗、`read_decoded_surface` の
+/// エラー（対応外の出力形式・null ポインタ・サイズ計算のオーバーフロー）のみを返す。
+/// frame_seq 引き当て失敗はドレインの空フレームや異常出力が原因の正常な破棄として扱い、
 /// `Err` にせず `Ok(())` で返す（対応する user_data が存在しないだけで、出力自体は解放すればよいため）。
 fn sync_and_callback<H: DecodeHandler>(
     lib: VplLibrary,
@@ -871,6 +872,10 @@ fn decoded_frame_format(fourcc: u32, chroma_format: u16) -> Option<FrameFormat> 
 ///
 /// Map 済みであることと、戻り値の `DecodedFrame` が生存している間
 /// サーフェスデータが有効であることの保証は呼び出し元の責任。
+/// VPL が返したメタデータどおりのメモリが有効であることを前提とする。
+///
+/// 対応外の出力形式、プレーンポインタの null、スライス長の計算のオーバーフロー
+/// の場合は `Err` を返す。
 fn read_decoded_surface<'a, T>(
     frame_surface: &'a FrameSurface,
     user_data: T,
@@ -891,31 +896,8 @@ fn read_decoded_surface<'a, T>(
         let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
         (fi.CropW as usize, fi.CropH as usize)
     };
-    if crop_w == 0 || crop_h == 0 {
-        return Err(Error::new_custom(
-            "Decoder::sync_worker",
-            "decoded surface has zero crop dimensions",
-        ));
-    }
 
-    let row_bytes = format
-        .bytes_per_row(crop_w)
-        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "row bytes overflowed"))?;
     let pitch = unsafe { frame_data_pitch(&surface.Data) };
-    if pitch < row_bytes {
-        return Err(Error::new_custom_owned(
-            "Decoder::sync_worker",
-            format!("pitch ({pitch}) is less than row bytes ({row_bytes})"),
-        ));
-    }
-
-    // P010 は 10bit サンプルを 16bit ワードの上位ビットに格納する
-    if format == FrameFormat::P010 && surface.Info.Shift == 0 {
-        return Err(Error::new_custom(
-            "Decoder::sync_worker",
-            "P010 decoded surface has Shift 0",
-        ));
-    }
 
     // Y プレーンの長さ (パック形式ではフレーム全体の長さ) を計算する
     let plane_size = pitch
@@ -925,12 +907,6 @@ fn read_decoded_surface<'a, T>(
     let data = unsafe {
         match format {
             FrameFormat::Nv12 | FrameFormat::P010 => {
-                if crop_w % 2 != 0 || crop_h % 2 != 0 {
-                    return Err(Error::new_custom(
-                        "Decoder::sync_worker",
-                        "4:2:0 decoded surface has odd crop dimensions",
-                    ));
-                }
                 let y_ptr = surface.Data.__bindgen_anon_3.Y;
                 let uv_ptr = surface.Data.__bindgen_anon_4.UV;
                 if y_ptr.is_null() || uv_ptr.is_null() {
