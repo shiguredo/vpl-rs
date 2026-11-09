@@ -11,6 +11,12 @@
 
 ## develop
 
+- [CHANGE] デコーダーの 4:4:4 出力 (AYUV / Y410) に対応する
+  - `DecodedFrame::frame_format` でデコード出力の色形式を取得できる
+  - `DecodedFrame::data` が返す `FrameData` で画素データを取得する。NV12 / P010 は `SemiPlanar`、AYUV / Y410 は `Packed` になる
+  - `DecodedFrame::y` / `DecodedFrame::uv` / `DecodedFrame::pitch` を削除する。`data` と `frame_format` で置き換える
+  - `FrameData` をエンコード入力とデコード出力の共通の画素データ表現にする
+  - @melpon
 - [CHANGE] プロファイル型とコーデック識別型を統合する
   - `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` に統合する
   - `DecoderCodec` を削除し、`DecoderConfig` のコーデックを `VideoCodecType` で指定するよう変更する
