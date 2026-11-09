@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-11-08
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-10
 - Model: DeepSeek V4 Flash
 - Branch: feature/refactor-unify-vpl-value-checking
 - Polished: {YYYY-MM-DD}
@@ -53,3 +53,37 @@ VPL が返す値の検証方針が場所によって異なっている。`CODEBA
 
 - VPL の `MFXVideoENCODE_GetVideoParam` / `mfxFrameSurface1.Info` / `mfxFrameData.Pitch`
 - VPL の `MFXVideoDECODE_DecodeFrameAsync` と `mfxBitstream` の `DataOffset` / `DataLength`
+
+## 解決方法
+
+`CODEBASE.md` に「VPL の値の扱い」を追記し、ユーザー入力の検証と Rust の安全境界だけを残す形に統一した。
+
+### 変更内容
+
+- `CODEBASE.md` に VPL の値の扱いを追記した
+  - VPL が返すメタデータは仕様どおりと信頼し、健全性の検証をしない
+  - VPL が返すメモリ記述は Rust の安全境界に必要な確認だけ行う
+  - 安全境界の定義と確認項目を明記した
+- エンコーダーの VPL 出力メタデータ検証を削除した
+  - `Encoder::new` の実効 `FrameInfo` と VP9 `WriteIVFHeaders` の読み戻し検証を削除した
+  - 実効 `FrameInfo` は `coded_size` 用に保持する
+- デコーダーの VPL 出力メタデータ検証を削除した
+  - `read_decoded_surface` の `crop = 0`、pitch、P010 `Shift`、4:2:0 の奇数 crop の検証を削除した
+  - `decoded_frame_format` の ChromaFormat 一致検証を削除し、FourCC の分岐だけにした
+  - null ポインタとサイズ計算のオーバーフロー確認は残した
+- コピー先サーフェスの安全確認を追加した
+  - `copy_to_surface_planes` の先頭で、実際のサーフェスの `Info.Width` / `Info.Height` と pitch が表示サイズを満たすことを確認する
+  - 純粋関数 `ensure_destination_surface_fits` と単体テストを追加した
+- `sync_and_collect` の `DataOffset` / `DataLength` 範囲確認は安全境界として残した
+- `CHANGES.md` / `README.md` / `skills/shiguredo-vpl/SKILL.md` を更新した
+
+### 確認
+
+Intel GPU を搭載した実機で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` | pass (lib 58 件、adapter 6 件、codec_info 1 件、roundtrip 67 件、doctest 2 件) |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | pass |

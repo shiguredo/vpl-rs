@@ -48,7 +48,6 @@
   - `FrameFormat::bytes_per_row` を公開する
   - `FrameFormat::frame_size` を削除する。入力バッファの行長は `FrameFormat::bytes_per_row` から求める
   - NV12 / P010 の奇数サイズと YUY2 の奇数幅は `Encoder::new` がエラーにする
-  - `Encoder::new` は Init 後の実効フレーム情報が要求値と一致しない場合もエラーにする
   - `Encoder::coded_size` はサーフェスのサイズを返す API として残す
   - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する
@@ -89,6 +88,9 @@
 - [ADD] silent pass していたテストを修正する
   - `frame_surface_gpu_required` でテスト用エンコーダーを初期化し、早期 return を assert に置き換える
   - `test_list_adapters_sorted_and_deduped` に空 Vec の自動パスを防ぐ assert を追加する
+  - @melpon
+- [UPDATE] VPL が返す値の検証方針をユーザー入力と Rust の安全境界に限定する
+  - VPL が仕様どおりの値を返す前提で、メタデータの健全性検証を削除する
   - @melpon
 - [UPDATE] VPL ローダーの初期化処理を `VplLoader` に集約する
   - セッション生成・アダプタ列挙・コーデック照会で重複していたローダーの生成とフィルタ設定を共通化する

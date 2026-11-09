@@ -2103,8 +2103,8 @@ fn test_encoder_new_rejects_unsupported_format() {
 
 /// 入力フォーマットとプロファイルの組み合わせの可否が Init の結果に従うこと
 ///
-/// `Encoder::new` が Init に成功した場合は実効パラメータが要求した色形式と一致し、
-/// 失敗した場合は `MFXVideoENCODE_Init` のエラーを返すことを確認する。
+/// `Encoder::new` が Init に成功した場合は `get_video_param` が VPL の実効値として
+/// 要求した色形式を報告し、失敗した場合は `MFXVideoENCODE_Init` のエラーを返すことを確認する。
 #[test]
 fn test_encoder_new_profile_bit_depth_depends_on_init() {
     let cases = [
@@ -3345,6 +3345,25 @@ fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
         write_ivf_headers,
         "write_ivf_headers の getter は設定した値を返すこと"
     );
+
+    // get_video_param が VPL の実効 VP9 パラメータを報告することを確認する。
+    // VPL が書き戻さない実装では WriteIVFHeaders が 0 のままなので、その場合は値を問わない。
+    let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+    let vp9_param = param
+        .ext
+        .vp9_param
+        .expect("mfxExtVP9Param が読み戻されていない");
+    if vp9_param.WriteIVFHeaders != 0 {
+        let expected = if write_ivf_headers {
+            ffi::MFX_CODINGOPTION_ON as u16
+        } else {
+            ffi::MFX_CODINGOPTION_OFF as u16
+        };
+        assert_eq!(
+            vp9_param.WriteIVFHeaders, expected,
+            "get_video_param の WriteIVFHeaders が要求値と違う"
+        );
+    }
 
     let width = config.width as usize;
     let height = config.height as usize;

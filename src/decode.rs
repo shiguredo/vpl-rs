@@ -74,9 +74,6 @@ impl<'a, T> DecodedFrame<'a, T> {
     }
 
     /// 画素データを返す
-    ///
-    /// `SemiPlanar` の Y プレーンは `y_pitch * height()` バイト、UV プレーンは
-    /// `uv_pitch * (height() / 2)` バイトである。`Packed` は `pitch * height()` バイトである。
     pub fn data(&self) -> FrameData<'a> {
         self.data
     }
@@ -802,8 +799,9 @@ fn notify_decoded<H: DecodeHandler>(
 ///
 /// `DecodedFrame` の `data()` が返すスライスは `on_decoded` 呼び出し中のみ有効。
 ///
-/// `Err` はデータ破損系（`SyncOperation` 失敗・`map_read` 失敗・`read_decoded_surface` の検証エラー）
-/// のみを返す。frame_seq 引き当て失敗はドレインの空フレームや異常出力が原因の正常な破棄として扱い、
+/// `Err` は `SyncOperation` の失敗、`map_read` の失敗、`read_decoded_surface` の
+/// エラー（対応外の出力形式・null ポインタ・サイズ計算のオーバーフロー）のみを返す。
+/// frame_seq 引き当て失敗はドレインの空フレームや異常出力が原因の正常な破棄として扱い、
 /// `Err` にせず `Ok(())` で返す（対応する user_data が存在しないだけで、出力自体は解放すればよいため）。
 fn sync_and_callback<H: DecodeHandler>(
     lib: VplLibrary,
@@ -852,13 +850,10 @@ fn sync_and_callback<H: DecodeHandler>(
 
 /// デコード出力として扱える色形式を返す
 ///
-/// FourCC と ChromaFormat の組が、対応する [`FrameFormat`] の組と一致しない場合は `None` を返す。
-/// [`FrameFormat`] で表現できても、YUY2 と BGRA はデコード出力としては扱わないため `None` を返す。
-fn decoded_frame_format(fourcc: u32, chroma_format: u16) -> Option<FrameFormat> {
+/// [`FrameFormat`] で表現できない FourCC と、YUY2 と BGRA はデコード出力としては
+/// 扱わないため `None` を返す。
+fn decoded_frame_format(fourcc: u32) -> Option<FrameFormat> {
     let format = FrameFormat::from_fourcc(fourcc)?;
-    if format.chroma_format() != chroma_format {
-        return None;
-    }
     match format {
         FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Ayuv | FrameFormat::Y410 => {
             Some(format)
@@ -871,19 +866,20 @@ fn decoded_frame_format(fourcc: u32, chroma_format: u16) -> Option<FrameFormat> 
 ///
 /// Map 済みであることと、戻り値の `DecodedFrame` が生存している間
 /// サーフェスデータが有効であることの保証は呼び出し元の責任。
+/// VPL が返したメタデータどおりのメモリが有効であることを前提とする。
+///
+/// 対応外の出力形式、プレーンポインタの null、スライス長の計算のオーバーフロー
+/// の場合は `Err` を返す。
 fn read_decoded_surface<'a, T>(
     frame_surface: &'a FrameSurface,
     user_data: T,
 ) -> Result<DecodedFrame<'a, T>, Error> {
     let surface = unsafe { &*frame_surface.as_ptr() };
     let fourcc = surface.Info.FourCC;
-    let chroma_format = surface.Info.ChromaFormat;
-    let format = decoded_frame_format(fourcc, chroma_format).ok_or_else(|| {
+    let format = decoded_frame_format(fourcc).ok_or_else(|| {
         Error::new_custom_owned(
             "Decoder::sync_worker",
-            format!(
-                "unsupported decoded surface format: FourCC={fourcc:#x}, ChromaFormat={chroma_format}"
-            ),
+            format!("unsupported decoded surface format: FourCC={fourcc:#x}"),
         )
     })?;
 
@@ -891,31 +887,8 @@ fn read_decoded_surface<'a, T>(
         let fi = &surface.Info.__bindgen_anon_1.__bindgen_anon_1;
         (fi.CropW as usize, fi.CropH as usize)
     };
-    if crop_w == 0 || crop_h == 0 {
-        return Err(Error::new_custom(
-            "Decoder::sync_worker",
-            "decoded surface has zero crop dimensions",
-        ));
-    }
 
-    let row_bytes = format
-        .bytes_per_row(crop_w)
-        .ok_or_else(|| Error::new_custom("Decoder::sync_worker", "row bytes overflowed"))?;
     let pitch = unsafe { frame_data_pitch(&surface.Data) };
-    if pitch < row_bytes {
-        return Err(Error::new_custom_owned(
-            "Decoder::sync_worker",
-            format!("pitch ({pitch}) is less than row bytes ({row_bytes})"),
-        ));
-    }
-
-    // P010 は 10bit サンプルを 16bit ワードの上位ビットに格納する
-    if format == FrameFormat::P010 && surface.Info.Shift == 0 {
-        return Err(Error::new_custom(
-            "Decoder::sync_worker",
-            "P010 decoded surface has Shift 0",
-        ));
-    }
 
     // Y プレーンの長さ (パック形式ではフレーム全体の長さ) を計算する
     let plane_size = pitch
@@ -925,12 +898,6 @@ fn read_decoded_surface<'a, T>(
     let data = unsafe {
         match format {
             FrameFormat::Nv12 | FrameFormat::P010 => {
-                if crop_w % 2 != 0 || crop_h % 2 != 0 {
-                    return Err(Error::new_custom(
-                        "Decoder::sync_worker",
-                        "4:2:0 decoded surface has odd crop dimensions",
-                    ));
-                }
                 let y_ptr = surface.Data.__bindgen_anon_3.Y;
                 let uv_ptr = surface.Data.__bindgen_anon_4.UV;
                 if y_ptr.is_null() || uv_ptr.is_null() {
@@ -1239,48 +1206,30 @@ mod tests {
     /// デコード出力として扱える色形式を FourCC から引けること
     #[test]
     fn decoded_frame_format_accepts_supported_formats() {
-        for (fourcc, chroma_format, expected) in [
-            (
-                sys::MFX_FOURCC_NV12,
-                sys::MFX_CHROMAFORMAT_YUV420 as u16,
-                FrameFormat::Nv12,
-            ),
-            (
-                sys::MFX_FOURCC_P010,
-                sys::MFX_CHROMAFORMAT_YUV420 as u16,
-                FrameFormat::P010,
-            ),
-            (
-                sys::MFX_FOURCC_AYUV,
-                sys::MFX_CHROMAFORMAT_YUV444 as u16,
-                FrameFormat::Ayuv,
-            ),
-            (
-                sys::MFX_FOURCC_Y410,
-                sys::MFX_CHROMAFORMAT_YUV444 as u16,
-                FrameFormat::Y410,
-            ),
+        for (fourcc, expected) in [
+            (sys::MFX_FOURCC_NV12, FrameFormat::Nv12),
+            (sys::MFX_FOURCC_P010, FrameFormat::P010),
+            (sys::MFX_FOURCC_AYUV, FrameFormat::Ayuv),
+            (sys::MFX_FOURCC_Y410, FrameFormat::Y410),
         ] {
             assert_eq!(
-                decoded_frame_format(fourcc, chroma_format),
+                decoded_frame_format(fourcc),
                 Some(expected),
                 "FourCC {fourcc:#x} が {expected:?} として受け付けられない"
             );
         }
     }
 
-    /// デコード出力として扱えない形式と、色形式が一致しない組を拒否すること
+    /// デコード出力として扱えない形式を拒否すること
     #[test]
     fn decoded_frame_format_rejects_unsupported_formats() {
-        for (fourcc, chroma_format) in [
-            (sys::MFX_FOURCC_P016, sys::MFX_CHROMAFORMAT_YUV420 as u16),
-            (sys::MFX_FOURCC_YUY2, sys::MFX_CHROMAFORMAT_YUV422 as u16),
-            (sys::MFX_FOURCC_RGB4, sys::MFX_CHROMAFORMAT_YUV444 as u16),
-            (sys::MFX_FOURCC_NV12, sys::MFX_CHROMAFORMAT_YUV444 as u16),
-            (sys::MFX_FOURCC_AYUV, sys::MFX_CHROMAFORMAT_YUV420 as u16),
+        for fourcc in [
+            sys::MFX_FOURCC_P016,
+            sys::MFX_FOURCC_YUY2,
+            sys::MFX_FOURCC_RGB4,
         ] {
             assert_eq!(
-                decoded_frame_format(fourcc, chroma_format),
+                decoded_frame_format(fourcc),
                 None,
                 "FourCC {fourcc:#x} が受け付けられている"
             );
