@@ -158,7 +158,7 @@ while let Ok(result) = rx.try_recv() {
 - コーデック: `codec: CodecConfig`
   - `CodecConfig::H264(H264EncoderConfig)` / `Hevc(...)` / `Vp9(...)` / `Av1(...)`
   - 各設定は `profile: Option<...>` を持つ。 `None` でコーデックのデフォルトプロファイル。
-  - `Vp9EncoderConfig` だけは `write_ivf_headers: bool` を持つ。 `true` で IVF ヘッダー付き、 `false` で raw VP9 を出力する。 Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、 従来の IVF 付き出力を維持するには `true` を指定する。 構造体リテラルで構築する場合は必須フィールド。
+  - `Vp9EncoderConfig` だけは `write_ivf_headers: bool` を持つ。 `true` で IVF ヘッダー付き、 `false` で raw VP9 を VPL へ要求する。 実効値は `Encoder::get_video_param()` の `ExtParams::vp9_param` で確認できる。 Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、 従来の IVF 付き出力を維持するには `true` を指定する。 構造体リテラルで構築する場合は必須フィールド。
 - フレーム情報 (`mfxFrameInfo` 対応): `width` / `height` / `frame_format` / `framerate_num` / `framerate_den` / `aspect_ratio_w` / `aspect_ratio_h`
 - 非同期深度: `async_depth` (`mfxVideoParam.AsyncDepth`)。 `None` の場合は 4 を使用。 1 は最小メモリだが性能が低く、4 が高スループット寄りの推奨値。
 - エンコード制御 (`mfxInfoMFX` 対応): `low_power` / `brc_param_multiplier` / `target_usage` (1=最高品質, 4=バランス, 7=最高速)
@@ -280,10 +280,10 @@ encoder.reconfigure(ReconfigureParams {
 - reconfigure は、呼び出し時点までに送信したフレームの Sync 完了と、すべてのコールバックの完了までブロックする。
 - reconfigure が `Err` を返した場合、エンコーダーが使用できない状態のまま残ることがあるため、 `Encoder` を作り直す。
 
-### 出力設定の検証 (`write_ivf_headers`)
+### 出力設定 (`write_ivf_headers`)
 
-- `Encoder::write_ivf_headers() -> bool` は VP9 の IVF ヘッダー出力設定を返す。 `Vp9EncoderConfig::write_ivf_headers` の要求値そのもの。
-- 初期化時に `mfxExtVP9Param::WriteIVFHeaders` の実効値を GetVideoParam で読み戻し、 要求値と一致しない場合はエラーを返す。 非 VP9 コーデックでは常に `false`。
+- `Encoder::write_ivf_headers() -> bool` は VP9 の IVF ヘッダー出力設定を返す。 `Vp9EncoderConfig::write_ivf_headers` の要求値そのもの。 非 VP9 コーデックでは常に `false`。
+- 要求値は初期化時に `mfxExtVP9Param::WriteIVFHeaders` として VPL へ渡す。 VPL が報告する実効値は `Encoder::get_video_param()` の `ExtParams::vp9_param` で確認できる。
 
 ### 実効パラメータの取得 (`get_video_param`)
 
@@ -451,7 +451,7 @@ impl<'a, T> DecodedFrame<'a, T> {
 - `data()` は **ピッチ込みの生サーフェス** を `FrameData` で返す。 NV12 / P010 は `FrameData::SemiPlanar`、 AYUV / Y410 は `FrameData::Packed` になる。 有効データは各行の先頭 `FrameFormat::bytes_per_row(width())` バイトだけで、 残りはパディング。 P010 は各サンプルが 16bit ワードで上位 10bit が有効。 ピッチが表示幅と一致するとは限らないので、 そのまま連結すると壊れる。 行ごとにコピーする。
 - AYUV は 1 画素 4 バイト (V, U, Y, A)、 Y410 は 1 画素 4 バイトの 32bit ワード (下位から U 10bit / Y 10bit / V 10bit / A 2bit)。 パック形式では Y / U / V がインターリーブされるため、 `SemiPlanar` のようにプレーン単位では扱えない。
 - スライスのライフタイム `'a` は `on_decoded` 呼び出し中のみ。 コールバックの外に持ち出そうとするとコンパイルエラーになる。 外で使いたいなら `to_vec()` でコピーする。
-- VPL から返るサーフェスが不正 (null ポインタ / `crop = 0` / `pitch < bytes_per_row`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
+- VPL から返るサーフェスのプレーンポインタが null の場合や、サイズ計算がオーバーフローした場合は、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 これは Rust のスライス生成に必要な安全境界であり、 VPL が返すメタデータの正しさを検証するものではない。
 
 ## コーデック情報の照会 (`supported_codecs`)
 

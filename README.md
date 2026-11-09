@@ -307,8 +307,9 @@ decoder.decode(&keyframe, "frame-0")?;
 | VP9       | `CodecConfig::Vp9(Vp9EncoderConfig)` |
 | AV1       | `CodecConfig::Av1(Av1EncoderConfig)` |
 
-VP9 の場合、`Vp9EncoderConfig::write_ivf_headers` で出力形式を選択します。
-`true` で IVF ヘッダー付き、`false` で raw VP9 を出力します。
+VP9 の場合、`Vp9EncoderConfig::write_ivf_headers` に VPL への要求値を指定します。
+`true` で IVF ヘッダー付き、`false` で raw VP9 を要求します。実効値は `Encoder::get_video_param()` の
+`ExtParams::vp9_param` で確認できます。
 Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従来の IVF 付き出力を維持するには `true` を指定してください。
 
 ### デコード
