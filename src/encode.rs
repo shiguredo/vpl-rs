@@ -30,7 +30,7 @@ pub struct Vp9EncoderConfig {
     pub profile: Option<Vp9Profile>,
     /// IVF ヘッダーを出力するかどうか
     ///
-    /// true の場合は IVF ヘッダー付き、false の場合は raw VP9 を出力する。
+    /// `true` の場合は IVF ヘッダー付き、`false` の場合は raw VP9 を出力する。
     pub write_ivf_headers: bool,
 }
 
@@ -57,15 +57,19 @@ pub enum CodecConfig {
 impl FrameFormat {
     /// フレームデータをコピーする
     ///
-    /// `frame` の形式と各プレーンの `pitch` / データ長、`data` のピッチが不正な場合はエラーを返す。
+    /// `frame` の形式と各プレーンの `pitch` / データ長、コピー先サーフェスの
+    /// サイズとピッチが不正な場合はエラーを返す。
     ///
     /// # Safety
     ///
-    /// `data` の各プレーンポインタは有効なメモリを指し、Pitch 幅分の書き込みが可能である必要がある。
+    /// `data` の各プレーンポインタは有効なメモリを指し、`surface_width` /
+    /// `surface_height` の範囲に `Pitch` 幅で書き込める必要がある。
     unsafe fn copy_to_surface_planes(
         self,
         frame: FrameData<'_>,
         data: &sys::mfxFrameData,
+        surface_width: usize,
+        surface_height: usize,
         width: usize,
         height: usize,
     ) -> Result<(), Error> {
@@ -74,14 +78,14 @@ impl FrameFormat {
         })?;
         unsafe {
             let dst_pitch = frame_data_pitch(data);
-            if dst_pitch < row_bytes {
-                return Err(Error::new_custom_owned(
-                    "Encoder::encode",
-                    format!(
-                        "destination pitch ({dst_pitch}) is less than bytes per row ({row_bytes})"
-                    ),
-                ));
-            }
+            ensure_destination_surface_fits(
+                surface_width,
+                surface_height,
+                dst_pitch,
+                row_bytes,
+                width,
+                height,
+            )?;
             match (self, frame) {
                 (
                     FrameFormat::Nv12 | FrameFormat::P010,
@@ -743,6 +747,32 @@ pub struct EncodeOptions {
     /// 0 の場合はエンコーダが自動決定する。
     /// `frame_type` モジュールの定数をビット OR で組み合わせて指定する。
     pub frame_type: u16,
+}
+
+/// コピー先サーフェスが、指定した表示サイズのフレームを書き込めることを確認する
+///
+/// `surface_width` / `surface_height` はコピー先サーフェスの実際のサイズ、
+/// `pitch` は実際の行ピッチ、`row_bytes` は 1 行あたりの必要バイト数、
+/// `width` / `height` は書き込む表示サイズである。
+///
+/// 幅・高さ・ピッチのいずれかが不足する場合は `Err` を返す。
+fn ensure_destination_surface_fits(
+    surface_width: usize,
+    surface_height: usize,
+    pitch: usize,
+    row_bytes: usize,
+    width: usize,
+    height: usize,
+) -> Result<(), Error> {
+    if surface_width < width || surface_height < height || pitch < row_bytes {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!(
+                "destination surface is too small: surface={surface_width}x{surface_height} pitch={pitch}, required={width}x{height} row_bytes={row_bytes}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// プレーンのデータ長が指定行数分あることを検証する
@@ -1619,7 +1649,7 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// IVF ヘッダーを出力する設定かどうかを返す
     ///
-    /// `Vp9EncoderConfig::write_ivf_headers` で指定した要求値を返す。
+    /// `Vp9EncoderConfig::write_ivf_headers` で指定した値を返す。
     /// 非 VP9 コーデックでは常に `false` を返す。
     pub fn write_ivf_headers(&self) -> bool {
         self.write_ivf_headers
@@ -1666,10 +1696,17 @@ impl<H: EncodeHandler> Encoder<H> {
 
         // フレームデータを検証して内部サーフェスにコピーする
         unsafe {
-            (*frame_surface.as_ptr()).Data.TimeStamp = frame_seq;
+            let surface_ptr = frame_surface.as_ptr();
+            (*surface_ptr).Data.TimeStamp = frame_seq;
+            let (surface_width, surface_height) = {
+                let fi = &(*surface_ptr).Info.__bindgen_anon_1.__bindgen_anon_1;
+                (usize::from(fi.Width), usize::from(fi.Height))
+            };
             self.frame_format.copy_to_surface_planes(
                 frame,
-                &(*frame_surface.as_ptr()).Data,
+                &(*surface_ptr).Data,
+                surface_width,
+                surface_height,
                 self.width,
                 self.height,
             )?;
@@ -2267,7 +2304,7 @@ mod tests {
         };
         unsafe {
             FrameFormat::Nv12
-                .copy_to_surface_planes(frame, &data, width, height)
+                .copy_to_surface_planes(frame, &data, width, height, width, height)
                 .expect("コピーに失敗した");
         }
 
@@ -2323,13 +2360,38 @@ mod tests {
         };
         let error = unsafe {
             FrameFormat::Nv12
-                .copy_to_surface_planes(frame, &data, width, height)
+                .copy_to_surface_planes(frame, &data, width, height, width, height)
                 .expect_err("コピー先のピッチ不足は拒否されること")
         };
         assert!(
-            error.to_string().contains("destination pitch"),
-            "エラーメッセージに destination pitch が含まれること: {error}"
+            error
+                .to_string()
+                .contains("destination surface is too small"),
+            "エラーメッセージに容量不足が含まれること: {error}"
         );
+    }
+
+    /// コピー先サーフェスの幅・高さ・ピッチがちょうどの容量なら受け付けること
+    #[test]
+    fn ensure_destination_surface_fits_accepts_exact_capacity() {
+        ensure_destination_surface_fits(4, 4, 4, 4, 4, 4)
+            .expect("ちょうどの容量は受け付けられること");
+    }
+
+    /// コピー先サーフェスの幅・高さ・ピッチのいずれかが不足する場合はエラーになること
+    #[test]
+    fn ensure_destination_surface_fits_rejects_short_capacity() {
+        for (surface_width, surface_height, pitch) in [(3, 4, 4), (4, 3, 4), (4, 4, 3)] {
+            let error =
+                ensure_destination_surface_fits(surface_width, surface_height, pitch, 4, 4, 4)
+                    .expect_err("容量不足は拒否されること");
+            assert!(
+                error
+                    .to_string()
+                    .contains("destination surface is too small"),
+                "エラーメッセージに容量不足が含まれること: {error}"
+            );
+        }
     }
 
     /// パック形式のコピーが形式ごとのポインタとピッチを使うこと
@@ -2365,7 +2427,7 @@ mod tests {
             };
             unsafe {
                 format
-                    .copy_to_surface_planes(frame, &data, width, height)
+                    .copy_to_surface_planes(frame, &data, width, height, width, height)
                     .expect("コピーに失敗した");
             }
             for row in 0..height {

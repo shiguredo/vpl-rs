@@ -74,9 +74,6 @@ impl<'a, T> DecodedFrame<'a, T> {
     }
 
     /// 画素データを返す
-    ///
-    /// `SemiPlanar` の Y プレーンは `y_pitch * height()` バイト、UV プレーンは
-    /// `uv_pitch * (height() / 2)` バイトである。`Packed` は `pitch * height()` バイトである。
     pub fn data(&self) -> FrameData<'a> {
         self.data
     }
@@ -853,13 +850,10 @@ fn sync_and_callback<H: DecodeHandler>(
 
 /// デコード出力として扱える色形式を返す
 ///
-/// FourCC と ChromaFormat の組が、対応する [`FrameFormat`] の組と一致しない場合は `None` を返す。
-/// [`FrameFormat`] で表現できても、YUY2 と BGRA はデコード出力としては扱わないため `None` を返す。
-fn decoded_frame_format(fourcc: u32, chroma_format: u16) -> Option<FrameFormat> {
+/// [`FrameFormat`] で表現できない FourCC と、YUY2 と BGRA はデコード出力としては
+/// 扱わないため `None` を返す。
+fn decoded_frame_format(fourcc: u32) -> Option<FrameFormat> {
     let format = FrameFormat::from_fourcc(fourcc)?;
-    if format.chroma_format() != chroma_format {
-        return None;
-    }
     match format {
         FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Ayuv | FrameFormat::Y410 => {
             Some(format)
@@ -882,13 +876,10 @@ fn read_decoded_surface<'a, T>(
 ) -> Result<DecodedFrame<'a, T>, Error> {
     let surface = unsafe { &*frame_surface.as_ptr() };
     let fourcc = surface.Info.FourCC;
-    let chroma_format = surface.Info.ChromaFormat;
-    let format = decoded_frame_format(fourcc, chroma_format).ok_or_else(|| {
+    let format = decoded_frame_format(fourcc).ok_or_else(|| {
         Error::new_custom_owned(
             "Decoder::sync_worker",
-            format!(
-                "unsupported decoded surface format: FourCC={fourcc:#x}, ChromaFormat={chroma_format}"
-            ),
+            format!("unsupported decoded surface format: FourCC={fourcc:#x}"),
         )
     })?;
 
@@ -1215,48 +1206,30 @@ mod tests {
     /// デコード出力として扱える色形式を FourCC から引けること
     #[test]
     fn decoded_frame_format_accepts_supported_formats() {
-        for (fourcc, chroma_format, expected) in [
-            (
-                sys::MFX_FOURCC_NV12,
-                sys::MFX_CHROMAFORMAT_YUV420 as u16,
-                FrameFormat::Nv12,
-            ),
-            (
-                sys::MFX_FOURCC_P010,
-                sys::MFX_CHROMAFORMAT_YUV420 as u16,
-                FrameFormat::P010,
-            ),
-            (
-                sys::MFX_FOURCC_AYUV,
-                sys::MFX_CHROMAFORMAT_YUV444 as u16,
-                FrameFormat::Ayuv,
-            ),
-            (
-                sys::MFX_FOURCC_Y410,
-                sys::MFX_CHROMAFORMAT_YUV444 as u16,
-                FrameFormat::Y410,
-            ),
+        for (fourcc, expected) in [
+            (sys::MFX_FOURCC_NV12, FrameFormat::Nv12),
+            (sys::MFX_FOURCC_P010, FrameFormat::P010),
+            (sys::MFX_FOURCC_AYUV, FrameFormat::Ayuv),
+            (sys::MFX_FOURCC_Y410, FrameFormat::Y410),
         ] {
             assert_eq!(
-                decoded_frame_format(fourcc, chroma_format),
+                decoded_frame_format(fourcc),
                 Some(expected),
                 "FourCC {fourcc:#x} が {expected:?} として受け付けられない"
             );
         }
     }
 
-    /// デコード出力として扱えない形式と、色形式が一致しない組を拒否すること
+    /// デコード出力として扱えない形式を拒否すること
     #[test]
     fn decoded_frame_format_rejects_unsupported_formats() {
-        for (fourcc, chroma_format) in [
-            (sys::MFX_FOURCC_P016, sys::MFX_CHROMAFORMAT_YUV420 as u16),
-            (sys::MFX_FOURCC_YUY2, sys::MFX_CHROMAFORMAT_YUV422 as u16),
-            (sys::MFX_FOURCC_RGB4, sys::MFX_CHROMAFORMAT_YUV444 as u16),
-            (sys::MFX_FOURCC_NV12, sys::MFX_CHROMAFORMAT_YUV444 as u16),
-            (sys::MFX_FOURCC_AYUV, sys::MFX_CHROMAFORMAT_YUV420 as u16),
+        for fourcc in [
+            sys::MFX_FOURCC_P016,
+            sys::MFX_FOURCC_YUY2,
+            sys::MFX_FOURCC_RGB4,
         ] {
             assert_eq!(
-                decoded_frame_format(fourcc, chroma_format),
+                decoded_frame_format(fourcc),
                 None,
                 "FourCC {fourcc:#x} が受け付けられている"
             );

@@ -158,7 +158,7 @@ while let Ok(result) = rx.try_recv() {
 - コーデック: `codec: CodecConfig`
   - `CodecConfig::H264(H264EncoderConfig)` / `Hevc(...)` / `Vp9(...)` / `Av1(...)`
   - 各設定は `profile: Option<...>` を持つ。 `None` でコーデックのデフォルトプロファイル。
-  - `Vp9EncoderConfig` だけは `write_ivf_headers: bool` を持つ。 `true` で IVF ヘッダー付き、 `false` で raw VP9 を出力する。 Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、 従来の IVF 付き出力を維持するには `true` を指定する。 構造体リテラルで構築する場合は必須フィールド。
+  - `Vp9EncoderConfig` だけは `write_ivf_headers: bool` を持つ。 `true` で IVF ヘッダー付き、 `false` で raw VP9 を VPL へ要求する。 実効値は `Encoder::get_video_param()` の `ExtParams::vp9_param` で確認できる。 Intel GPU の oneVPL は `WriteIVFHeaders` が既定で ON のため、 従来の IVF 付き出力を維持するには `true` を指定する。 構造体リテラルで構築する場合は必須フィールド。
 - フレーム情報 (`mfxFrameInfo` 対応): `width` / `height` / `frame_format` / `framerate_num` / `framerate_den` / `aspect_ratio_w` / `aspect_ratio_h`
 - 非同期深度: `async_depth` (`mfxVideoParam.AsyncDepth`)。 `None` の場合は 4 を使用。 1 は最小メモリだが性能が低く、4 が高スループット寄りの推奨値。
 - エンコード制御 (`mfxInfoMFX` 対応): `low_power` / `brc_param_multiplier` / `target_usage` (1=最高品質, 4=バランス, 7=最高速)

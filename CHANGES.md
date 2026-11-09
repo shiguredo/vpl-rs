@@ -80,10 +80,6 @@
 
 ### misc
 
-- [UPDATE] VPL が返す値の検証方針をユーザー入力と Rust の安全境界に限定する
-  - VPL が返すメタデータの健全性検証を削除し、仕様どおりの値として扱う
-  - `Encoder::new` は実効フレーム情報と VP9 の `WriteIVFHeaders` を要求値と比較しなくなる
-  - @melpon
 - [ADD] エンコード→デコードの恒等性を検証するテストを追加する
   - 同一フォーマット経路は Y / U / V の PSNR、変換経路はルマの PSNR と色バー領域のクロマ平均で検証する
   - ルマの分散・フレーム間差分・色バー間のクロマ平均の広がりと、BGRA 入力のルマ相関・平均・レンジ・分散を検証する
@@ -92,6 +88,9 @@
 - [ADD] silent pass していたテストを修正する
   - `frame_surface_gpu_required` でテスト用エンコーダーを初期化し、早期 return を assert に置き換える
   - `test_list_adapters_sorted_and_deduped` に空 Vec の自動パスを防ぐ assert を追加する
+  - @melpon
+- [UPDATE] VPL が返す値の検証方針をユーザー入力と Rust の安全境界に限定する
+  - VPL が仕様どおりの値を返す前提で、メタデータの健全性検証を削除する
   - @melpon
 - [UPDATE] VPL ローダーの初期化処理を `VplLoader` に集約する
   - セッション生成・アダプタ列挙・コーデック照会で重複していたローダーの生成とフィルタ設定を共通化する
