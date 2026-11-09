@@ -126,22 +126,32 @@ fn generate_dummy_nv12(width: usize, height: usize, frame_index: usize) -> Vec<u
     data
 }
 
+/// SMPTE カラーバー風の 7 色（白/黄/シアン/緑/マゼンタ/赤/青）
+const COLOR_BARS_RGB: [(u8, u8, u8); 7] = [
+    (235, 235, 235), // 白
+    (235, 235, 16),  // 黄
+    (16, 235, 235),  // シアン
+    (16, 235, 16),   // 緑
+    (235, 16, 235),  // マゼンタ
+    (235, 16, 16),   // 赤
+    (16, 16, 235),   // 青
+];
+
+/// BT.601 の RGB -> YCbCr 変換で U / V を返す
+///
+/// `U` / `V` は 16〜240 の範囲に制限する。
+fn rgb_to_uv((r, g, b): (u8, u8, u8)) -> (u8, u8) {
+    let (r, g, b) = (r as f64, g as f64, b as f64);
+    let u = (-0.148 * r - 0.291 * g + 0.439 * b + 128.0).clamp(16.0, 240.0) as u8;
+    let v = (0.439 * r - 0.368 * g - 0.071 * b + 128.0).clamp(16.0, 240.0) as u8;
+    (u, v)
+}
+
 /// SMPTE カラーバー風の NV12 フレームを生成する
 ///
 /// 7 色の縦ストライプ（白/黄/シアン/緑/マゼンタ/赤/青）を
 /// BT.601 で YUV に変換し NV12 形式で返す。
 fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
-    // SMPTE カラーバーの RGB 値（白/黄/シアン/緑/マゼンタ/赤/青）
-    let bars: [(u8, u8, u8); 7] = [
-        (235, 235, 235), // 白
-        (235, 235, 16),  // 黄
-        (16, 235, 235),  // シアン
-        (16, 235, 16),   // 緑
-        (235, 16, 235),  // マゼンタ
-        (235, 16, 16),   // 赤
-        (16, 16, 235),   // 青
-    ];
-
     let y_size = width * height;
     let uv_height = height / 2;
     let uv_size = width * uv_height;
@@ -153,8 +163,8 @@ fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
 
     for y in 0..height {
         for x in 0..width {
-            let bar_index = x * 7 / width;
-            let (r, g, b) = bars[bar_index];
+            let bar_index = x * COLOR_BARS_RGB.len() / width;
+            let (r, g, b) = COLOR_BARS_RGB[bar_index];
 
             // BT.601 RGB -> YCbCr
             let rf = r as f64;
@@ -165,8 +175,7 @@ fn generate_colorbar_nv12(width: usize, height: usize) -> Vec<u8> {
 
             // UV は 2x2 ブロック単位（左上ピクセルで代表する）
             if y % 2 == 0 && x % 2 == 0 {
-                let u = (-0.148 * rf - 0.291 * gf + 0.439 * bf + 128.0).clamp(16.0, 240.0) as u8;
-                let v = (0.439 * rf - 0.368 * gf - 0.071 * bf + 128.0).clamp(16.0, 240.0) as u8;
+                let (u, v) = rgb_to_uv((r, g, b));
                 let uv_row = y / 2;
                 let uv_col = x; // NV12 はインターリーブなので x そのまま
                 data[uv_offset + uv_row * width + uv_col] = u;
@@ -281,11 +290,8 @@ fn psnr_y_10bit(
     psnr_from_mse(mse_sum, pixels, 1023.0)
 }
 
-/// Y プレーン PSNR の下限 (dB)
-///
-/// QPI=10 の実測では 60 dB 程度。エンコーダーの実装差を考慮して、AYUV は 30 dB、
-/// 10bit 入力は 35 dB を下限にする。
-const AYUV_LUMA_PSNR_MIN_DB: f64 = 30.0;
+// QPI = 10 の実測では 60 dB 程度。エンコーダーの実装差を考慮して 35 dB を下限にする
+/// P010 入力の Y プレーン PSNR の下限 (dB)
 const TEN_BIT_LUMA_PSNR_MIN_DB: f64 = 35.0;
 
 /// エンコード結果をコールバックで受信するエンコーダと受信用チャネルのペア
@@ -1813,21 +1819,10 @@ fn generate_dummy_frame(
     }
 }
 
-/// フォーマット指定のラウンドトリップテストを実行するヘルパー
+/// 指定したフォーマット・サイズでエンコード→デコードのラウンドトリップを検証する
 ///
-/// 指定フォーマットでダミーフレームを生成し、エンコード→デコードして
-/// フレーム数が一致することを検証する。
+/// フレーム数とサイズ（レイアウト）だけを検証し、画素値は検証しない。
 fn roundtrip_format(
-    codec_config: CodecConfig,
-    decoder_codec: VideoCodecType,
-    format: FrameFormat,
-    num_frames: usize,
-) {
-    roundtrip_format_with_size(codec_config, decoder_codec, format, num_frames, 320, 240);
-}
-
-/// フォーマット指定のラウンドトリップテストを実行するヘルパー（任意サイズ）
-fn roundtrip_format_with_size(
     codec_config: CodecConfig,
     decoder_codec: VideoCodecType,
     format: FrameFormat,
@@ -1873,23 +1868,6 @@ fn roundtrip_format_with_size(
         num_frames,
         "{format:?}: decoded {} frames, expected {num_frames}",
         decoded_frames.len()
-    );
-}
-
-// ---------------------------------------------------------------------------
-// フレームフォーマット別ラウンドトリップテスト
-// ---------------------------------------------------------------------------
-
-/// BGRA 入力の H.264 ラウンドトリップ
-#[test]
-fn test_roundtrip_h264_bgra() {
-    roundtrip_format(
-        CodecConfig::H264(H264EncoderConfig {
-            profile: Some(H264Profile::High),
-        }),
-        VideoCodecType::H264,
-        FrameFormat::Bgra,
-        10,
     );
 }
 
@@ -1946,167 +1924,6 @@ fn skip_if_encoder_format_unsupported(
         }
         None => false,
     }
-}
-
-/// AYUV 入力のラウンドトリップと Y プレーンの画質検証
-///
-/// 入力の輝度パターンとデコード結果の Y プレーンが一致することを確認する。
-/// これにより AYUV のバイト順 (V, U, Y, A) がエンコーダーに正しく伝わることが検証できる。
-#[test]
-fn test_roundtrip_hevc_ayuv_luma() {
-    let codec = VideoCodecType::Hevc;
-    let profile = VideoProfile::Hevc(HevcProfile::Main);
-    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
-        return;
-    }
-
-    let width = 320usize;
-    let height = 240usize;
-    let num_frames = 10usize;
-    let mut config = EncoderConfig::new(
-        test_adapter(),
-        CodecConfig::Hevc(HevcEncoderConfig {
-            profile: Some(HevcProfile::Main),
-        }),
-        width as u32,
-        height as u32,
-        FrameFormat::Ayuv,
-        30,
-        1,
-        RateControlMode::Cqp,
-    );
-    config.qpi = Some(10);
-    config.gop_pic_size = Some(30);
-
-    let frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_frame(FrameFormat::Ayuv, width, height, i))
-        .collect();
-    let (_, decoded) = roundtrip(config, codec, &frames);
-
-    for frame in &decoded {
-        let frame_index = frame.user_data;
-        // generate_dummy_frame と同じパターンの 8bit 輝度を期待値にする
-        let expected: Vec<u8> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (16 + (x + y + frame_index * 7) % 220) as u8))
-            .collect();
-        let psnr = psnr_y(&expected, &frame.y_data, frame.pitch, width, height);
-        assert!(
-            psnr >= AYUV_LUMA_PSNR_MIN_DB,
-            "AYUV 入力の Y プレーンの PSNR が低すぎる (frame {frame_index}): {psnr} dB"
-        );
-    }
-}
-
-/// 10bit 入力の Y プレーンを検証する
-///
-/// 4:2:0 のプロファイルでは、4:4:4 の Y410 入力は 4:2:0 に変換され、デコード出力は P010 になる。
-/// ルマは変換で失われないため、P010 の Y プレーンと比較する。
-fn assert_10bit_luma_roundtrip(
-    codec: VideoCodecType,
-    codec_config: CodecConfig,
-    profile: VideoProfile,
-    format: FrameFormat,
-) {
-    if skip_if_encoder_format_unsupported(codec, profile, format) {
-        return;
-    }
-
-    let width = 320usize;
-    let height = 240usize;
-    let num_frames = 5usize;
-    let mut config = EncoderConfig::new(
-        test_adapter(),
-        codec_config,
-        width as u32,
-        height as u32,
-        format,
-        30,
-        1,
-        RateControlMode::Cqp,
-    );
-    config.qpi = Some(10);
-    config.gop_pic_size = Some(30);
-
-    let frames: Vec<Vec<u8>> = (0..num_frames)
-        .map(|i| generate_dummy_frame(format, width, height, i))
-        .collect();
-    let (_, decoded) = roundtrip(config, codec, &frames);
-
-    for frame in &decoded {
-        let frame_index = frame.user_data;
-        assert!(
-            frame.pitch >= width * 2,
-            "{format:?} の Y プレーンのピッチが小さすぎる (frame {frame_index}): {} < {}",
-            frame.pitch,
-            width * 2,
-        );
-        // generate_dummy_frame と同じパターンの 10bit 輝度を期待値にする
-        let expected: Vec<u16> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (64 + (x + y + frame_index * 7) % 900) as u16))
-            .collect();
-        let psnr = psnr_y_10bit(&expected, &frame.y_data, frame.pitch, width, height);
-        assert!(
-            psnr >= TEN_BIT_LUMA_PSNR_MIN_DB,
-            "{format:?} 入力の Y プレーンの PSNR が低すぎる (frame {frame_index}): {psnr} dB"
-        );
-    }
-}
-
-/// P010 (10bit 4:2:0) 入力の HEVC Main10 ラウンドトリップ
-#[test]
-fn test_roundtrip_hevc_main10_p010() {
-    assert_10bit_luma_roundtrip(
-        VideoCodecType::Hevc,
-        CodecConfig::Hevc(HevcEncoderConfig {
-            profile: Some(HevcProfile::Main10),
-        }),
-        VideoProfile::Hevc(HevcProfile::Main10),
-        FrameFormat::P010,
-    );
-}
-
-/// Y410 (10bit 4:4:4) 入力の HEVC Main10 ラウンドトリップ
-#[test]
-fn test_roundtrip_hevc_main10_y410() {
-    assert_10bit_luma_roundtrip(
-        VideoCodecType::Hevc,
-        CodecConfig::Hevc(HevcEncoderConfig {
-            profile: Some(HevcProfile::Main10),
-        }),
-        VideoProfile::Hevc(HevcProfile::Main10),
-        FrameFormat::Y410,
-    );
-}
-
-/// AYUV (8bit 4:4:4) 入力の H.264 High ラウンドトリップ
-#[test]
-fn test_roundtrip_h264_ayuv() {
-    let codec = VideoCodecType::H264;
-    let profile = VideoProfile::H264(H264Profile::High);
-    if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
-        return;
-    }
-    roundtrip_format(
-        CodecConfig::H264(H264EncoderConfig {
-            profile: Some(H264Profile::High),
-        }),
-        codec,
-        FrameFormat::Ayuv,
-        10,
-    );
-}
-
-/// P010 (10bit 4:2:0) 入力の AV1 Main ラウンドトリップ
-#[test]
-fn test_roundtrip_av1_p010() {
-    assert_10bit_luma_roundtrip(
-        VideoCodecType::Av1,
-        CodecConfig::Av1(Av1EncoderConfig {
-            profile: Some(Av1Profile::Main),
-        }),
-        VideoProfile::Av1(Av1Profile::Main),
-        FrameFormat::P010,
-    );
 }
 
 /// ケーパビリティ照会で非対応の形式は Encoder::new がエラーを返すこと
@@ -2346,6 +2163,10 @@ fn test_encoder_keeps_requested_frame_format() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// フレームフォーマット別ラウンドトリップテスト
+// ---------------------------------------------------------------------------
+
 /// NV12 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
 #[test]
 fn test_roundtrip_h264_nv12_alignment_mismatch() {
@@ -2383,7 +2204,7 @@ fn test_roundtrip_hevc_nv12_alignment_mismatch() {
     if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Nv12) {
         return;
     }
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::Hevc(HevcEncoderConfig {
             profile: Some(HevcProfile::Main),
         }),
@@ -2403,7 +2224,7 @@ fn test_roundtrip_av1_nv12_alignment_mismatch() {
     if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Nv12) {
         return;
     }
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::Av1(Av1EncoderConfig {
             profile: Some(Av1Profile::Main),
         }),
@@ -2423,7 +2244,7 @@ fn test_roundtrip_vp9_nv12_alignment_mismatch() {
     if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Nv12) {
         return;
     }
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::Vp9(Vp9EncoderConfig {
             profile: Some(Vp9Profile::Profile0),
             write_ivf_headers: false,
@@ -2444,7 +2265,7 @@ fn test_roundtrip_hevc_main10_p010_alignment_mismatch() {
     if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::P010) {
         return;
     }
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::Hevc(HevcEncoderConfig {
             profile: Some(HevcProfile::Main10),
         }),
@@ -2464,7 +2285,7 @@ fn test_roundtrip_h264_ayuv_alignment_mismatch() {
     if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Ayuv) {
         return;
     }
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -2484,7 +2305,7 @@ fn test_roundtrip_hevc_main10_y410_alignment_mismatch() {
     if skip_if_encoder_format_unsupported(codec, profile, FrameFormat::Y410) {
         return;
     }
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::Hevc(HevcEncoderConfig {
             profile: Some(HevcProfile::Main10),
         }),
@@ -2499,7 +2320,7 @@ fn test_roundtrip_hevc_main10_y410_alignment_mismatch() {
 /// BGRA 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
 #[test]
 fn test_roundtrip_h264_bgra_alignment_mismatch() {
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -2514,7 +2335,7 @@ fn test_roundtrip_h264_bgra_alignment_mismatch() {
 /// YUY2 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
 #[test]
 fn test_roundtrip_h264_yuy2_alignment_mismatch() {
-    roundtrip_format_with_size(
+    roundtrip_format(
         CodecConfig::H264(H264EncoderConfig {
             profile: Some(H264Profile::High),
         }),
@@ -4217,4 +4038,1250 @@ fn test_decoder_stats_in_flight_frames() {
         0,
         "正常に完了したデコードでエラー数が増えないこと"
     );
+}
+
+// ---------------------------------------------------------------------------
+// エンコード→デコードの恒等性テスト
+// ---------------------------------------------------------------------------
+
+/// エンコード→デコードで入力と出力の内容が一致することを検証するテスト群
+///
+/// デコーダーの出力フォーマットはストリームのネイティブ形式で決まり、入力フォーマットと
+/// 異なる場合があるため、実機で確認した主要な経路を明示的なテーブルで持つ。
+///
+/// Intel GPU を搭載した実機が必須である。閾値の実測値は Meteor Lake / mfx-gen 環境で取得した。
+/// BGRA 入力のデコード結果は limited range の Y である前提で検証する。
+mod identity {
+    use super::*;
+
+    /// 表示幅
+    const WIDTH: usize = 320;
+
+    /// 表示高さ
+    const HEIGHT: usize = 240;
+
+    /// 1 ケースあたりのフレーム数
+    const NUM_FRAMES: usize = 5;
+
+    // 量子化誤差を十分小さくしつつ、実機で安定してエンコードできる 10〜16 の範囲に収める
+    /// I フレームの量子化パラメータ
+    const QPI: u16 = 12;
+
+    // QPI と同じ範囲に収める
+    /// P フレームの量子化パラメータ
+    const QPP: u16 = 12;
+
+    /// 色バーの本数
+    const BAR_COUNT: usize = COLOR_BARS_RGB.len();
+
+    /// クロマ領域平均を計算する縦方向の範囲（上端）
+    const CHROMA_ROW_START: usize = HEIGHT / 4;
+
+    /// クロマ領域平均を計算する縦方向の範囲（下端）
+    const CHROMA_ROW_END: usize = HEIGHT * 3 / 4;
+
+    // QPI = QPP = 12 の実測値は Y が 52.1 dB 以上、U / V が 53.7 dB 以上だった。
+    // 実装差を見込んで 45 dB を下限にする。これは実測の最小値より 7 dB 低く、MSE では
+    // 約 5 倍の余裕がある。変換経路でもルマは変換で失われないため同じ下限を使う。
+    /// Y / U / V PSNR の下限 (dB)
+    const PSNR_MIN_DB: f64 = 45.0;
+
+    // 実測値の最大は 0.09 だった。4:2:0 への変換で色バー境界の影響を受けるため 2.0 まで
+    // 許容する。色バーの取り違えやクロマプレーンの欠落は 10 以上の差になるが、小さな
+    // クロマの歪みは検出しない。
+    /// 8bit のクロマ領域平均の許容差（サンプル値）
+    const CHROMA_MEAN_TOLERANCE_8BIT: f64 = 2.0;
+
+    // 実測値の最大は 0.53 だった。10bit のサンプル値は 8bit の 4 倍のスケールなので、
+    // 8bit と同じ比率になる 8.0 まで許容する。
+    /// 10bit のクロマ領域平均の許容差（サンプル値）
+    const CHROMA_MEAN_TOLERANCE_10BIT: f64 = 8.0;
+
+    // 参照フレームのグラデーション・チェッカー・移動縞による実測値は 2312 以上だった。
+    // 単色やフラットな壊れた出力を検出できるよう、実測値の約 65% を下限にする。
+    /// 8bit のルマ分散の下限
+    const LUMA_VARIANCE_MIN_8BIT: f64 = 1500.0;
+
+    // 実測値は 37006 以上だった。10bit のサンプル値は 8bit の 4 倍のスケールなので、
+    // 分散は 16 倍になり、8bit の下限 1500 の 16 倍を下限にする。
+    /// 10bit のルマ分散の下限
+    const LUMA_VARIANCE_MIN_10BIT: f64 = 24000.0;
+
+    // フレームごとに移動する縞による実測値は 8.4 以上だった。同じフレームの繰り返しや
+    // 移動パターンが失われた出力を検出できるよう、実測値の約 35% を下限にする。
+    /// 8bit の隣接フレーム間の平均絶対差分の下限
+    const FRAME_DIFF_MIN_8BIT: f64 = 3.0;
+
+    // 実測値は 33.7 以上だった。10bit のサンプル値は 8bit の 4 倍のスケールなので、
+    // 8bit の下限 3.0 の 4 倍を下限にする。
+    /// 10bit の隣接フレーム間の平均絶対差分の下限
+    const FRAME_DIFF_MIN_10BIT: f64 = 12.0;
+
+    // 7 色の色バーによる実測値は 193 以上だった。クロマが単色になった場合は 0 になるため、
+    // 実測値の約 60% を下限にする。
+    /// 8bit の色バー間のクロマ平均の広がりの下限
+    const CHROMA_SPREAD_MIN_8BIT: f64 = 120.0;
+
+    // 実測値は 772 以上だった。10bit のサンプル値は 8bit の 4 倍のスケールなので、
+    // 8bit の下限 120 の 4 倍を下限にする。
+    /// 10bit の色バー間のクロマ平均の広がりの下限
+    const CHROMA_SPREAD_MIN_10BIT: f64 = 480.0;
+
+    // R = G = B のランプに対する実測値は 1.0000 だった。量子化の影響を見込んで 0.995 を
+    // 下限にする。
+    /// BGRA 入力のグレーランプとルマの相関の下限
+    const BGRA_LUMA_CORRELATION_MIN: f64 = 0.995;
+
+    // 各フレームのグレー値のレンジは 180 で、limited range の Y に変換すると 154〜155 に
+    // なる。単色の場合は 0 になるため、120 を下限にする。
+    /// BGRA 入力のルマレンジの下限
+    const BGRA_LUMA_RANGE_MIN: f64 = 120.0;
+
+    // 行方向と列方向のグラデーションによる輝度の分散は実測で 1311 だった。単色の場合は 0 に
+    // なるため、1000 を下限にする。
+    /// BGRA 入力のルマ分散の下限
+    const BGRA_LUMA_VARIANCE_MIN: f64 = 1000.0;
+
+    // グレー値をフレームごとに 3 増やしており、limited range の輝度の差は約 2.6 になる。
+    // 実測値は 2.6 だったため、量子化誤差と実装差を見込んで約 42% の余裕がある 1.5 を
+    // 下限にする。
+    /// BGRA 入力の隣接フレーム間の平均絶対差分の下限
+    const BGRA_FRAME_DIFF_MIN: f64 = 1.5;
+
+    // BGRA 入力のデコード結果の Y は limited range であるため、期待するグレー平均を
+    // 16 + 219 / 255 * 平均 に変換して比較する。正しいフレームの残差は 0.1 以下、
+    // 隣接フレームの取り違えでは 2.5 以上変わるため、0.5 を許容差にする。
+    /// BGRA 入力のルマ平均の許容差（サンプル値）
+    const BGRA_LUMA_MEAN_TOLERANCE: f64 = 0.5;
+
+    /// デコード出力のサンプル形式
+    #[derive(Debug, Clone, Copy)]
+    enum DecodeFormat {
+        /// 8bit の NV12
+        Nv12,
+        /// 10bit の P010
+        P010,
+    }
+
+    /// クロマの検証方法
+    #[derive(Debug, Clone, Copy)]
+    enum ChromaCheck {
+        /// U / V プレーンの PSNR を検証する
+        Psnr,
+        /// 色バー領域の平均値だけを検証する
+        RegionMean,
+    }
+
+    /// 検証するエンコーダー・入力フォーマット・デコード出力の組み合わせ
+    struct Case {
+        /// テストログに出す経路の名前
+        label: &'static str,
+        /// エンコーダーのコーデック設定
+        codec_config: CodecConfig,
+        /// デコーダーのコーデック種別
+        decoder_codec: VideoCodecType,
+        /// エンコーダーへの入力フォーマット
+        input_format: FrameFormat,
+        /// デコーダーの出力フォーマット
+        decode_format: DecodeFormat,
+        /// クロマの検証方法
+        chroma_check: ChromaCheck,
+    }
+
+    /// H.264 High のコーデック設定を返す
+    fn h264_high() -> CodecConfig {
+        CodecConfig::H264(H264EncoderConfig {
+            profile: Some(H264Profile::High),
+        })
+    }
+
+    /// HEVC Main のコーデック設定を返す
+    fn hevc_main() -> CodecConfig {
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main),
+        })
+    }
+
+    /// HEVC Main10 のコーデック設定を返す
+    fn hevc_main10() -> CodecConfig {
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Main10),
+        })
+    }
+
+    /// AV1 Main のコーデック設定を返す
+    fn av1_main() -> CodecConfig {
+        CodecConfig::Av1(Av1EncoderConfig {
+            profile: Some(Av1Profile::Main),
+        })
+    }
+
+    /// VP9 のコーデック設定を返す
+    ///
+    /// IVF ヘッダーを含まない raw VP9 を出力する。デコーダーにはそのまま渡せる。
+    fn vp9(profile: Vp9Profile) -> CodecConfig {
+        CodecConfig::Vp9(Vp9EncoderConfig {
+            profile: Some(profile),
+            write_ivf_headers: false,
+        })
+    }
+
+    /// identity テスト用のエンコーダー設定を返す
+    ///
+    /// QPI = QPP = 12、`gop_ref_dist = 1`、全フレームを 1 GOP に収める設定である。
+    fn identity_config(codec_config: CodecConfig, input_format: FrameFormat) -> EncoderConfig {
+        let mut config = EncoderConfig::new(
+            test_adapter(),
+            codec_config,
+            WIDTH as u32,
+            HEIGHT as u32,
+            input_format,
+            30,
+            1,
+            RateControlMode::Cqp,
+        );
+        config.qpi = Some(QPI);
+        config.qpp = Some(QPP);
+        // 全フレームを 1 GOP に収め、最初の I フレーム以外を P フレームにする
+        config.gop_pic_size = Some(NUM_FRAMES as u16);
+        config.gop_ref_dist = Some(1);
+        config
+    }
+
+    // 参照フレームは入力フォーマットに依存しない YUV 4:4:4 で保持し、BGRA を除く
+    // 各入力フォーマットへ変換する
+    /// 参照フレームの YUV 4:4:4 プレーン（8bit）
+    struct ReferenceFrame {
+        /// Y プレーン
+        y: Vec<u8>,
+        /// U プレーン
+        u: Vec<u8>,
+        /// V プレーン
+        v: Vec<u8>,
+    }
+
+    impl ReferenceFrame {
+        /// フレーム番号に応じた参照フレームを生成する
+        ///
+        /// 返り値の `y` / `u` / `v` はそれぞれ `WIDTH * HEIGHT` サンプルの 4:4:4 プレーンである。
+        fn new(frame_index: usize) -> Self {
+            // Y は水平・垂直のグラデーション、高周波チェッカー、フレームごとに移動する縞を
+            // 合成する。U / V は 7 色の縦ストライプ（色バー）に、フレームごとに上下へ移動する
+            // 帯を加える。フレーム対応は Y の移動縞と PSNR で検証する
+            let bar_uv: [(u8, u8); BAR_COUNT] = COLOR_BARS_RGB.map(rgb_to_uv);
+
+            let mut y = vec![0u8; WIDTH * HEIGHT];
+            let mut u = vec![0u8; WIDTH * HEIGHT];
+            let mut v = vec![0u8; WIDTH * HEIGHT];
+            for row in 0..HEIGHT {
+                for col in 0..WIDTH {
+                    let gradient = 16 + col * 150 / (WIDTH - 1) + row * 30 / (HEIGHT - 1);
+                    let checker = if (col / 8 + row / 8) % 2 == 0 {
+                        16
+                    } else {
+                        -16
+                    };
+                    let moving = if (col + row * 2 + frame_index * 17) % 96 < 48 {
+                        12
+                    } else {
+                        -12
+                    };
+                    y[row * WIDTH + col] = (gradient as i32 + checker + moving).max(16) as u8;
+
+                    let (bar_u, bar_v) = bar_uv[col * BAR_COUNT / WIDTH];
+                    let band = if (row + frame_index * 13) % 64 < 32 {
+                        8
+                    } else {
+                        -8
+                    };
+                    u[row * WIDTH + col] = (bar_u as i32 + band).clamp(16, 240) as u8;
+                    v[row * WIDTH + col] = (bar_v as i32 - band).clamp(16, 240) as u8;
+                }
+            }
+            Self { y, u, v }
+        }
+    }
+
+    /// 指定フォーマットのエンコーダー入力バッファを生成する
+    ///
+    /// # Panics
+    ///
+    /// `format` が `FrameFormat::Bgra` の場合はパニックする。
+    fn input_frame(reference: &ReferenceFrame, format: FrameFormat) -> Vec<u8> {
+        let data = match format {
+            FrameFormat::Nv12 => nv12_from_reference(reference),
+            FrameFormat::P010 => p010_from_reference(reference),
+            FrameFormat::Yuy2 => yuy2_from_reference(reference),
+            FrameFormat::Ayuv => ayuv_from_reference(reference),
+            FrameFormat::Y410 => y410_from_reference(reference),
+            FrameFormat::Bgra => panic!("BGRA はグレーランプ用の生成関数を使う"),
+        };
+        assert_eq!(
+            data.len(),
+            frame_buffer_size(format, WIDTH, HEIGHT),
+            "入力フレームのサイズが表示サイズと一致しない"
+        );
+        data
+    }
+
+    /// 参照フレームから NV12 の入力バッファを生成する
+    fn nv12_from_reference(reference: &ReferenceFrame) -> Vec<u8> {
+        let u = chroma_420(&reference.u);
+        let v = chroma_420(&reference.v);
+        let mut data = reference.y.clone();
+        for (u, v) in u.iter().zip(&v) {
+            data.push(*u);
+            data.push(*v);
+        }
+        data
+    }
+
+    /// 参照フレームから P010 の入力バッファを生成する
+    fn p010_from_reference(reference: &ReferenceFrame) -> Vec<u8> {
+        let mut data = Vec::new();
+        for &y in &reference.y {
+            // 8bit を 10bit 相当（4 倍）に拡大し、16bit ワードの上位 10bit に格納する
+            data.extend_from_slice(&((y as u16) << 8).to_le_bytes());
+        }
+        let u = chroma_420(&reference.u);
+        let v = chroma_420(&reference.v);
+        for (u, v) in u.iter().zip(&v) {
+            data.extend_from_slice(&((*u as u16) << 8).to_le_bytes());
+            data.extend_from_slice(&((*v as u16) << 8).to_le_bytes());
+        }
+        data
+    }
+
+    /// 参照フレームから YUY2 の入力バッファを生成する
+    fn yuy2_from_reference(reference: &ReferenceFrame) -> Vec<u8> {
+        let u = chroma_422(&reference.u);
+        let v = chroma_422(&reference.v);
+        let mut data = Vec::new();
+        for row in 0..HEIGHT {
+            for col in (0..WIDTH).step_by(2) {
+                data.push(reference.y[row * WIDTH + col]);
+                data.push(u[row * (WIDTH / 2) + col / 2]);
+                data.push(reference.y[row * WIDTH + col + 1]);
+                data.push(v[row * (WIDTH / 2) + col / 2]);
+            }
+        }
+        data
+    }
+
+    /// 参照フレームから AYUV の入力バッファを生成する
+    fn ayuv_from_reference(reference: &ReferenceFrame) -> Vec<u8> {
+        let mut data = Vec::new();
+        for index in 0..WIDTH * HEIGHT {
+            data.push(reference.v[index]);
+            data.push(reference.u[index]);
+            data.push(reference.y[index]);
+            data.push(255);
+        }
+        data
+    }
+
+    /// 参照フレームから Y410 の入力バッファを生成する
+    fn y410_from_reference(reference: &ReferenceFrame) -> Vec<u8> {
+        let mut data = Vec::new();
+        for index in 0..WIDTH * HEIGHT {
+            // 10bit に拡大した各サンプルを、下位から U / Y / V / A の順に詰める
+            let u = (reference.u[index] as u32) << 2;
+            let y = (reference.y[index] as u32) << 2;
+            let v = (reference.v[index] as u32) << 2;
+            let word = u | (y << 10) | (v << 20) | (3 << 30);
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        data
+    }
+
+    /// 4:4:4 のクロマプレーンを 4:2:0 に縮小したプレーンを返す
+    ///
+    /// 2x2 の平均で縮小する。`plane` は `WIDTH * HEIGHT` サンプルの 4:4:4 プレーンであること。
+    ///
+    /// # Panics
+    ///
+    /// `plane` の長さが `WIDTH * HEIGHT` と異なる場合はパニックする。
+    fn chroma_420(plane: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            plane.len(),
+            WIDTH * HEIGHT,
+            "4:4:4 クロマプレーンの長さが表示サイズと一致しない"
+        );
+        let plane_width = WIDTH / 2;
+        let mut data = vec![0u8; plane_width * (HEIGHT / 2)];
+        for row in 0..HEIGHT / 2 {
+            for col in 0..plane_width {
+                let index = row * 2 * WIDTH + col * 2;
+                let sum = plane[index] as u32
+                    + plane[index + 1] as u32
+                    + plane[index + WIDTH] as u32
+                    + plane[index + WIDTH + 1] as u32;
+                data[row * plane_width + col] = ((sum + 2) / 4) as u8;
+            }
+        }
+        data
+    }
+
+    /// 4:4:4 のクロマプレーンを 4:2:2 に縮小したプレーンを返す
+    ///
+    /// 水平 2 タップの平均で縮小する。`plane` は `WIDTH * HEIGHT` サンプルの 4:4:4 プレーンであること。
+    ///
+    /// # Panics
+    ///
+    /// `plane` の長さが `WIDTH * HEIGHT` と異なる場合はパニックする。
+    fn chroma_422(plane: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            plane.len(),
+            WIDTH * HEIGHT,
+            "4:4:4 クロマプレーンの長さが表示サイズと一致しない"
+        );
+        let plane_width = WIDTH / 2;
+        let mut data = vec![0u8; plane_width * HEIGHT];
+        for row in 0..HEIGHT {
+            for col in 0..plane_width {
+                let index = row * WIDTH + col * 2;
+                let sum = plane[index] as u32 + plane[index + 1] as u32;
+                data[row * plane_width + col] = sum.div_ceil(2) as u8;
+            }
+        }
+        data
+    }
+
+    /// U / V プレーン（8bit または 10bit）
+    enum ChromaPlanes {
+        /// 8bit のプレーン
+        Bit8 { u: Vec<u8>, v: Vec<u8> },
+        /// 10bit のプレーン
+        Bit10 { u: Vec<u16>, v: Vec<u16> },
+    }
+
+    /// 参照フレームの 4:4:4 クロマを 2x2 平均で 4:2:0 に縮小した期待値を返す
+    ///
+    /// `format` が `Nv12` の場合は 8bit、`P010` の場合は 10bit のプレーンを返す。
+    fn expected_chroma(reference: &ReferenceFrame, format: DecodeFormat) -> ChromaPlanes {
+        // デコード出力のクロマは 4:2:0 であり、入力フォーマットが異なっても同じ期待値と
+        // 比較できる
+        let u = chroma_420(&reference.u);
+        let v = chroma_420(&reference.v);
+        match format {
+            DecodeFormat::Nv12 => ChromaPlanes::Bit8 { u, v },
+            DecodeFormat::P010 => ChromaPlanes::Bit10 {
+                u: u.iter().map(|&value| (value as u16) << 2).collect(),
+                v: v.iter().map(|&value| (value as u16) << 2).collect(),
+            },
+        }
+    }
+
+    /// デコード結果から U / V プレーンを取り出す
+    fn decoded_chroma(frame: &DecodedFrameInfo, format: DecodeFormat) -> ChromaPlanes {
+        let plane_width = frame.width / 2;
+        let plane_height = frame.height / 2;
+        match format {
+            DecodeFormat::Nv12 => {
+                let mut u = vec![0u8; plane_width * plane_height];
+                let mut v = vec![0u8; plane_width * plane_height];
+                for row in 0..plane_height {
+                    for col in 0..plane_width {
+                        let index = row * frame.pitch + col * 2;
+                        u[row * plane_width + col] = frame.uv_data[index];
+                        v[row * plane_width + col] = frame.uv_data[index + 1];
+                    }
+                }
+                ChromaPlanes::Bit8 { u, v }
+            }
+            DecodeFormat::P010 => {
+                let mut u = vec![0u16; plane_width * plane_height];
+                let mut v = vec![0u16; plane_width * plane_height];
+                for row in 0..plane_height {
+                    for col in 0..plane_width {
+                        let index = row * frame.pitch + col * 4;
+                        let decoded_u =
+                            u16::from_le_bytes([frame.uv_data[index], frame.uv_data[index + 1]])
+                                >> 6;
+                        let decoded_v = u16::from_le_bytes([
+                            frame.uv_data[index + 2],
+                            frame.uv_data[index + 3],
+                        ]) >> 6;
+                        u[row * plane_width + col] = decoded_u;
+                        v[row * plane_width + col] = decoded_v;
+                    }
+                }
+                ChromaPlanes::Bit10 { u, v }
+            }
+        }
+    }
+
+    /// U / V プレーンの PSNR を計算する
+    fn chroma_psnr(expected: &ChromaPlanes, decoded: &ChromaPlanes) -> (f64, f64) {
+        match (expected, decoded) {
+            (
+                ChromaPlanes::Bit8 {
+                    u: expected_u,
+                    v: expected_v,
+                },
+                ChromaPlanes::Bit8 {
+                    u: decoded_u,
+                    v: decoded_v,
+                },
+            ) => (
+                psnr_plane_8bit(expected_u, decoded_u),
+                psnr_plane_8bit(expected_v, decoded_v),
+            ),
+            (
+                ChromaPlanes::Bit10 {
+                    u: expected_u,
+                    v: expected_v,
+                },
+                ChromaPlanes::Bit10 {
+                    u: decoded_u,
+                    v: decoded_v,
+                },
+            ) => (
+                psnr_plane_10bit(expected_u, decoded_u),
+                psnr_plane_10bit(expected_v, decoded_v),
+            ),
+            // expected_chroma と decoded_chroma は同じ decode_format から生成するため、
+            // ビット深度が異なる組み合わせには到達しない
+            _ => panic!("期待値とデコード結果のビット深度が一致しない"),
+        }
+    }
+
+    /// 密な 8bit プレーン同士の PSNR を計算する（dB）
+    ///
+    /// ピッチを持たないプレーン用である。ピッチを含む Y プレーンには [`psnr_y`] を使う。
+    fn psnr_plane_8bit(expected: &[u8], decoded: &[u8]) -> f64 {
+        assert_eq!(
+            expected.len(),
+            decoded.len(),
+            "PSNR を計算するプレーンの長さが一致しない"
+        );
+        let mut mse_sum = 0.0;
+        for (expected_sample, decoded_sample) in expected.iter().zip(decoded) {
+            let diff = *expected_sample as f64 - *decoded_sample as f64;
+            mse_sum += diff * diff;
+        }
+        psnr_from_mse(mse_sum, expected.len(), 255.0)
+    }
+
+    /// 密な 10bit プレーン同士の PSNR を計算する（dB）
+    fn psnr_plane_10bit(expected: &[u16], decoded: &[u16]) -> f64 {
+        assert_eq!(
+            expected.len(),
+            decoded.len(),
+            "PSNR を計算するプレーンの長さが一致しない"
+        );
+        let mut mse_sum = 0.0;
+        for (expected_sample, decoded_sample) in expected.iter().zip(decoded) {
+            let diff = *expected_sample as f64 - *decoded_sample as f64;
+            mse_sum += diff * diff;
+        }
+        psnr_from_mse(mse_sum, expected.len(), 1023.0)
+    }
+
+    /// 指定した番号の色バーの、左右の境界を除いた領域を `x0..x1` の半開区間で返す
+    ///
+    /// # Panics
+    ///
+    /// `bar` が `BAR_COUNT` 以上の場合はパニックする。
+    fn bar_region(bar: usize) -> (usize, usize) {
+        assert!(bar < BAR_COUNT, "色バーの番号が範囲外である");
+        // 色バーの境界は 4:2:0 のクロマで隣の色と混ざるため、左右を 1/4 ずつ内側に狭める
+        let start = (bar * WIDTH).div_ceil(BAR_COUNT);
+        let end = ((bar + 1) * WIDTH).div_ceil(BAR_COUNT);
+        let inset = (end - start) / 4;
+        (start + inset, end - inset)
+    }
+
+    /// 8bit プレーンの指定領域の平均を返す
+    ///
+    /// `x0 < x1`、`y0 < y1` であり、領域がプレーンの範囲内であること。
+    ///
+    /// # Panics
+    ///
+    /// 領域が空の場合、または領域がプレーンの範囲外の場合はパニックする。
+    fn region_mean_8bit(
+        plane: &[u8],
+        plane_width: usize,
+        x0: usize,
+        x1: usize,
+        y0: usize,
+        y1: usize,
+    ) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0;
+        for row in y0..y1 {
+            for col in x0..x1 {
+                sum += plane[row * plane_width + col] as f64;
+                count += 1;
+            }
+        }
+        assert!(count > 0, "領域平均を計算する画素が無い");
+        sum / count as f64
+    }
+
+    /// 10bit プレーンの指定領域の平均を返す
+    ///
+    /// `x0 < x1`、`y0 < y1` であり、領域がプレーンの範囲内であること。
+    ///
+    /// # Panics
+    ///
+    /// 領域が空の場合、または領域がプレーンの範囲外の場合はパニックする。
+    fn region_mean_10bit(
+        plane: &[u16],
+        plane_width: usize,
+        x0: usize,
+        x1: usize,
+        y0: usize,
+        y1: usize,
+    ) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0;
+        for row in y0..y1 {
+            for col in x0..x1 {
+                sum += plane[row * plane_width + col] as f64;
+                count += 1;
+            }
+        }
+        assert!(count > 0, "領域平均を計算する画素が無い");
+        sum / count as f64
+    }
+
+    /// 色バーごとのクロマ領域平均の最大差を返す
+    fn max_chroma_mean_diff(reference: &ReferenceFrame, decoded: &ChromaPlanes) -> f64 {
+        match decoded {
+            ChromaPlanes::Bit8 { u, v } => {
+                let mut max_diff = 0.0_f64;
+                for bar in 0..BAR_COUNT {
+                    let (x0, x1) = bar_region(bar);
+                    let expected_u = region_mean_8bit(
+                        &reference.u,
+                        WIDTH,
+                        x0,
+                        x1,
+                        CHROMA_ROW_START,
+                        CHROMA_ROW_END,
+                    );
+                    let expected_v = region_mean_8bit(
+                        &reference.v,
+                        WIDTH,
+                        x0,
+                        x1,
+                        CHROMA_ROW_START,
+                        CHROMA_ROW_END,
+                    );
+                    let actual_u = region_mean_8bit(
+                        u,
+                        WIDTH / 2,
+                        x0 / 2,
+                        x1 / 2,
+                        CHROMA_ROW_START / 2,
+                        CHROMA_ROW_END / 2,
+                    );
+                    let actual_v = region_mean_8bit(
+                        v,
+                        WIDTH / 2,
+                        x0 / 2,
+                        x1 / 2,
+                        CHROMA_ROW_START / 2,
+                        CHROMA_ROW_END / 2,
+                    );
+                    max_diff = max_diff.max((expected_u - actual_u).abs());
+                    max_diff = max_diff.max((expected_v - actual_v).abs());
+                }
+                max_diff
+            }
+            ChromaPlanes::Bit10 { u, v } => {
+                let mut max_diff = 0.0_f64;
+                for bar in 0..BAR_COUNT {
+                    let (x0, x1) = bar_region(bar);
+                    // 期待値は 8bit の平均を 10bit 相当（4 倍）にしたもの
+                    let expected_u = region_mean_8bit(
+                        &reference.u,
+                        WIDTH,
+                        x0,
+                        x1,
+                        CHROMA_ROW_START,
+                        CHROMA_ROW_END,
+                    ) * 4.0;
+                    let expected_v = region_mean_8bit(
+                        &reference.v,
+                        WIDTH,
+                        x0,
+                        x1,
+                        CHROMA_ROW_START,
+                        CHROMA_ROW_END,
+                    ) * 4.0;
+                    let actual_u = region_mean_10bit(
+                        u,
+                        WIDTH / 2,
+                        x0 / 2,
+                        x1 / 2,
+                        CHROMA_ROW_START / 2,
+                        CHROMA_ROW_END / 2,
+                    );
+                    let actual_v = region_mean_10bit(
+                        v,
+                        WIDTH / 2,
+                        x0 / 2,
+                        x1 / 2,
+                        CHROMA_ROW_START / 2,
+                        CHROMA_ROW_END / 2,
+                    );
+                    max_diff = max_diff.max((expected_u - actual_u).abs());
+                    max_diff = max_diff.max((expected_v - actual_v).abs());
+                }
+                max_diff
+            }
+        }
+    }
+
+    /// 色バー間のクロマ平均の広がりを返す
+    fn chroma_spread(decoded: &ChromaPlanes) -> f64 {
+        match decoded {
+            ChromaPlanes::Bit8 { u, v } => {
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for plane in [u.as_slice(), v.as_slice()] {
+                    for bar in 0..BAR_COUNT {
+                        let (x0, x1) = bar_region(bar);
+                        let mean = region_mean_8bit(
+                            plane,
+                            WIDTH / 2,
+                            x0 / 2,
+                            x1 / 2,
+                            CHROMA_ROW_START / 2,
+                            CHROMA_ROW_END / 2,
+                        );
+                        min = min.min(mean);
+                        max = max.max(mean);
+                    }
+                }
+                max - min
+            }
+            ChromaPlanes::Bit10 { u, v } => {
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for plane in [u.as_slice(), v.as_slice()] {
+                    for bar in 0..BAR_COUNT {
+                        let (x0, x1) = bar_region(bar);
+                        let mean = region_mean_10bit(
+                            plane,
+                            WIDTH / 2,
+                            x0 / 2,
+                            x1 / 2,
+                            CHROMA_ROW_START / 2,
+                            CHROMA_ROW_END / 2,
+                        );
+                        min = min.min(mean);
+                        max = max.max(mean);
+                    }
+                }
+                max - min
+            }
+        }
+    }
+
+    /// 参照フレームとデコード結果の Y プレーンの PSNR を計算する
+    fn luma_psnr(
+        decode_format: DecodeFormat,
+        reference: &ReferenceFrame,
+        frame: &DecodedFrameInfo,
+    ) -> f64 {
+        match decode_format {
+            DecodeFormat::Nv12 => psnr_y(&reference.y, &frame.y_data, frame.pitch, WIDTH, HEIGHT),
+            DecodeFormat::P010 => {
+                let expected: Vec<u16> = reference
+                    .y
+                    .iter()
+                    .map(|&value| (value as u16) << 2)
+                    .collect();
+                psnr_y_10bit(&expected, &frame.y_data, frame.pitch, WIDTH, HEIGHT)
+            }
+        }
+    }
+
+    /// デコード結果のルマのサンプル値を返す
+    ///
+    /// `row` は `frame.height` 未満、`col` は `frame.width` 未満であること。
+    ///
+    /// # Panics
+    ///
+    /// `row` または `col` がフレームの範囲外の場合はパニックする。
+    fn luma_sample(frame: &DecodedFrameInfo, format: DecodeFormat, row: usize, col: usize) -> f64 {
+        match format {
+            DecodeFormat::Nv12 => frame.y_data[row * frame.pitch + col] as f64,
+            DecodeFormat::P010 => {
+                let offset = row * frame.pitch + col * 2;
+                (u16::from_le_bytes([frame.y_data[offset], frame.y_data[offset + 1]]) >> 6) as f64
+            }
+        }
+    }
+
+    /// デコード結果のルマの分散を返す
+    fn luma_variance(frame: &DecodedFrameInfo, format: DecodeFormat) -> f64 {
+        let count = (frame.width * frame.height) as f64;
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for row in 0..frame.height {
+            for col in 0..frame.width {
+                let value = luma_sample(frame, format, row, col);
+                sum += value;
+                sum_sq += value * value;
+            }
+        }
+        sum_sq / count - (sum / count) * (sum / count)
+    }
+
+    /// デコード結果のルマのレンジ（最大値 - 最小値）を返す
+    fn luma_range(frame: &DecodedFrameInfo, format: DecodeFormat) -> f64 {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for row in 0..frame.height {
+            for col in 0..frame.width {
+                let value = luma_sample(frame, format, row, col);
+                min = min.min(value);
+                max = max.max(value);
+            }
+        }
+        max - min
+    }
+
+    /// 2 つのデコード結果のルマの平均絶対差分を返す
+    ///
+    /// # Panics
+    ///
+    /// 2 つのフレームのサイズが異なる場合はパニックする。
+    fn mean_abs_luma_diff(
+        previous: &DecodedFrameInfo,
+        current: &DecodedFrameInfo,
+        format: DecodeFormat,
+    ) -> f64 {
+        assert_eq!(
+            (previous.width, previous.height),
+            (current.width, current.height),
+            "フレーム間差分を計算するフレームのサイズが一致しない"
+        );
+        let mut sum = 0.0;
+        for row in 0..current.height {
+            for col in 0..current.width {
+                let previous_sample = luma_sample(previous, format, row, col);
+                let current_sample = luma_sample(current, format, row, col);
+                sum += (previous_sample - current_sample).abs();
+            }
+        }
+        sum / (current.width * current.height) as f64
+    }
+
+    /// 2 つの等長な配列のピアソン相関を返す
+    ///
+    /// # Panics
+    ///
+    /// 配列の長さが異なる場合、配列が空の場合、またはどちらかの分散が 0 の場合は
+    /// パニックする。
+    fn pearson_correlation(x: &[f64], y: &[f64]) -> f64 {
+        assert_eq!(x.len(), y.len(), "相関を計算する配列の長さが一致しない");
+        assert!(!x.is_empty(), "相関を計算する配列が空である");
+        let count = x.len() as f64;
+        let mean_x = x.iter().sum::<f64>() / count;
+        let mean_y = y.iter().sum::<f64>() / count;
+        let mut covariance = 0.0;
+        let mut variance_x = 0.0;
+        let mut variance_y = 0.0;
+        for (xi, yi) in x.iter().zip(y) {
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
+            covariance += dx * dy;
+            variance_x += dx * dx;
+            variance_y += dy * dy;
+        }
+        assert!(
+            variance_x > 0.0 && variance_y > 0.0,
+            "相関を計算する配列の分散が 0 である"
+        );
+        covariance / (variance_x.sqrt() * variance_y.sqrt())
+    }
+
+    /// エンコード結果のフレーム種別が想定どおりであることを検証する
+    ///
+    /// 先頭が IDR または I フレームで、残りが P フレームであること。
+    ///
+    /// # Panics
+    ///
+    /// フレーム数が `NUM_FRAMES` と異なる場合、またはフレーム種別が想定と異なる場合は
+    /// パニックする。
+    fn assert_frame_types(encoded_frames: &[EncodedFrame<usize>], label: &str) {
+        assert_eq!(
+            encoded_frames.len(),
+            NUM_FRAMES,
+            "{label}: エンコード結果のフレーム数が入力と一致しない"
+        );
+        assert!(
+            matches!(
+                encoded_frames[0].picture_type(),
+                PictureType::Idr | PictureType::I
+            ),
+            "{label}: 先頭フレームが IDR / I フレームでない"
+        );
+        let p_frame_count = encoded_frames
+            .iter()
+            .filter(|frame| frame.picture_type() == PictureType::P)
+            .count();
+        assert_eq!(
+            p_frame_count,
+            NUM_FRAMES - 1,
+            "{label}: P フレーム数が {} でない",
+            NUM_FRAMES - 1
+        );
+    }
+
+    /// 1 ケースを実行し、入力とデコード出力の恒等性を検証する
+    fn run_case(case: &Case) {
+        println!("実行: {}", case.label);
+
+        let config = identity_config(case.codec_config.clone(), case.input_format);
+
+        let references: Vec<ReferenceFrame> = (0..NUM_FRAMES).map(ReferenceFrame::new).collect();
+        let input_frames: Vec<Vec<u8>> = references
+            .iter()
+            .map(|reference| input_frame(reference, case.input_format))
+            .collect();
+
+        let (encoded_frames, decoded_frames) = roundtrip(config, case.decoder_codec, &input_frames);
+        assert_frame_types(&encoded_frames, case.label);
+
+        // P010 のデコード結果は 1 サンプル 2 バイトなので、ピッチが表示幅の 2 倍以上である
+        // ことを確認する。NV12 のピッチは assert_decoded_frame_layout が検証する。
+        if matches!(case.decode_format, DecodeFormat::P010) {
+            for frame in &decoded_frames {
+                assert!(
+                    frame.pitch >= WIDTH * 2,
+                    "{}: P010 のデコード結果のピッチ {} が表示幅 {} の 2 倍未満",
+                    case.label,
+                    frame.pitch,
+                    WIDTH
+                );
+            }
+        }
+
+        for (index, frame) in decoded_frames.iter().enumerate() {
+            // gop_ref_dist = 1 なので B フレームによる表示順の並び替えは起きない。
+            // デコーダーが decode 呼び出し順にフレームを返すことを確認する。エンコーダー
+            // 出力の順序は、各フレームの PSNR が入力順の参照フレームと一致することで検証する。
+            assert_eq!(
+                frame.user_data, index,
+                "{}: フレーム {index} の user_data が入力の順序と一致しない",
+                case.label
+            );
+            let reference = &references[index];
+
+            // ルマの PSNR
+            let y_psnr = luma_psnr(case.decode_format, reference, frame);
+            assert!(
+                y_psnr >= PSNR_MIN_DB,
+                "{}: フレーム {index} の Y PSNR {y_psnr:.1} dB が下限 {PSNR_MIN_DB:.1} dB 未満",
+                case.label
+            );
+
+            // クロマの PSNR または色バー領域平均
+            let decoded_chroma_planes = decoded_chroma(frame, case.decode_format);
+            match case.chroma_check {
+                ChromaCheck::Psnr => {
+                    let expected_chroma_planes = expected_chroma(reference, case.decode_format);
+                    let (u_psnr, v_psnr) =
+                        chroma_psnr(&expected_chroma_planes, &decoded_chroma_planes);
+                    assert!(
+                        u_psnr >= PSNR_MIN_DB && v_psnr >= PSNR_MIN_DB,
+                        "{}: フレーム {index} の U PSNR {u_psnr:.1} dB / V PSNR {v_psnr:.1} dB が下限 {PSNR_MIN_DB:.1} dB 未満",
+                        case.label
+                    );
+                }
+                ChromaCheck::RegionMean => {
+                    let diff = max_chroma_mean_diff(reference, &decoded_chroma_planes);
+                    let tolerance = match case.decode_format {
+                        DecodeFormat::Nv12 => CHROMA_MEAN_TOLERANCE_8BIT,
+                        DecodeFormat::P010 => CHROMA_MEAN_TOLERANCE_10BIT,
+                    };
+                    assert!(
+                        diff <= tolerance,
+                        "{}: フレーム {index} のクロマ領域平均の最大差 {diff:.2} が許容値 {tolerance:.1} を超えた",
+                        case.label
+                    );
+                }
+            }
+
+            // 以下は診断用のサニティチェックである。Y PSNR とクロマの検証（U / V PSNR
+            // または色バー領域平均）が下限を満たせば多くは自動的に満たされるが、単色・
+            // 静止画・プレーン欠落といった壊れ方をしたときに原因を特定しやすくするために残す。
+            // クロマが単色でないこと（色バー間で平均が変化すること）
+            let spread = chroma_spread(&decoded_chroma_planes);
+            let minimum_spread = match case.decode_format {
+                DecodeFormat::Nv12 => CHROMA_SPREAD_MIN_8BIT,
+                DecodeFormat::P010 => CHROMA_SPREAD_MIN_10BIT,
+            };
+            assert!(
+                spread >= minimum_spread,
+                "{}: フレーム {index} の色バー間のクロマ平均の広がり {spread:.1} が下限 {minimum_spread:.1} 未満",
+                case.label
+            );
+
+            // ルマが単色でないこと
+            let variance = luma_variance(frame, case.decode_format);
+            let minimum_variance = match case.decode_format {
+                DecodeFormat::Nv12 => LUMA_VARIANCE_MIN_8BIT,
+                DecodeFormat::P010 => LUMA_VARIANCE_MIN_10BIT,
+            };
+            assert!(
+                variance >= minimum_variance,
+                "{}: フレーム {index} のルマ分散 {variance:.1} が下限 {minimum_variance:.1} 未満",
+                case.label
+            );
+
+            // フレームごとの移動パターンがデコード結果にも現れていること
+            if index > 0 {
+                let diff =
+                    mean_abs_luma_diff(&decoded_frames[index - 1], frame, case.decode_format);
+                let minimum_diff = match case.decode_format {
+                    DecodeFormat::Nv12 => FRAME_DIFF_MIN_8BIT,
+                    DecodeFormat::P010 => FRAME_DIFF_MIN_10BIT,
+                };
+                assert!(
+                    diff >= minimum_diff,
+                    "{}: フレーム {index} と前フレームの平均絶対差分 {diff:.2} が下限 {minimum_diff:.1} 未満",
+                    case.label
+                );
+            }
+        }
+    }
+
+    /// 複数のケースを順に実行する
+    fn run_cases(cases: &[Case]) {
+        for case in cases {
+            run_case(case);
+        }
+    }
+
+    /// H.264 High の 8bit 入力を NV12 にデコードする経路
+    #[test]
+    fn test_identity_h264_formats() {
+        run_cases(&[
+            Case {
+                label: "H.264 High / NV12 -> NV12",
+                codec_config: h264_high(),
+                decoder_codec: VideoCodecType::H264,
+                input_format: FrameFormat::Nv12,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "H.264 High / YUY2 -> NV12",
+                codec_config: h264_high(),
+                decoder_codec: VideoCodecType::H264,
+                input_format: FrameFormat::Yuy2,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::RegionMean,
+            },
+            Case {
+                label: "H.264 High / AYUV -> NV12",
+                codec_config: h264_high(),
+                decoder_codec: VideoCodecType::H264,
+                input_format: FrameFormat::Ayuv,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::RegionMean,
+            },
+        ]);
+    }
+
+    /// HEVC Main の 8bit 入力を NV12 にデコードする経路
+    #[test]
+    fn test_identity_hevc_formats() {
+        run_cases(&[
+            Case {
+                label: "HEVC Main / NV12 -> NV12",
+                codec_config: hevc_main(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Nv12,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "HEVC Main / YUY2 -> NV12",
+                codec_config: hevc_main(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Yuy2,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::RegionMean,
+            },
+            Case {
+                label: "HEVC Main / AYUV -> NV12",
+                codec_config: hevc_main(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Ayuv,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::RegionMean,
+            },
+        ]);
+    }
+
+    /// HEVC Main10 の 10bit 入力を P010 にデコードする経路
+    #[test]
+    fn test_identity_hevc_main10_formats() {
+        run_cases(&[
+            Case {
+                label: "HEVC Main10 / P010 -> P010",
+                codec_config: hevc_main10(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::P010,
+                decode_format: DecodeFormat::P010,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "HEVC Main10 / Y410 -> P010",
+                codec_config: hevc_main10(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Y410,
+                decode_format: DecodeFormat::P010,
+                chroma_check: ChromaCheck::RegionMean,
+            },
+        ]);
+    }
+
+    /// AV1 Main の NV12 / P010 入力を同じフォーマットにデコードする経路
+    #[test]
+    fn test_identity_av1_formats() {
+        run_cases(&[
+            Case {
+                label: "AV1 Main / NV12 -> NV12",
+                codec_config: av1_main(),
+                decoder_codec: VideoCodecType::Av1,
+                input_format: FrameFormat::Nv12,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "AV1 Main / P010 -> P010",
+                codec_config: av1_main(),
+                decoder_codec: VideoCodecType::Av1,
+                input_format: FrameFormat::P010,
+                decode_format: DecodeFormat::P010,
+                chroma_check: ChromaCheck::Psnr,
+            },
+        ]);
+    }
+
+    /// VP9 Profile0 / Profile2 の入力を同じフォーマットにデコードする経路
+    #[test]
+    fn test_identity_vp9_formats() {
+        run_cases(&[
+            Case {
+                label: "VP9 Profile0 / NV12 -> NV12",
+                codec_config: vp9(Vp9Profile::Profile0),
+                decoder_codec: VideoCodecType::Vp9,
+                input_format: FrameFormat::Nv12,
+                decode_format: DecodeFormat::Nv12,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "VP9 Profile2 / P010 -> P010",
+                codec_config: vp9(Vp9Profile::Profile2),
+                decoder_codec: VideoCodecType::Vp9,
+                input_format: FrameFormat::P010,
+                decode_format: DecodeFormat::P010,
+                chroma_check: ChromaCheck::Psnr,
+            },
+        ]);
+    }
+
+    /// BGRA のグレーランプフレームと、期待するグレー値の配列を生成する
+    ///
+    /// 返り値は (BGRA バッファ, 画素ごとのグレー値) である。R = G = B のグレーランプを生成する。
+    fn bgra_gray_frame(frame_index: usize) -> (Vec<u8>, Vec<f64>) {
+        // R = G = B のグレー値は、輝度に変換すると画素値に対して単調に増える
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for row in 0..HEIGHT {
+            for col in 0..WIDTH {
+                // 行方向にも値を変え、上下反転を検出できるようにする。行の入れ替え、
+                // 横方向の 1 画素ずれ、B / R の入れ替えは検出できない。
+                let value = u8::try_from(
+                    16 + col * 140 / (WIDTH - 1) + row * 40 / (HEIGHT - 1) + frame_index * 3,
+                )
+                .expect("BGRA のグレー値が u8 の範囲を超えた");
+                data.push(value);
+                data.push(value);
+                data.push(value);
+                data.push(255);
+                expected.push(value as f64);
+            }
+        }
+        (data, expected)
+    }
+
+    /// BGRA 入力のルマ検証
+    ///
+    /// グレーランプに対する輝度の相関・平均・レンジ・分散と、フレーム間差分を検証する。
+    #[test]
+    fn test_identity_h264_bgra_luma() {
+        println!("実行: H.264 High / BGRA -> NV12");
+
+        // 入力の BGRA は RGB、デコード結果は YUV の Y であり、値のスケールが異なるため
+        // 直接 PSNR で比較できない
+        let config = identity_config(h264_high(), FrameFormat::Bgra);
+
+        let (input_frames, expected_values): (Vec<Vec<u8>>, Vec<Vec<f64>>) =
+            (0..NUM_FRAMES).map(bgra_gray_frame).unzip();
+        let (encoded_frames, decoded_frames) =
+            roundtrip(config, VideoCodecType::H264, &input_frames);
+        assert_frame_types(&encoded_frames, "BGRA");
+
+        for (index, frame) in decoded_frames.iter().enumerate() {
+            assert_eq!(
+                frame.user_data, index,
+                "BGRA: フレーム {index} の user_data が入力の順序と一致しない"
+            );
+            let expected = &expected_values[index];
+            let mut decoded = Vec::new();
+            for row in 0..HEIGHT {
+                for col in 0..WIDTH {
+                    decoded.push(luma_sample(frame, DecodeFormat::Nv12, row, col));
+                }
+            }
+
+            let correlation = pearson_correlation(expected, &decoded);
+            assert!(
+                correlation >= BGRA_LUMA_CORRELATION_MIN,
+                "BGRA: フレーム {index} のグレーランプとデコード結果の相関 {correlation:.4} が下限 {BGRA_LUMA_CORRELATION_MIN} 未満"
+            );
+
+            // デコード結果の Y は limited range であるため、期待するグレー平均も
+            // limited range の Y に変換して比較する。フレームの取り違えは平均値の差として現れる
+            let expected_mean =
+                16.0 + 219.0 / 255.0 * (expected.iter().sum::<f64>() / expected.len() as f64);
+            let decoded_mean = decoded.iter().sum::<f64>() / decoded.len() as f64;
+            assert!(
+                (decoded_mean - expected_mean).abs() <= BGRA_LUMA_MEAN_TOLERANCE,
+                "BGRA: フレーム {index} のルマ平均 {decoded_mean:.2} が期待値 {expected_mean:.2} から許容差 {BGRA_LUMA_MEAN_TOLERANCE} 以上離れている"
+            );
+
+            let range = luma_range(frame, DecodeFormat::Nv12);
+            assert!(
+                range >= BGRA_LUMA_RANGE_MIN,
+                "BGRA: フレーム {index} のルマレンジ {range:.1} が下限 {BGRA_LUMA_RANGE_MIN} 未満"
+            );
+
+            let variance = luma_variance(frame, DecodeFormat::Nv12);
+            assert!(
+                variance >= BGRA_LUMA_VARIANCE_MIN,
+                "BGRA: フレーム {index} のルマ分散 {variance:.1} が下限 {BGRA_LUMA_VARIANCE_MIN} 未満"
+            );
+
+            if index > 0 {
+                let diff =
+                    mean_abs_luma_diff(&decoded_frames[index - 1], frame, DecodeFormat::Nv12);
+                assert!(
+                    diff >= BGRA_FRAME_DIFF_MIN,
+                    "BGRA: フレーム {index} と前フレームの平均絶対差分 {diff:.2} が下限 {BGRA_FRAME_DIFF_MIN} 未満"
+                );
+            }
+        }
+    }
 }
