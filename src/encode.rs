@@ -3,10 +3,10 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use crate::codec_info::{
-    Av1Profile, FrameFormat, H264Profile, HevcProfile, VideoCodecType, Vp9Profile,
+    Av1Profile, FrameData, FrameFormat, H264Profile, HevcProfile, VideoCodecType, Vp9Profile,
 };
 use crate::stats::{Counter, Gauge};
-use crate::vpl::{FrameSurface, Session, VplLibrary};
+use crate::vpl::{FrameSurface, Session, VplLibrary, frame_data_pitch};
 use crate::{AdapterSelector, Error, sys};
 
 /// H.264 エンコーダ固有の設定
@@ -173,21 +173,6 @@ impl FrameFormat {
             | FrameFormat::Y410 => 0,
         }
     }
-}
-
-/// mfxFrameData から 1 行あたりのバイト数 (ピッチ) を取り出す
-///
-/// VPL はピッチを `PitchHigh` と `PitchLow` の 2 つの 16bit 値に分けて保持する。
-/// finalPitch = (PitchHigh << 16) + PitchLow
-///
-/// ref: libvpl api/vpl/mfxstructures.h (mfxFrameData::PitchHigh / PitchLow)
-///
-/// # Safety
-///
-/// `data` は VPL が初期化した有効な `mfxFrameData` である必要がある。
-/// `PitchLow` は共用体のメンバなので、`Pitch` と同じ領域が初期化されている必要がある。
-unsafe fn frame_data_pitch(data: &sys::mfxFrameData) -> usize {
-    unsafe { ((data.PitchHigh as usize) << 16) + (data.__bindgen_anon_2.PitchLow as usize) }
 }
 
 /// コピー元の行を 1 行ずつコピー先のピッチに従ってコピーする
@@ -758,36 +743,6 @@ pub struct EncodeOptions {
     /// 0 の場合はエンコーダが自動決定する。
     /// `frame_type` モジュールの定数をビット OR で組み合わせて指定する。
     pub frame_type: u16,
-}
-
-/// [`Encoder::encode`] に渡すフレーム
-///
-/// [`EncoderConfig::frame_format`] に対応する variant を選ぶ。
-/// `SemiPlanar` の Y プレーンは [`EncoderConfig::height`] 行、UV プレーンはその半分の行数、
-/// `Packed` は 1 プレーンで [`EncoderConfig::height`] 行を持つ。
-/// 各プレーンのデータ長は、行数を `rows` として `rows * pitch` バイト以上必要である。
-/// 各プレーンの `pitch` は `FrameFormat::bytes_per_row(width)` 以上の値であること。
-/// P010 の 10bit 値は 16bit ワードの上位 10bit に格納する（[`FrameFormat::P010`]）。
-#[derive(Debug, Clone, Copy)]
-pub enum FrameData<'a> {
-    /// Semi-Planar YUV 4:2:0 (NV12 / P010)
-    SemiPlanar {
-        /// Y プレーン
-        y: &'a [u8],
-        /// Y プレーンの行間のバイト数（パディングを含む）
-        y_pitch: usize,
-        /// UV プレーン（インターリーブ）
-        uv: &'a [u8],
-        /// UV プレーンの行間のバイト数（パディングを含む）
-        uv_pitch: usize,
-    },
-    /// パック形式 (YUY2 / BGRA / AYUV / Y410)
-    Packed {
-        /// フレームデータ
-        data: &'a [u8],
-        /// 行間のバイト数（パディングを含む）
-        pitch: usize,
-    },
 }
 
 /// プレーンのデータ長が指定行数分あることを検証する

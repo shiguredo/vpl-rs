@@ -1,6 +1,6 @@
 ---
 name: shiguredo-vpl
-description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、DecodedFrame の pitch 付き借用 Y/UV プレーン、decode_header によるキーフレームのヘッダからの解像度取得、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
+description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。Intel VPL (Video Processing Library) v2.17 を libvpl で static link した Rust バインディング。H.264 / H.265 / VP9 / AV1 のハードウェアエンコード・デコード、AdapterSelector による複数 Intel GPU 対応、EncoderConfig / RateControlMode の選び方、Encoder / Decoder のハンドラー方式 (EncodeHandler / DecodeHandler) と user_data 連携、async_depth の調整、frame_type / gop_opt_flag のビットフラグ、encode の入力となる FrameData / pitch と coded_size の関係、DecodedFrame の frame_format と借用 FrameData (SemiPlanar / Packed)、decode_header によるキーフレームのヘッダからの解像度取得、supported_codecs による解像度範囲・対応色形式の照会、MFX_ERR_MORE_DATA を含むエラー処理に関する質問で使用。
 ---
 
 # shiguredo_vpl クレート
@@ -28,9 +28,9 @@ Intel VPL (Video Processing Library) を libvpl で static link した Rust バ�
 `src/lib.rs` から再エクスポートされる API:
 
 - `adapter` — `AdapterSelector` / `AdapterInfo` / `PciAddress` / `MediaAdapterType` / `list_adapters()`
-- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
+- `codec_info` — `VideoCodecType` / `H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` / `VideoProfile` / `MemoryType` / `ValueRange` / `FrameFormat` / `FrameData<'_>` / `ProfileCapabilities` / `MemoryTypeCapabilities` / `CodecInfo` / `DecodingInfo` / `EncodingInfo`
 - `decode` — `Decoder<H>` / `DecoderConfig` / `DecodedFrame<'_, T>` / `Framerate` / `StreamInfo` / `DecoderStats` / `DecodeHandler` / `FnDecodeHandler<T, E>`
-- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `FrameData<'_>` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
+- `encode` — `Encoder<H>` / `EncoderConfig` / `CodecConfig` / `EncodeOptions` / `EncodedFrame<T>` / `EncoderStats` / `SequenceParams` / `VideoParam` / `ExtParams` / `RateControlMode` / `ReconfigureParams` / `PictureType` / `EncodeHandler` / `FnEncodeHandler<T, E>`
 - `error` — `Error`
 - `stats` — `Counter` / `Gauge`
 - `vpl::frame_type` (定数モジュール) — `UNKNOWN` / `I` / `P` / `B` / `S` / `REF` / `IDR`
@@ -340,10 +340,24 @@ if let Some(params) = params {
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler,
+    AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler, FrameData,
     VideoCodecType, list_adapters,
 };
 use std::sync::mpsc;
+
+// コールバックの外へ持ち出すための所有権付き画素データ
+enum OwnedFrameData {
+    SemiPlanar {
+        y: Vec<u8>,
+        y_pitch: usize,
+        uv: Vec<u8>,
+        uv_pitch: usize,
+    },
+    Packed {
+        data: Vec<u8>,
+        pitch: usize,
+    },
+}
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let config = DecoderConfig::new(adapter, VideoCodecType::H264);
@@ -352,13 +366,19 @@ let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 let (tx, rx) = mpsc::channel();
 let handler = FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, u64>, Error>| {
     let copied = result.map(|frame| {
-        (
-            frame.y().to_vec(),
-            frame.uv().to_vec(),
-            frame.pitch(),
-            frame.width(),
-            frame.height(),
-        )
+        let data = match frame.data() {
+            FrameData::SemiPlanar { y, y_pitch, uv, uv_pitch } => OwnedFrameData::SemiPlanar {
+                y: y.to_vec(),
+                y_pitch,
+                uv: uv.to_vec(),
+                uv_pitch,
+            },
+            FrameData::Packed { data, pitch } => OwnedFrameData::Packed {
+                data: data.to_vec(),
+                pitch,
+            },
+        };
+        (frame.frame_format(), data, frame.width(), frame.height())
     });
     let _ = tx.send(copied);
 });
@@ -370,16 +390,16 @@ decoder.decode(&bitstream_data, /* user_data */ 0u64)?;
 decoder.finish()?;
 
 while let Ok(result) = rx.try_recv() {
-    let (_y, _uv, _pitch, _w, _h) = result?;
+    let (_format, _data, _w, _h) = result?;
 }
 ```
 
 押さえておく挙動:
 
-- `DecoderConfig` は `#[non_exhaustive]`。 必須は `adapter` と `codec` のみ。 解像度・フレームレートはビットストリームヘッダ (SPS/PPS など) から自動検出される。
+- `DecoderConfig` の必須項目は `adapter` と `codec` のみ。 解像度・フレームレートはビットストリームヘッダ (SPS/PPS など) から自動検出される。
 - `async_depth: Option<u16>` を持つ。 `None` の場合は 4。 エンコーダと同じ意味。
 - 最初の `decode` 呼び出しで `MFXVideoDECODE_DecodeHeader` → `MFXVideoDECODE_Init` が自動的に走る。 ヘッダ未到達のうちは `MFX_ERR_MORE_DATA` を内部で吸収して何も出さない (`initialized` フラグで管理)。
-- 出力フォーマットはストリームのネイティブ形式で決まる (8bit は NV12、10bit は P010)。 出力形式を選択する API はない。 4:4:4 ストリームのデコードは未対応。 `IOPattern = OUT_SYSTEM_MEMORY` は変わらない。
+- 出力フォーマットはストリームのネイティブ形式で決まる (8bit 4:2:0 は NV12、10bit 4:2:0 は P010、8bit 4:4:4 は AYUV、10bit 4:4:4 は Y410)。 出力形式を選択する API はない。 実際の形式は `DecodedFrame::frame_format()` で取得し、画素データは `DecodedFrame::data()` の `FrameData` で取得する。 `IOPattern = OUT_SYSTEM_MEMORY` は変わらない。
 - サーフェスは VPL の **内部割り当て** (`surface_work = NULL`)。 アプリ側でサーフェスプールを持つ必要はなく、`FrameSurface` の Drop で `Release` が自動的に呼ばれる。
 - worker スレッド名は `vpl-decoder-sync`。 `user_data` は入力ビットストリームの `TimeStamp` に載せた連番と、 出力フレームの `TimeStamp` の**完全一致**で対応付く (Encoder と同じ方式)。 B フレームの表示順並び替えがあっても正しい入力フレームに戻る。 なお、 1 フレームが複数の `decode()` 呼び出しに分割して供給されるケースでは、 出力フレームの TimeStamp がどの呼び出しの連番になるかが VPL 実装依存のため、 user_data の対応付けは保証されない (分割入力で未消費の連番が残留した場合、 `finish()` が残留チェックエラーを返す)。
 - `decode` 呼び出しごとに `user_data` を 1 つ供給する。 VPL が内部蓄積でフレームを出さないターンでは消費されず、 出力フレーム数より供給数が多い場合の残余は `finish()` の残留チェックでエラーになる (エラーが通知され、 `finish()` が `Err` を返す)。 `decode` がエラーを返した場合も `frame_seq` は消費済みで、 失敗フレームの `user_data` は出力に紐付かず `finish()` の残留チェック (または `Drop` 時の `MFX_ERR_ABORTED` 通知) でエラーとして通知される。
@@ -418,9 +438,8 @@ decoder.decode(&keyframe, 0usize)?;
 pub struct DecodedFrame<'a, T> { /* private */ }
 
 impl<'a, T> DecodedFrame<'a, T> {
-    pub fn y(&self) -> &[u8];    // 長さ pitch() * height() バイト
-    pub fn uv(&self) -> &[u8];   // 長さ pitch() * height() / 2 バイト
-    pub fn pitch(&self) -> usize;
+    pub fn frame_format(&self) -> FrameFormat;
+    pub fn data(&self) -> FrameData<'a>;
     pub fn width(&self) -> usize;
     pub fn height(&self) -> usize;
     pub fn user_data(&self) -> &T;
@@ -428,9 +447,11 @@ impl<'a, T> DecodedFrame<'a, T> {
 }
 ```
 
-- `y()` / `uv()` は **ピッチ込みの生サーフェス**。 8bit は各行の先頭 `width()` バイト、 P010 は各行の先頭 `width() * 2` バイトのみが有効データで、残りはパディング。 P010 は各サンプルが 16bit ワードで上位 10bit が有効。 `pitch() != width()` が普通なので、 そのまま `width * height * 3 / 2` バイトのバッファにコピーすると壊れる。 行ごとにコピーする。
+- `frame_format()` はデコード出力の色形式を返す。 8bit 4:2:0 は `FrameFormat::Nv12`、 10bit 4:2:0 は `FrameFormat::P010`、 8bit 4:4:4 は `FrameFormat::Ayuv`、 10bit 4:4:4 は `FrameFormat::Y410` になる。 P016 などこれ以外の形式はデコード時にエラーになる。
+- `data()` は **ピッチ込みの生サーフェス** を `FrameData` で返す。 NV12 / P010 は `FrameData::SemiPlanar`、 AYUV / Y410 は `FrameData::Packed` になる。 有効データは各行の先頭 `FrameFormat::bytes_per_row(width())` バイトだけで、 残りはパディング。 P010 は各サンプルが 16bit ワードで上位 10bit が有効。 ピッチが表示幅と一致するとは限らないので、 そのまま連結すると壊れる。 行ごとにコピーする。
+- AYUV は 1 画素 4 バイト (V, U, Y, A)、 Y410 は 1 画素 4 バイトの 32bit ワード (下位から U 10bit / Y 10bit / V 10bit / A 2bit)。 パック形式では Y / U / V がインターリーブされるため、 `SemiPlanar` のようにプレーン単位では扱えない。
 - スライスのライフタイム `'a` は `on_decoded` 呼び出し中のみ。 コールバックの外に持ち出そうとするとコンパイルエラーになる。 外で使いたいなら `to_vec()` でコピーする。
-- VPL から返るサーフェスが不正 (null プレーン / `crop = 0` / `pitch < crop_w`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
+- VPL から返るサーフェスが不正 (null ポインタ / `crop = 0` / `pitch < bytes_per_row`) なら、 `read_decoded_surface` が `Error` を返し `on_decoded(Err(...))` に変換される。 仕様違反のサーフェスをそのまま読まない安全装置。
 
 ## コーデック情報の照会 (`supported_codecs`)
 
@@ -494,14 +515,14 @@ for codec in supported_codecs(adapter)? {
 | AV1 Main | AYUV | 非対応 | `MFX_ERR_INVALID_VIDEO_PARAM` | - |
 | HEVC Rext | AYUV / Y410 | 対応 | 成功 | 出力あり (CQP / CBR) |
 | HEVC Scc | AYUV | 対応 | 成功 | CQP は出力あり、CBR は Init 失敗 |
-| HEVC Scc | Y410 | 対応 | 成功 | CQP は出力なし、CBR は Init 失敗 |
+| HEVC Scc | Y410 | 対応 | 成功 | CQP は QPI / QPP 20 以下で出力なし、22 で出力あり、CBR は Init 失敗 |
 
 補足:
 
 - HEVC Rext + AYUV / Y410 は CQP (3 / 10 フレーム) と CBR のいずれも出力が得られる。
 - HEVC Scc + AYUV は CQP (3 / 10 フレーム) で出力が得られるが、CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
-- HEVC Scc + Y410 は CQP 3 フレームで `Encoder::finish` が pending frames のエラーを返して出力が得られず、10 フレームでは 6 フレーム目の `EncodeFrameAsync` が device busy で失敗する。CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
-- 測定条件: CQP は QPI=10、GOP=30、qpp / qpb 未指定。CBR は 1000 kbps。AsyncDepth 4。
+- HEVC Scc + Y410 は CQP で QPI / QPP が 20 以下だと出力が得られない。22 では出力が得られる。CBR は Init が `MFX_ERR_DEVICE_FAILED` になる。
+- 測定条件: CQP は QPI=10 (HEVC Scc + Y410 のみ QPI=22)、GOP=30、qpp / qpb 未指定。CBR は 1000 kbps。AsyncDepth 4。
 - HEVC Main + P010 は Init が成功し、実効 FourCC は P010 のままになる。エンコード結果のプロファイルとビット深度の整合は未確認。
 - capability が「対応」でも Init が失敗する組み合わせがある。Init が成功してもエンコードに失敗する組み合わせもある。`supported_codecs` の結果だけで成功を判断しない。
 
@@ -513,12 +534,12 @@ for codec in supported_codecs(adapter)? {
 | 10bit (HEVC Main10 / AV1 10bit) | P010 | - |
 | HEVC Main10 + Y410 | P010 | 4:4:4 から 4:2:0 に変換される |
 | VP9 Profile2 + P010 | P010 | - |
-| HEVC Rext / Scc + AYUV / Y410 | AYUV / Y410 | NV12 / P010 以外のためデコードはエラー |
-| VP9 Profile2 + NV12 | P016 (12bit) | 入力のビット深度がプロファイルと合わない例。NV12 / P010 以外のためデコードはエラー |
+| HEVC Rext / Scc + AYUV / Y410 | AYUV / Y410 | 4:4:4 のまま出力される |
+| VP9 Profile2 + NV12 | P016 (12bit) | 入力のビット深度がプロファイルと合わない例。P016 は未対応のためデコードはエラー |
 
-- 出力形式はストリームのネイティブ形式で決まり、選択する API はない。
+- 出力形式はストリームのネイティブ形式で決まり、選択する API はない。 実際の形式は `DecodedFrame::frame_format()` で取得する。
 - `DecodeHeader` 後の FourCC 上書きはプロファイル依存で、YUY2 出力は確認できていない。
-- NV12 / P010 以外の出力は未対応で、デコード時にエラーになる。
+- NV12 / P010 / AYUV / Y410 以外の出力は未対応で、デコード時にエラーになる。
 - `decode_header` は H.264 / HEVC / AV1 のキーフレームで解像度を返す。 測定条件: 256x160 / 320x240 / 318x238、CBR 1000 kbps、GOP 30、Main プロファイル。 256x160 と 320x240 では coded サイズと表示サイズが一致し、318x238 では coded サイズが表示サイズより大きくなった。 H.264 の 318x238 は coded 320x240 / 表示 318x238 だった。
 - `decode_header` のフレームレートは、測定条件: 256x160 / 320x240、CBR 1000 kbps、GOP 30、Main プロファイルで、H.264 が 60/2、HEVC が 30/1、AV1 が 0/0 になった。 AV1 のエンコーダー出力は sequence header に timing info を含まない。
 - `decode_header` に P フレーム単体を渡すと、H.264 / HEVC / AV1 のいずれも `MFX_ERR_MORE_DATA` になった。 測定条件: 320x240、CBR 1000 kbps、GOP 30、Main プロファイル。
@@ -557,7 +578,7 @@ for codec in supported_codecs(adapter)? {
 - **`frame_type` の組合せ**: IDR を強制したいときは `IDR | I | REF`。 IDR 単体だと VPL が再決定することがある。
 - **`MFX_WRN_*` の解釈**: `Init` / `Reset` 系では警告は「成功」扱い。 自分でラッパーを書くときは `check_mfx_allow_warn` の方を使う。
 - **ハンドラはワーカースレッドから呼ばれる**: `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は `vpl-encoder-sync` / `vpl-decoder-sync` のワーカースレッドから呼ばれる。 ハンドラ実装は `Send + 'static`。 メインスレッドへ届けるなら mpsc などのチャネルにブリッジする。
-- **`DecodedFrame` の借用**: `DecodedFrame<'_, T>` の `y()` / `uv()` スライスはコールバック呼び出し中のみ有効。 外に持ち出すには `to_vec()` などでコピーする必要がある。 `pitch() != width()` が普通で、 単純連結すると壊れる。
+- **`DecodedFrame` の借用**: `DecodedFrame<'_, T>` の `data()` が返すスライスはコールバック呼び出し中のみ有効。 外に持ち出すには `to_vec()` などでコピーする必要がある。 `frame_format()` と `FrameData` の variant を組み合わせて解釈する。
 - **`user_data` の対応付け**: `Decoder` は入力 `decode()` の連番 (`TimeStamp`) と出力フレームの `TimeStamp` を完全一致で対応付ける。 出力フレームの TimeStamp がどの入力にも一致しない (= 供給不足) 場合は worker 内で drain 扱いとなり破棄される。 1 入力で複数枚出ることはないが、 元入力との 1:1 対応を確実にするには `decode` 1 回ごとに `user_data` を必ず供給する。
 - **動作 OS の制約**: 実機サポートは Linux x86_64 + Intel GPU のみ。 Linux x86_64 以外のターゲットでは `compile_error!` により crate 自体がビルドできない。
 - **静的リンク**: 実行時に libvpl 共有ライブラリは不要だが、 ビルド時に対応 GPU ドライバ (Intel Media Driver / iHD) が動作環境にないと実機テストは通らない。

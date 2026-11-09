@@ -14,34 +14,188 @@ use shiguredo_vpl::{
 
 /// コールバックから取り出したデコード済みフレーム情報（データをコピーして保持する）
 struct DecodedFrameInfo {
-    y_data: Vec<u8>,
-    uv_data: Vec<u8>,
-    pitch: usize,
+    /// デコード出力の色形式
+    frame_format: FrameFormat,
+    /// 画素データ
+    data: OwnedFrameData,
     width: usize,
     height: usize,
     user_data: usize,
 }
 
-/// デコード結果のプレーンサイズが width / height / pitch と整合していることを検証する
-///
-/// Y プレーンは `pitch * height` バイト、UV プレーンは `pitch * (height / 2)` バイトである。
+/// 所有権を持つ画素データ
+enum OwnedFrameData {
+    /// Semi-Planar YUV 4:2:0 (NV12 / P010)
+    SemiPlanar {
+        /// Y プレーン
+        y: Vec<u8>,
+        /// Y プレーンの行間のバイト数
+        y_pitch: usize,
+        /// UV プレーン
+        uv: Vec<u8>,
+        /// UV プレーンの行間のバイト数
+        uv_pitch: usize,
+    },
+    /// パック形式 (AYUV / Y410)
+    Packed {
+        /// フレーム全体
+        data: Vec<u8>,
+        /// 行間のバイト数
+        pitch: usize,
+    },
+}
+
+impl DecodedFrameInfo {
+    /// コールバックで受け取ったフレームをコピーして返す
+    fn from_frame(frame: &DecodedFrame<'_, usize>) -> Self {
+        let data = match frame.data() {
+            FrameData::SemiPlanar {
+                y,
+                y_pitch,
+                uv,
+                uv_pitch,
+            } => OwnedFrameData::SemiPlanar {
+                y: y.to_vec(),
+                y_pitch,
+                uv: uv.to_vec(),
+                uv_pitch,
+            },
+            FrameData::Packed { data, pitch } => OwnedFrameData::Packed {
+                data: data.to_vec(),
+                pitch,
+            },
+        };
+        Self {
+            frame_format: frame.frame_format(),
+            data,
+            width: frame.width(),
+            height: frame.height(),
+            user_data: *frame.user_data(),
+        }
+    }
+
+    /// 半平面形式の Y プレーンを返す
+    ///
+    /// # Panics
+    ///
+    /// パック形式の場合はパニックする。
+    fn y(&self) -> &[u8] {
+        match &self.data {
+            OwnedFrameData::SemiPlanar { y, .. } => y,
+            OwnedFrameData::Packed { .. } => panic!("パック形式のフレームに Y プレーンは無い"),
+        }
+    }
+
+    /// 半平面形式の UV プレーンを返す
+    ///
+    /// # Panics
+    ///
+    /// パック形式の場合はパニックする。
+    fn uv(&self) -> &[u8] {
+        match &self.data {
+            OwnedFrameData::SemiPlanar { uv, .. } => uv,
+            OwnedFrameData::Packed { .. } => panic!("パック形式のフレームに UV プレーンは無い"),
+        }
+    }
+
+    /// パック形式のフレーム全体を返す
+    ///
+    /// # Panics
+    ///
+    /// 半平面形式の場合はパニックする。
+    fn packed(&self) -> &[u8] {
+        match &self.data {
+            OwnedFrameData::Packed { data, .. } => data,
+            OwnedFrameData::SemiPlanar { .. } => panic!("半平面形式のフレームはパック形式ではない"),
+        }
+    }
+
+    /// Y プレーン（パック形式ではフレーム全体）の行間のバイト数を返す
+    fn pitch(&self) -> usize {
+        match &self.data {
+            OwnedFrameData::SemiPlanar { y_pitch, .. } => *y_pitch,
+            OwnedFrameData::Packed { pitch, .. } => *pitch,
+        }
+    }
+
+    /// UV プレーンの行間のバイト数を返す
+    ///
+    /// # Panics
+    ///
+    /// パック形式の場合はパニックする。
+    fn uv_pitch(&self) -> usize {
+        match &self.data {
+            OwnedFrameData::SemiPlanar { uv_pitch, .. } => *uv_pitch,
+            OwnedFrameData::Packed { .. } => panic!("パック形式のフレームに UV プレーンは無い"),
+        }
+    }
+
+    /// 保持している画素データを [`FrameData`] として返す
+    fn frame_data(&self) -> FrameData<'_> {
+        match &self.data {
+            OwnedFrameData::SemiPlanar {
+                y,
+                y_pitch,
+                uv,
+                uv_pitch,
+            } => FrameData::SemiPlanar {
+                y,
+                y_pitch: *y_pitch,
+                uv,
+                uv_pitch: *uv_pitch,
+            },
+            OwnedFrameData::Packed { data, pitch } => FrameData::Packed {
+                data,
+                pitch: *pitch,
+            },
+        }
+    }
+}
+
+/// デコード結果のプレーンサイズが色形式・幅・高さ・ピッチと整合していることを検証する
 fn assert_decoded_frame_layout(frame: &DecodedFrameInfo, label: &str) {
-    assert!(
-        frame.pitch >= frame.width,
-        "{label}: pitch {} が width {} より小さい",
-        frame.pitch,
-        frame.width
-    );
-    assert_eq!(
-        frame.y_data.len(),
-        frame.pitch * frame.height,
-        "{label}: Y プレーンの長さが pitch * height と一致しない"
-    );
-    assert_eq!(
-        frame.uv_data.len(),
-        frame.pitch * (frame.height / 2),
-        "{label}: UV プレーンの長さが pitch * (height / 2) と一致しない"
-    );
+    let row_bytes = frame
+        .frame_format
+        .bytes_per_row(frame.width)
+        .expect("表示幅の行バイト数計算がオーバーフローした");
+    match &frame.data {
+        OwnedFrameData::SemiPlanar {
+            y,
+            y_pitch,
+            uv,
+            uv_pitch,
+        } => {
+            assert!(
+                *y_pitch >= row_bytes,
+                "{label}: Y プレーンのピッチ {y_pitch} が行のバイト数 {row_bytes} より小さい"
+            );
+            assert!(
+                *uv_pitch >= row_bytes,
+                "{label}: UV プレーンのピッチ {uv_pitch} が行のバイト数 {row_bytes} より小さい"
+            );
+            assert_eq!(
+                y.len(),
+                *y_pitch * frame.height,
+                "{label}: Y プレーンの長さが y_pitch * height と一致しない"
+            );
+            assert_eq!(
+                uv.len(),
+                *uv_pitch * (frame.height / 2),
+                "{label}: UV プレーンの長さが uv_pitch * (height / 2) と一致しない"
+            );
+        }
+        OwnedFrameData::Packed { data, pitch } => {
+            assert!(
+                *pitch >= row_bytes,
+                "{label}: パック形式のピッチ {pitch} が行のバイト数 {row_bytes} より小さい"
+            );
+            assert_eq!(
+                data.len(),
+                *pitch * frame.height,
+                "{label}: パック形式の長さが pitch * height と一致しない"
+            );
+        }
+    }
 }
 
 /// 表示サイズのバッファからエンコーダー入力を構築する
@@ -408,18 +562,7 @@ fn create_info_decoder(codec: VideoCodecType) -> InfoDecoderAndReceiver {
     let decoder = Decoder::new(
         DecoderConfig::new(test_adapter(), codec),
         FnDecodeHandler::new(move |result| {
-            let info = result.map(|frame| {
-                let y_data = frame.y().to_vec();
-                let uv_data = frame.uv().to_vec();
-                DecodedFrameInfo {
-                    y_data,
-                    uv_data,
-                    pitch: frame.pitch(),
-                    width: frame.width(),
-                    height: frame.height(),
-                    user_data: *frame.user_data(),
-                }
-            });
+            let info = result.map(|frame| DecodedFrameInfo::from_frame(&frame));
             tx.send(info)
                 .expect("デコード結果コールバックの送信に失敗した");
         }),
@@ -519,10 +662,6 @@ fn roundtrip(
         assert_eq!(
             frame.height, height,
             "デコード結果フレーム {i} の height が不一致"
-        );
-        assert!(
-            !frame.y_data.is_empty(),
-            "デコード結果フレーム {i} の Y プレーンが空"
         );
     }
 
@@ -708,15 +847,15 @@ fn roundtrip_colorbar(
 
     let y_size = width * height;
     for (i, decoded) in decoded_frames.iter().enumerate() {
-        let y_psnr = psnr_y(&colorbar, &decoded.y_data, decoded.pitch, width, height);
+        let y_psnr = psnr_y(&colorbar, decoded.y(), decoded.pitch(), width, height);
         assert!(
             y_psnr >= min_psnr_db,
             "フレーム {i}: Y プレーンの PSNR {y_psnr:.1} dB が {min_psnr_db} dB 未満"
         );
         let uv_psnr = psnr_uv(
             &colorbar[y_size..],
-            &decoded.uv_data,
-            decoded.pitch,
+            decoded.uv(),
+            decoded.pitch(),
             width,
             height,
         );
@@ -789,18 +928,7 @@ fn roundtrip_b_frames(
     let mut decoder = Decoder::new(
         decoder_config,
         FnDecodeHandler::new(move |result| {
-            let info = result.map(|frame| {
-                let y_data = frame.y().to_vec();
-                let uv_data = frame.uv().to_vec();
-                DecodedFrameInfo {
-                    y_data,
-                    uv_data,
-                    pitch: frame.pitch(),
-                    width: frame.width(),
-                    height: frame.height(),
-                    user_data: *frame.user_data(),
-                }
-            });
+            let info = result.map(|frame| DecodedFrameInfo::from_frame(&frame));
             tx.send(info)
                 .expect("デコード結果コールバックの送信に失敗した");
         }),
@@ -879,8 +1007,8 @@ fn assert_user_data_matches_input(
         let i = frame.user_data;
         let psnr_with_i = psnr_y(
             &input_frames_for_psnr[i],
-            &frame.y_data,
-            frame.pitch,
+            frame.y(),
+            frame.pitch(),
             width,
             height,
         );
@@ -895,7 +1023,7 @@ fn assert_user_data_matches_input(
             if j == i {
                 continue;
             }
-            let psnr = psnr_y(other, &frame.y_data, frame.pitch, width, height);
+            let psnr = psnr_y(other, frame.y(), frame.pitch(), width, height);
             max_wrong_psnr = max_wrong_psnr.max(psnr);
         }
         assert!(
@@ -2317,6 +2445,139 @@ fn test_roundtrip_hevc_main10_y410_alignment_mismatch() {
     );
 }
 
+/// パック形式のフレームの Y プレーン PSNR を計算する
+///
+/// `input` は `format` の入力バッファ、`frame` はその入力からデコードしたフレームであること。
+///
+/// # Panics
+///
+/// `format` が `Ayuv` / `Y410` 以外の場合はパニックする。
+fn packed_luma_psnr(
+    frame: &DecodedFrameInfo,
+    input: &[u8],
+    format: FrameFormat,
+    width: usize,
+    height: usize,
+) -> f64 {
+    let peak = match format {
+        FrameFormat::Ayuv => 255.0,
+        FrameFormat::Y410 => 1023.0,
+        FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Yuy2 | FrameFormat::Bgra => {
+            panic!("パック形式以外の色形式が渡された")
+        }
+    };
+    let mut mse_sum = 0.0;
+    for row in 0..height {
+        for col in 0..width {
+            let input_index = (row * width + col) * 4;
+            let decoded_index = row * frame.pitch() + col * 4;
+            let (expected, decoded) = match format {
+                FrameFormat::Ayuv => (
+                    input[input_index + 2] as f64,
+                    frame.packed()[decoded_index + 2] as f64,
+                ),
+                FrameFormat::Y410 => {
+                    let input_word = u32::from_le_bytes([
+                        input[input_index],
+                        input[input_index + 1],
+                        input[input_index + 2],
+                        input[input_index + 3],
+                    ]);
+                    let decoded_word = u32::from_le_bytes([
+                        frame.packed()[decoded_index],
+                        frame.packed()[decoded_index + 1],
+                        frame.packed()[decoded_index + 2],
+                        frame.packed()[decoded_index + 3],
+                    ]);
+                    (
+                        ((input_word >> 10) & 0x3ff) as f64,
+                        ((decoded_word >> 10) & 0x3ff) as f64,
+                    )
+                }
+                FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Yuy2 | FrameFormat::Bgra => {
+                    panic!("パック形式以外の色形式が渡された")
+                }
+            };
+            let diff = expected - decoded;
+            mse_sum += diff * diff;
+        }
+    }
+    psnr_from_mse(mse_sum, width * height, peak)
+}
+
+/// HEVC Rext の 4:4:4 入力を 318x238 でエンコード→デコードし、行ピッチを検証する
+///
+/// 318x238 では行のバイト数がアラインメントされ、ピッチが行のバイト数より大きくなる。
+#[test]
+fn test_roundtrip_hevc_rext_444_alignment_mismatch() {
+    let width = 318usize;
+    let height = 238usize;
+    for (format, profile) in [
+        (FrameFormat::Ayuv, HevcProfile::Rext),
+        (FrameFormat::Y410, HevcProfile::Rext),
+    ] {
+        if skip_if_encoder_format_unsupported(
+            VideoCodecType::Hevc,
+            VideoProfile::Hevc(profile),
+            format,
+        ) {
+            continue;
+        }
+
+        let mut config = EncoderConfig::new(
+            test_adapter(),
+            CodecConfig::Hevc(HevcEncoderConfig {
+                profile: Some(profile),
+            }),
+            width as u32,
+            height as u32,
+            format,
+            30,
+            1,
+            RateControlMode::Cqp,
+        );
+        config.qpi = Some(12);
+        config.qpp = Some(12);
+        config.gop_pic_size = Some(2);
+        config.gop_ref_dist = Some(1);
+
+        let input_frames: Vec<Vec<u8>> = (0..2)
+            .map(|index| match format {
+                FrameFormat::Ayuv => generate_dummy_ayuv(width, height, index),
+                FrameFormat::Y410 => generate_dummy_y410(width, height, index),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        let (_, decoded_frames) = roundtrip(config, VideoCodecType::Hevc, &input_frames);
+        assert_eq!(decoded_frames.len(), input_frames.len());
+        let row_bytes = format
+            .bytes_per_row(width)
+            .expect("表示幅の行バイト数計算がオーバーフローした");
+        for (index, frame) in decoded_frames.iter().enumerate() {
+            assert_eq!(
+                frame.frame_format, format,
+                "フレーム {index} のデコード出力の色形式が期待値と一致しない"
+            );
+            assert!(
+                frame.pitch() > row_bytes,
+                "フレーム {index} のピッチ {} が行のバイト数 {row_bytes} より大きくない",
+                frame.pitch()
+            );
+            assert_eq!(
+                frame.packed().len(),
+                frame.pitch() * height,
+                "フレーム {index} のパック形式の長さがピッチと高さの積と一致しない"
+            );
+            let psnr = packed_luma_psnr(frame, &input_frames[index], format, width, height);
+            assert!(
+                psnr >= 45.0,
+                "フレーム {index} の Y PSNR {psnr:.1} dB が 45.0 dB 未満"
+            );
+        }
+    }
+}
+
 /// BGRA 入力で crop と coded のサイズが異なるケースの H.264 ラウンドトリップ
 #[test]
 fn test_roundtrip_h264_bgra_alignment_mismatch() {
@@ -2784,15 +3045,15 @@ fn test_encode_accepts_strided_nv12() {
         frame.height, height,
         "デコード結果の height が表示高さと一致すること"
     );
-    let y_psnr = psnr_y(&colorbar, &frame.y_data, frame.pitch, width, height);
+    let y_psnr = psnr_y(&colorbar, frame.y(), frame.pitch(), width, height);
     assert!(
         y_psnr >= 25.0,
         "ピッチ付き NV12 入力の Y プレーン PSNR が低すぎる: {y_psnr:.1} dB"
     );
     let uv_psnr = psnr_uv(
         &colorbar[y_size..],
-        &frame.uv_data,
-        frame.pitch,
+        frame.uv(),
+        frame.pitch(),
         width,
         height,
     );
@@ -2866,13 +3127,13 @@ fn test_encode_accepts_strided_yuy2() {
     let expected_y: Vec<u8> = (0..height)
         .flat_map(|y| (0..width).map(move |x| ((x + y) % 256) as u8))
         .collect();
-    let y_psnr = psnr_y(&expected_y, &frame.y_data, frame.pitch, width, height);
+    let y_psnr = psnr_y(&expected_y, frame.y(), frame.pitch(), width, height);
     assert!(
         y_psnr >= 25.0,
         "ピッチ付き YUY2 入力の Y プレーン PSNR が低すぎる: {y_psnr:.1} dB"
     );
     let expected_uv = yuy2_uv_plane(&data, width, height);
-    let uv_psnr = psnr_uv(&expected_uv, &frame.uv_data, frame.pitch, width, height);
+    let uv_psnr = psnr_uv(&expected_uv, frame.uv(), frame.pitch(), width, height);
     assert!(
         uv_psnr >= 20.0,
         "ピッチ付き YUY2 入力の UV プレーン PSNR が低すぎる: {uv_psnr:.1} dB"
@@ -2908,17 +3169,8 @@ fn test_encode_decoded_frame_planes_directly() {
         frame_type: frame_type::UNKNOWN,
     };
     encoder
-        .encode(
-            FrameData::SemiPlanar {
-                y: &decoded.y_data,
-                y_pitch: decoded.pitch,
-                uv: &decoded.uv_data,
-                uv_pitch: decoded.pitch,
-            },
-            0,
-            &options,
-        )
-        .expect("デコード結果のプレーンを直接エンコードできない");
+        .encode(decoded.frame_data(), 0, &options)
+        .expect("デコード結果の画素データを直接エンコードできない");
     encoder.finish().expect("finish に失敗した");
 
     let encoded = rx
@@ -3013,14 +3265,14 @@ fn test_encode_accepts_strided_p010() {
     let expected_y: Vec<u16> = (0..height)
         .flat_map(|y| (0..width).map(move |x| (64 + (x + y) % 900) as u16))
         .collect();
-    let y_psnr = psnr_y_10bit(&expected_y, &frame.y_data, frame.pitch, width, height);
+    let y_psnr = psnr_y_10bit(&expected_y, frame.y(), frame.pitch(), width, height);
     assert!(
         y_psnr >= TEN_BIT_LUMA_PSNR_MIN_DB,
         "ピッチ付き P010 入力の Y プレーン PSNR が低すぎる: {y_psnr:.1} dB"
     );
 
     let expected_uv = p010_uv_values(&p010, width, height);
-    let uv_psnr = psnr_uv_10bit(&expected_uv, &frame.uv_data, frame.pitch, width, height);
+    let uv_psnr = psnr_uv_10bit(&expected_uv, frame.uv(), frame.pitch(), width, height);
     assert!(
         uv_psnr >= 30.0,
         "ピッチ付き P010 入力の UV プレーン PSNR が低すぎる: {uv_psnr:.1} dB"
@@ -3164,7 +3416,7 @@ fn roundtrip_vp9(write_ivf_headers: bool, reconfigure: bool) {
             decoded.height, height,
             "デコード結果のフレーム {i} の height が入力と一致すること"
         );
-        let psnr = psnr_y(&colorbar, &decoded.y_data, decoded.pitch, width, height);
+        let psnr = psnr_y(&colorbar, decoded.y(), decoded.pitch(), width, height);
         assert!(
             psnr >= 25.0,
             "フレーム {i}: PSNR {psnr:.1} dB が 25.0 dB 未満"
@@ -4064,12 +4316,13 @@ mod identity {
     const NUM_FRAMES: usize = 5;
 
     // 量子化誤差を十分小さくしつつ、実機で安定してエンコードできる 10〜16 の範囲に収める
-    /// I フレームの量子化パラメータ
-    const QPI: u16 = 12;
+    /// エンコードの量子化パラメータ (QPI / QPP)
+    const DEFAULT_QP: u16 = 12;
 
-    // QPI と同じ範囲に収める
-    /// P フレームの量子化パラメータ
-    const QPP: u16 = 12;
+    // 実機で Scc + Y410 の QPI / QPP を 20 以下にするとエンコードが完了しないため、
+    // 22 を使う。この値でも PSNR の下限を満たす。
+    /// Scc + Y410 のエンコードの量子化パラメータ (QPI / QPP)
+    const SCC_Y410_QP: u16 = 22;
 
     /// 色バーの本数
     const BAR_COUNT: usize = COLOR_BARS_RGB.len();
@@ -4154,15 +4407,6 @@ mod identity {
     /// BGRA 入力のルマ平均の許容差（サンプル値）
     const BGRA_LUMA_MEAN_TOLERANCE: f64 = 0.5;
 
-    /// デコード出力のサンプル形式
-    #[derive(Debug, Clone, Copy)]
-    enum DecodeFormat {
-        /// 8bit の NV12
-        Nv12,
-        /// 10bit の P010
-        P010,
-    }
-
     /// クロマの検証方法
     #[derive(Debug, Clone, Copy)]
     enum ChromaCheck {
@@ -4183,7 +4427,11 @@ mod identity {
         /// エンコーダーへの入力フォーマット
         input_format: FrameFormat,
         /// デコーダーの出力フォーマット
-        decode_format: DecodeFormat,
+        ///
+        /// デコード出力として扱うのは `Nv12` / `P010` / `Ayuv` / `Y410` だけである。
+        decode_format: FrameFormat,
+        /// エンコードの量子化パラメータ (QPI / QPP)
+        qp: u16,
         /// クロマの検証方法
         chroma_check: ChromaCheck,
     }
@@ -4209,6 +4457,20 @@ mod identity {
         })
     }
 
+    /// HEVC Range Extension のコーデック設定を返す
+    fn hevc_rext() -> CodecConfig {
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Rext),
+        })
+    }
+
+    /// HEVC Screen Content Coding のコーデック設定を返す
+    fn hevc_scc() -> CodecConfig {
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: Some(HevcProfile::Scc),
+        })
+    }
+
     /// AV1 Main のコーデック設定を返す
     fn av1_main() -> CodecConfig {
         CodecConfig::Av1(Av1EncoderConfig {
@@ -4228,8 +4490,12 @@ mod identity {
 
     /// identity テスト用のエンコーダー設定を返す
     ///
-    /// QPI = QPP = 12、`gop_ref_dist = 1`、全フレームを 1 GOP に収める設定である。
-    fn identity_config(codec_config: CodecConfig, input_format: FrameFormat) -> EncoderConfig {
+    /// QPI = QPP = `qp`、`gop_ref_dist = 1`、全フレームを 1 GOP に収める設定である。
+    fn identity_config(
+        codec_config: CodecConfig,
+        input_format: FrameFormat,
+        qp: u16,
+    ) -> EncoderConfig {
         let mut config = EncoderConfig::new(
             test_adapter(),
             codec_config,
@@ -4240,8 +4506,8 @@ mod identity {
             1,
             RateControlMode::Cqp,
         );
-        config.qpi = Some(QPI);
-        config.qpp = Some(QPP);
+        config.qpi = Some(qp);
+        config.qpp = Some(qp);
         // 全フレームを 1 GOP に収め、最初の I フレーム以外を P フレームにする
         config.gop_pic_size = Some(NUM_FRAMES as u16);
         config.gop_ref_dist = Some(1);
@@ -4455,58 +4721,156 @@ mod identity {
         Bit10 { u: Vec<u16>, v: Vec<u16> },
     }
 
-    /// 参照フレームの 4:4:4 クロマを 2x2 平均で 4:2:0 に縮小した期待値を返す
+    /// 色形式ごとのサンプル形式
+    struct FormatInfo {
+        /// クロマの縮小率（4:2:0 は 2、4:4:4 は 1）
+        chroma_scale: usize,
+        /// サンプルのビット深度
+        bit_depth: u16,
+    }
+
+    impl FormatInfo {
+        /// 8bit のサンプル値をこのビット深度に拡大する倍率
+        fn sample_scale(&self) -> u16 {
+            1 << (self.bit_depth - 8)
+        }
+    }
+
+    /// デコード出力として扱う色形式の情報を返す
     ///
-    /// `format` が `Nv12` の場合は 8bit、`P010` の場合は 10bit のプレーンを返す。
-    fn expected_chroma(reference: &ReferenceFrame, format: DecodeFormat) -> ChromaPlanes {
-        // デコード出力のクロマは 4:2:0 であり、入力フォーマットが異なっても同じ期待値と
-        // 比較できる
-        let u = chroma_420(&reference.u);
-        let v = chroma_420(&reference.v);
+    /// # Panics
+    ///
+    /// `Yuy2` または `Bgra` の場合はパニックする。
+    fn format_info(format: FrameFormat) -> FormatInfo {
         match format {
-            DecodeFormat::Nv12 => ChromaPlanes::Bit8 { u, v },
-            DecodeFormat::P010 => ChromaPlanes::Bit10 {
-                u: u.iter().map(|&value| (value as u16) << 2).collect(),
-                v: v.iter().map(|&value| (value as u16) << 2).collect(),
+            FrameFormat::Nv12 => FormatInfo {
+                chroma_scale: 2,
+                bit_depth: 8,
             },
+            FrameFormat::P010 => FormatInfo {
+                chroma_scale: 2,
+                bit_depth: 10,
+            },
+            FrameFormat::Ayuv => FormatInfo {
+                chroma_scale: 1,
+                bit_depth: 8,
+            },
+            FrameFormat::Y410 => FormatInfo {
+                chroma_scale: 1,
+                bit_depth: 10,
+            },
+            FrameFormat::Yuy2 | FrameFormat::Bgra => {
+                panic!("デコード出力として扱わない色形式が渡された")
+            }
+        }
+    }
+
+    /// デコード出力の色形式に合わせた U / V プレーンの期待値を返す
+    ///
+    /// 4:2:0 の形式は 2x2 平均で縮小し、4:4:4 の形式は参照フレームのプレーンをそのまま使う。
+    /// 10bit の形式は 8bit の値を `FormatInfo::sample_scale()` 倍した値を返す。
+    fn expected_chroma(reference: &ReferenceFrame, format: FrameFormat) -> ChromaPlanes {
+        let info = format_info(format);
+        let (u, v) = if info.chroma_scale == 2 {
+            (chroma_420(&reference.u), chroma_420(&reference.v))
+        } else {
+            (reference.u.clone(), reference.v.clone())
+        };
+        if info.bit_depth == 8 {
+            ChromaPlanes::Bit8 { u, v }
+        } else {
+            let scale = info.sample_scale();
+            ChromaPlanes::Bit10 {
+                u: u.iter().map(|&value| (value as u16) * scale).collect(),
+                v: v.iter().map(|&value| (value as u16) * scale).collect(),
+            }
         }
     }
 
     /// デコード結果から U / V プレーンを取り出す
-    fn decoded_chroma(frame: &DecodedFrameInfo, format: DecodeFormat) -> ChromaPlanes {
-        let plane_width = frame.width / 2;
-        let plane_height = frame.height / 2;
-        match format {
-            DecodeFormat::Nv12 => {
-                let mut u = vec![0u8; plane_width * plane_height];
-                let mut v = vec![0u8; plane_width * plane_height];
-                for row in 0..plane_height {
-                    for col in 0..plane_width {
-                        let index = row * frame.pitch + col * 2;
-                        u[row * plane_width + col] = frame.uv_data[index];
-                        v[row * plane_width + col] = frame.uv_data[index + 1];
+    fn decoded_chroma(frame: &DecodedFrameInfo) -> ChromaPlanes {
+        let info = format_info(frame.frame_format);
+        match &frame.data {
+            OwnedFrameData::SemiPlanar { .. } => {
+                let plane_width = frame.width / 2;
+                let plane_height = frame.height / 2;
+                match info.bit_depth {
+                    8 => {
+                        let mut u = vec![0u8; plane_width * plane_height];
+                        let mut v = vec![0u8; plane_width * plane_height];
+                        for row in 0..plane_height {
+                            for col in 0..plane_width {
+                                let index = row * frame.uv_pitch() + col * 2;
+                                u[row * plane_width + col] = frame.uv()[index];
+                                v[row * plane_width + col] = frame.uv()[index + 1];
+                            }
+                        }
+                        ChromaPlanes::Bit8 { u, v }
                     }
+                    10 => {
+                        let mut u = vec![0u16; plane_width * plane_height];
+                        let mut v = vec![0u16; plane_width * plane_height];
+                        for row in 0..plane_height {
+                            for col in 0..plane_width {
+                                let index = row * frame.uv_pitch() + col * 4;
+                                let decoded_u =
+                                    u16::from_le_bytes([frame.uv()[index], frame.uv()[index + 1]])
+                                        >> 6;
+                                let decoded_v = u16::from_le_bytes([
+                                    frame.uv()[index + 2],
+                                    frame.uv()[index + 3],
+                                ]) >> 6;
+                                u[row * plane_width + col] = decoded_u;
+                                v[row * plane_width + col] = decoded_v;
+                            }
+                        }
+                        ChromaPlanes::Bit10 { u, v }
+                    }
+                    _ => unreachable!("format_info が返したビット深度: {}", info.bit_depth),
                 }
-                ChromaPlanes::Bit8 { u, v }
             }
-            DecodeFormat::P010 => {
-                let mut u = vec![0u16; plane_width * plane_height];
-                let mut v = vec![0u16; plane_width * plane_height];
-                for row in 0..plane_height {
-                    for col in 0..plane_width {
-                        let index = row * frame.pitch + col * 4;
-                        let decoded_u =
-                            u16::from_le_bytes([frame.uv_data[index], frame.uv_data[index + 1]])
-                                >> 6;
-                        let decoded_v = u16::from_le_bytes([
-                            frame.uv_data[index + 2],
-                            frame.uv_data[index + 3],
-                        ]) >> 6;
-                        u[row * plane_width + col] = decoded_u;
-                        v[row * plane_width + col] = decoded_v;
+            OwnedFrameData::Packed { .. } => {
+                let plane_width = frame.width;
+                let plane_height = frame.height;
+                match info.bit_depth {
+                    8 => {
+                        let data = frame.packed();
+                        let pitch = frame.pitch();
+                        let mut u = vec![0u8; plane_width * plane_height];
+                        let mut v = vec![0u8; plane_width * plane_height];
+                        for row in 0..plane_height {
+                            for col in 0..plane_width {
+                                // AYUV のメモリ上の並びは V, U, Y, A
+                                let index = row * pitch + col * 4;
+                                v[row * plane_width + col] = data[index];
+                                u[row * plane_width + col] = data[index + 1];
+                            }
+                        }
+                        ChromaPlanes::Bit8 { u, v }
                     }
+                    10 => {
+                        let data = frame.packed();
+                        let pitch = frame.pitch();
+                        let mut u = vec![0u16; plane_width * plane_height];
+                        let mut v = vec![0u16; plane_width * plane_height];
+                        for row in 0..plane_height {
+                            for col in 0..plane_width {
+                                let index = row * pitch + col * 4;
+                                let word = u32::from_le_bytes([
+                                    data[index],
+                                    data[index + 1],
+                                    data[index + 2],
+                                    data[index + 3],
+                                ]);
+                                // 下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit)
+                                u[row * plane_width + col] = (word & 0x3ff) as u16;
+                                v[row * plane_width + col] = ((word >> 20) & 0x3ff) as u16;
+                            }
+                        }
+                        ChromaPlanes::Bit10 { u, v }
+                    }
+                    _ => unreachable!("format_info が返したビット深度: {}", info.bit_depth),
                 }
-                ChromaPlanes::Bit10 { u, v }
             }
         }
     }
@@ -4540,8 +4904,8 @@ mod identity {
                 psnr_plane_10bit(expected_u, decoded_u),
                 psnr_plane_10bit(expected_v, decoded_v),
             ),
-            // expected_chroma と decoded_chroma は同じ decode_format から生成するため、
-            // ビット深度が異なる組み合わせには到達しない
+            // decoded_chroma は frame.frame_format から、expected_chroma は case.decode_format から
+            // 生成する。run_case が両者の一致を検証しているため、ビット深度が異なる組み合わせには到達しない
             _ => panic!("期待値とデコード結果のビット深度が一致しない"),
         }
     }
@@ -4647,157 +5011,115 @@ mod identity {
     }
 
     /// 色バーごとのクロマ領域平均の最大差を返す
-    fn max_chroma_mean_diff(reference: &ReferenceFrame, decoded: &ChromaPlanes) -> f64 {
-        match decoded {
-            ChromaPlanes::Bit8 { u, v } => {
-                let mut max_diff = 0.0_f64;
-                for bar in 0..BAR_COUNT {
-                    let (x0, x1) = bar_region(bar);
-                    let expected_u = region_mean_8bit(
-                        &reference.u,
-                        WIDTH,
-                        x0,
-                        x1,
-                        CHROMA_ROW_START,
-                        CHROMA_ROW_END,
-                    );
-                    let expected_v = region_mean_8bit(
-                        &reference.v,
-                        WIDTH,
-                        x0,
-                        x1,
-                        CHROMA_ROW_START,
-                        CHROMA_ROW_END,
-                    );
-                    let actual_u = region_mean_8bit(
-                        u,
-                        WIDTH / 2,
-                        x0 / 2,
-                        x1 / 2,
-                        CHROMA_ROW_START / 2,
-                        CHROMA_ROW_END / 2,
-                    );
-                    let actual_v = region_mean_8bit(
-                        v,
-                        WIDTH / 2,
-                        x0 / 2,
-                        x1 / 2,
-                        CHROMA_ROW_START / 2,
-                        CHROMA_ROW_END / 2,
-                    );
-                    max_diff = max_diff.max((expected_u - actual_u).abs());
-                    max_diff = max_diff.max((expected_v - actual_v).abs());
-                }
-                max_diff
-            }
-            ChromaPlanes::Bit10 { u, v } => {
-                let mut max_diff = 0.0_f64;
-                for bar in 0..BAR_COUNT {
-                    let (x0, x1) = bar_region(bar);
-                    // 期待値は 8bit の平均を 10bit 相当（4 倍）にしたもの
-                    let expected_u = region_mean_8bit(
-                        &reference.u,
-                        WIDTH,
-                        x0,
-                        x1,
-                        CHROMA_ROW_START,
-                        CHROMA_ROW_END,
-                    ) * 4.0;
-                    let expected_v = region_mean_8bit(
-                        &reference.v,
-                        WIDTH,
-                        x0,
-                        x1,
-                        CHROMA_ROW_START,
-                        CHROMA_ROW_END,
-                    ) * 4.0;
-                    let actual_u = region_mean_10bit(
-                        u,
-                        WIDTH / 2,
-                        x0 / 2,
-                        x1 / 2,
-                        CHROMA_ROW_START / 2,
-                        CHROMA_ROW_END / 2,
-                    );
-                    let actual_v = region_mean_10bit(
-                        v,
-                        WIDTH / 2,
-                        x0 / 2,
-                        x1 / 2,
-                        CHROMA_ROW_START / 2,
-                        CHROMA_ROW_END / 2,
-                    );
-                    max_diff = max_diff.max((expected_u - actual_u).abs());
-                    max_diff = max_diff.max((expected_v - actual_v).abs());
-                }
-                max_diff
-            }
+    fn max_chroma_mean_diff(
+        reference: &ReferenceFrame,
+        decoded: &ChromaPlanes,
+        format: FrameFormat,
+    ) -> f64 {
+        let info = format_info(format);
+        let scale = info.chroma_scale;
+        let plane_width = WIDTH / scale;
+        let row_start = CHROMA_ROW_START / scale;
+        let row_end = CHROMA_ROW_END / scale;
+        let expected_scale = info.sample_scale() as f64;
+        let mut max_diff = 0.0_f64;
+        for bar in 0..BAR_COUNT {
+            let (x0, x1) = bar_region(bar);
+            // 期待値は 8bit の平均を、10bit の形式では sample_scale 倍したもの
+            let expected_u = region_mean_8bit(
+                &reference.u,
+                WIDTH,
+                x0,
+                x1,
+                CHROMA_ROW_START,
+                CHROMA_ROW_END,
+            ) * expected_scale;
+            let expected_v = region_mean_8bit(
+                &reference.v,
+                WIDTH,
+                x0,
+                x1,
+                CHROMA_ROW_START,
+                CHROMA_ROW_END,
+            ) * expected_scale;
+            let (actual_u, actual_v) = match decoded {
+                ChromaPlanes::Bit8 { u, v } => (
+                    region_mean_8bit(u, plane_width, x0 / scale, x1 / scale, row_start, row_end),
+                    region_mean_8bit(v, plane_width, x0 / scale, x1 / scale, row_start, row_end),
+                ),
+                ChromaPlanes::Bit10 { u, v } => (
+                    region_mean_10bit(u, plane_width, x0 / scale, x1 / scale, row_start, row_end),
+                    region_mean_10bit(v, plane_width, x0 / scale, x1 / scale, row_start, row_end),
+                ),
+            };
+            max_diff = max_diff.max((expected_u - actual_u).abs());
+            max_diff = max_diff.max((expected_v - actual_v).abs());
         }
+        max_diff
     }
 
     /// 色バー間のクロマ平均の広がりを返す
-    fn chroma_spread(decoded: &ChromaPlanes) -> f64 {
+    fn chroma_spread(decoded: &ChromaPlanes, format: FrameFormat) -> f64 {
+        let scale = format_info(format).chroma_scale;
+        let plane_width = WIDTH / scale;
+        let row_start = CHROMA_ROW_START / scale;
+        let row_end = CHROMA_ROW_END / scale;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
         match decoded {
             ChromaPlanes::Bit8 { u, v } => {
-                let mut min = f64::INFINITY;
-                let mut max = f64::NEG_INFINITY;
                 for plane in [u.as_slice(), v.as_slice()] {
                     for bar in 0..BAR_COUNT {
                         let (x0, x1) = bar_region(bar);
                         let mean = region_mean_8bit(
                             plane,
-                            WIDTH / 2,
-                            x0 / 2,
-                            x1 / 2,
-                            CHROMA_ROW_START / 2,
-                            CHROMA_ROW_END / 2,
+                            plane_width,
+                            x0 / scale,
+                            x1 / scale,
+                            row_start,
+                            row_end,
                         );
                         min = min.min(mean);
                         max = max.max(mean);
                     }
                 }
-                max - min
             }
             ChromaPlanes::Bit10 { u, v } => {
-                let mut min = f64::INFINITY;
-                let mut max = f64::NEG_INFINITY;
                 for plane in [u.as_slice(), v.as_slice()] {
                     for bar in 0..BAR_COUNT {
                         let (x0, x1) = bar_region(bar);
                         let mean = region_mean_10bit(
                             plane,
-                            WIDTH / 2,
-                            x0 / 2,
-                            x1 / 2,
-                            CHROMA_ROW_START / 2,
-                            CHROMA_ROW_END / 2,
+                            plane_width,
+                            x0 / scale,
+                            x1 / scale,
+                            row_start,
+                            row_end,
                         );
                         min = min.min(mean);
                         max = max.max(mean);
                     }
                 }
-                max - min
             }
         }
+        max - min
     }
 
     /// 参照フレームとデコード結果の Y プレーンの PSNR を計算する
-    fn luma_psnr(
-        decode_format: DecodeFormat,
-        reference: &ReferenceFrame,
-        frame: &DecodedFrameInfo,
-    ) -> f64 {
-        match decode_format {
-            DecodeFormat::Nv12 => psnr_y(&reference.y, &frame.y_data, frame.pitch, WIDTH, HEIGHT),
-            DecodeFormat::P010 => {
-                let expected: Vec<u16> = reference
-                    .y
-                    .iter()
-                    .map(|&value| (value as u16) << 2)
-                    .collect();
-                psnr_y_10bit(&expected, &frame.y_data, frame.pitch, WIDTH, HEIGHT)
+    fn luma_psnr(reference: &ReferenceFrame, frame: &DecodedFrameInfo) -> f64 {
+        let info = format_info(frame.frame_format);
+        let peak = if info.bit_depth == 10 { 1023.0 } else { 255.0 };
+        let expected_scale = info.sample_scale() as f64;
+        let mut mse_sum = 0.0;
+        for row in 0..frame.height {
+            for col in 0..frame.width {
+                let expected = reference.y[row * frame.width + col] as f64 * expected_scale;
+                let decoded = luma_sample(frame, row, col);
+                let diff = expected - decoded;
+                mse_sum += diff * diff;
             }
         }
+        psnr_from_mse(mse_sum, frame.width * frame.height, peak)
     }
 
     /// デコード結果のルマのサンプル値を返す
@@ -4807,24 +5129,47 @@ mod identity {
     /// # Panics
     ///
     /// `row` または `col` がフレームの範囲外の場合はパニックする。
-    fn luma_sample(frame: &DecodedFrameInfo, format: DecodeFormat, row: usize, col: usize) -> f64 {
-        match format {
-            DecodeFormat::Nv12 => frame.y_data[row * frame.pitch + col] as f64,
-            DecodeFormat::P010 => {
-                let offset = row * frame.pitch + col * 2;
-                (u16::from_le_bytes([frame.y_data[offset], frame.y_data[offset + 1]]) >> 6) as f64
-            }
+    fn luma_sample(frame: &DecodedFrameInfo, row: usize, col: usize) -> f64 {
+        let info = format_info(frame.frame_format);
+        match &frame.data {
+            OwnedFrameData::SemiPlanar { .. } => match info.bit_depth {
+                8 => frame.y()[row * frame.pitch() + col] as f64,
+                10 => {
+                    let offset = row * frame.pitch() + col * 2;
+                    (u16::from_le_bytes([frame.y()[offset], frame.y()[offset + 1]]) >> 6) as f64
+                }
+                _ => unreachable!("format_info が返したビット深度: {}", info.bit_depth),
+            },
+            OwnedFrameData::Packed { .. } => match info.bit_depth {
+                8 => {
+                    // AYUV のメモリ上の並びは V, U, Y, A
+                    frame.packed()[row * frame.pitch() + col * 4 + 2] as f64
+                }
+                10 => {
+                    let index = row * frame.pitch() + col * 4;
+                    let data = frame.packed();
+                    let word = u32::from_le_bytes([
+                        data[index],
+                        data[index + 1],
+                        data[index + 2],
+                        data[index + 3],
+                    ]);
+                    // 下位から U (10bit) / Y (10bit) / V (10bit) / A (2bit)
+                    ((word >> 10) & 0x3ff) as f64
+                }
+                _ => unreachable!("format_info が返したビット深度: {}", info.bit_depth),
+            },
         }
     }
 
     /// デコード結果のルマの分散を返す
-    fn luma_variance(frame: &DecodedFrameInfo, format: DecodeFormat) -> f64 {
+    fn luma_variance(frame: &DecodedFrameInfo) -> f64 {
         let count = (frame.width * frame.height) as f64;
         let mut sum = 0.0;
         let mut sum_sq = 0.0;
         for row in 0..frame.height {
             for col in 0..frame.width {
-                let value = luma_sample(frame, format, row, col);
+                let value = luma_sample(frame, row, col);
                 sum += value;
                 sum_sq += value * value;
             }
@@ -4833,12 +5178,12 @@ mod identity {
     }
 
     /// デコード結果のルマのレンジ（最大値 - 最小値）を返す
-    fn luma_range(frame: &DecodedFrameInfo, format: DecodeFormat) -> f64 {
+    fn luma_range(frame: &DecodedFrameInfo) -> f64 {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         for row in 0..frame.height {
             for col in 0..frame.width {
-                let value = luma_sample(frame, format, row, col);
+                let value = luma_sample(frame, row, col);
                 min = min.min(value);
                 max = max.max(value);
             }
@@ -4851,11 +5196,7 @@ mod identity {
     /// # Panics
     ///
     /// 2 つのフレームのサイズが異なる場合はパニックする。
-    fn mean_abs_luma_diff(
-        previous: &DecodedFrameInfo,
-        current: &DecodedFrameInfo,
-        format: DecodeFormat,
-    ) -> f64 {
+    fn mean_abs_luma_diff(previous: &DecodedFrameInfo, current: &DecodedFrameInfo) -> f64 {
         assert_eq!(
             (previous.width, previous.height),
             (current.width, current.height),
@@ -4864,8 +5205,8 @@ mod identity {
         let mut sum = 0.0;
         for row in 0..current.height {
             for col in 0..current.width {
-                let previous_sample = luma_sample(previous, format, row, col);
-                let current_sample = luma_sample(current, format, row, col);
+                let previous_sample = luma_sample(previous, row, col);
+                let current_sample = luma_sample(current, row, col);
                 sum += (previous_sample - current_sample).abs();
             }
         }
@@ -4934,11 +5275,16 @@ mod identity {
         );
     }
 
+    /// 10bit の色形式かどうか
+    fn is_10bit(format: FrameFormat) -> bool {
+        format_info(format).bit_depth == 10
+    }
+
     /// 1 ケースを実行し、入力とデコード出力の恒等性を検証する
     fn run_case(case: &Case) {
         println!("実行: {}", case.label);
 
-        let config = identity_config(case.codec_config.clone(), case.input_format);
+        let config = identity_config(case.codec_config.clone(), case.input_format, case.qp);
 
         let references: Vec<ReferenceFrame> = (0..NUM_FRAMES).map(ReferenceFrame::new).collect();
         let input_frames: Vec<Vec<u8>> = references
@@ -4949,18 +5295,13 @@ mod identity {
         let (encoded_frames, decoded_frames) = roundtrip(config, case.decoder_codec, &input_frames);
         assert_frame_types(&encoded_frames, case.label);
 
-        // P010 のデコード結果は 1 サンプル 2 バイトなので、ピッチが表示幅の 2 倍以上である
-        // ことを確認する。NV12 のピッチは assert_decoded_frame_layout が検証する。
-        if matches!(case.decode_format, DecodeFormat::P010) {
-            for frame in &decoded_frames {
-                assert!(
-                    frame.pitch >= WIDTH * 2,
-                    "{}: P010 のデコード結果のピッチ {} が表示幅 {} の 2 倍未満",
-                    case.label,
-                    frame.pitch,
-                    WIDTH
-                );
-            }
+        // デコード出力の色形式がストリームのネイティブ形式と一致することを確認する
+        for (index, frame) in decoded_frames.iter().enumerate() {
+            assert_eq!(
+                frame.frame_format, case.decode_format,
+                "{}: フレーム {index} のデコード出力の色形式 {:?} が期待値 {:?} と一致しない",
+                case.label, frame.frame_format, case.decode_format
+            );
         }
 
         for (index, frame) in decoded_frames.iter().enumerate() {
@@ -4975,7 +5316,7 @@ mod identity {
             let reference = &references[index];
 
             // ルマの PSNR
-            let y_psnr = luma_psnr(case.decode_format, reference, frame);
+            let y_psnr = luma_psnr(reference, frame);
             assert!(
                 y_psnr >= PSNR_MIN_DB,
                 "{}: フレーム {index} の Y PSNR {y_psnr:.1} dB が下限 {PSNR_MIN_DB:.1} dB 未満",
@@ -4983,7 +5324,7 @@ mod identity {
             );
 
             // クロマの PSNR または色バー領域平均
-            let decoded_chroma_planes = decoded_chroma(frame, case.decode_format);
+            let decoded_chroma_planes = decoded_chroma(frame);
             match case.chroma_check {
                 ChromaCheck::Psnr => {
                     let expected_chroma_planes = expected_chroma(reference, case.decode_format);
@@ -4996,10 +5337,12 @@ mod identity {
                     );
                 }
                 ChromaCheck::RegionMean => {
-                    let diff = max_chroma_mean_diff(reference, &decoded_chroma_planes);
-                    let tolerance = match case.decode_format {
-                        DecodeFormat::Nv12 => CHROMA_MEAN_TOLERANCE_8BIT,
-                        DecodeFormat::P010 => CHROMA_MEAN_TOLERANCE_10BIT,
+                    let diff =
+                        max_chroma_mean_diff(reference, &decoded_chroma_planes, case.decode_format);
+                    let tolerance = if is_10bit(case.decode_format) {
+                        CHROMA_MEAN_TOLERANCE_10BIT
+                    } else {
+                        CHROMA_MEAN_TOLERANCE_8BIT
                     };
                     assert!(
                         diff <= tolerance,
@@ -5013,10 +5356,11 @@ mod identity {
             // または色バー領域平均）が下限を満たせば多くは自動的に満たされるが、単色・
             // 静止画・プレーン欠落といった壊れ方をしたときに原因を特定しやすくするために残す。
             // クロマが単色でないこと（色バー間で平均が変化すること）
-            let spread = chroma_spread(&decoded_chroma_planes);
-            let minimum_spread = match case.decode_format {
-                DecodeFormat::Nv12 => CHROMA_SPREAD_MIN_8BIT,
-                DecodeFormat::P010 => CHROMA_SPREAD_MIN_10BIT,
+            let spread = chroma_spread(&decoded_chroma_planes, case.decode_format);
+            let minimum_spread = if is_10bit(case.decode_format) {
+                CHROMA_SPREAD_MIN_10BIT
+            } else {
+                CHROMA_SPREAD_MIN_8BIT
             };
             assert!(
                 spread >= minimum_spread,
@@ -5025,10 +5369,11 @@ mod identity {
             );
 
             // ルマが単色でないこと
-            let variance = luma_variance(frame, case.decode_format);
-            let minimum_variance = match case.decode_format {
-                DecodeFormat::Nv12 => LUMA_VARIANCE_MIN_8BIT,
-                DecodeFormat::P010 => LUMA_VARIANCE_MIN_10BIT,
+            let variance = luma_variance(frame);
+            let minimum_variance = if is_10bit(case.decode_format) {
+                LUMA_VARIANCE_MIN_10BIT
+            } else {
+                LUMA_VARIANCE_MIN_8BIT
             };
             assert!(
                 variance >= minimum_variance,
@@ -5038,11 +5383,11 @@ mod identity {
 
             // フレームごとの移動パターンがデコード結果にも現れていること
             if index > 0 {
-                let diff =
-                    mean_abs_luma_diff(&decoded_frames[index - 1], frame, case.decode_format);
-                let minimum_diff = match case.decode_format {
-                    DecodeFormat::Nv12 => FRAME_DIFF_MIN_8BIT,
-                    DecodeFormat::P010 => FRAME_DIFF_MIN_10BIT,
+                let diff = mean_abs_luma_diff(&decoded_frames[index - 1], frame);
+                let minimum_diff = if is_10bit(case.decode_format) {
+                    FRAME_DIFF_MIN_10BIT
+                } else {
+                    FRAME_DIFF_MIN_8BIT
                 };
                 assert!(
                     diff >= minimum_diff,
@@ -5069,7 +5414,8 @@ mod identity {
                 codec_config: h264_high(),
                 decoder_codec: VideoCodecType::H264,
                 input_format: FrameFormat::Nv12,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
             Case {
@@ -5077,7 +5423,8 @@ mod identity {
                 codec_config: h264_high(),
                 decoder_codec: VideoCodecType::H264,
                 input_format: FrameFormat::Yuy2,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::RegionMean,
             },
             Case {
@@ -5085,7 +5432,8 @@ mod identity {
                 codec_config: h264_high(),
                 decoder_codec: VideoCodecType::H264,
                 input_format: FrameFormat::Ayuv,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::RegionMean,
             },
         ]);
@@ -5100,7 +5448,8 @@ mod identity {
                 codec_config: hevc_main(),
                 decoder_codec: VideoCodecType::Hevc,
                 input_format: FrameFormat::Nv12,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
             Case {
@@ -5108,7 +5457,8 @@ mod identity {
                 codec_config: hevc_main(),
                 decoder_codec: VideoCodecType::Hevc,
                 input_format: FrameFormat::Yuy2,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::RegionMean,
             },
             Case {
@@ -5116,7 +5466,8 @@ mod identity {
                 codec_config: hevc_main(),
                 decoder_codec: VideoCodecType::Hevc,
                 input_format: FrameFormat::Ayuv,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::RegionMean,
             },
         ]);
@@ -5131,7 +5482,8 @@ mod identity {
                 codec_config: hevc_main10(),
                 decoder_codec: VideoCodecType::Hevc,
                 input_format: FrameFormat::P010,
-                decode_format: DecodeFormat::P010,
+                decode_format: FrameFormat::P010,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
             Case {
@@ -5139,8 +5491,52 @@ mod identity {
                 codec_config: hevc_main10(),
                 decoder_codec: VideoCodecType::Hevc,
                 input_format: FrameFormat::Y410,
-                decode_format: DecodeFormat::P010,
+                decode_format: FrameFormat::P010,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::RegionMean,
+            },
+        ]);
+    }
+
+    /// HEVC Rext / Scc の 4:4:4 入力を同じ 4:4:4 形式にデコードする経路
+    #[test]
+    fn test_identity_hevc_444_formats() {
+        run_cases(&[
+            Case {
+                label: "HEVC Rext / AYUV -> AYUV",
+                codec_config: hevc_rext(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Ayuv,
+                decode_format: FrameFormat::Ayuv,
+                qp: DEFAULT_QP,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "HEVC Rext / Y410 -> Y410",
+                codec_config: hevc_rext(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Y410,
+                decode_format: FrameFormat::Y410,
+                qp: DEFAULT_QP,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "HEVC Scc / AYUV -> AYUV",
+                codec_config: hevc_scc(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Ayuv,
+                decode_format: FrameFormat::Ayuv,
+                qp: DEFAULT_QP,
+                chroma_check: ChromaCheck::Psnr,
+            },
+            Case {
+                label: "HEVC Scc / Y410 -> Y410",
+                codec_config: hevc_scc(),
+                decoder_codec: VideoCodecType::Hevc,
+                input_format: FrameFormat::Y410,
+                decode_format: FrameFormat::Y410,
+                qp: SCC_Y410_QP,
+                chroma_check: ChromaCheck::Psnr,
             },
         ]);
     }
@@ -5154,7 +5550,8 @@ mod identity {
                 codec_config: av1_main(),
                 decoder_codec: VideoCodecType::Av1,
                 input_format: FrameFormat::Nv12,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
             Case {
@@ -5162,7 +5559,8 @@ mod identity {
                 codec_config: av1_main(),
                 decoder_codec: VideoCodecType::Av1,
                 input_format: FrameFormat::P010,
-                decode_format: DecodeFormat::P010,
+                decode_format: FrameFormat::P010,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
         ]);
@@ -5177,7 +5575,8 @@ mod identity {
                 codec_config: vp9(Vp9Profile::Profile0),
                 decoder_codec: VideoCodecType::Vp9,
                 input_format: FrameFormat::Nv12,
-                decode_format: DecodeFormat::Nv12,
+                decode_format: FrameFormat::Nv12,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
             Case {
@@ -5185,7 +5584,8 @@ mod identity {
                 codec_config: vp9(Vp9Profile::Profile2),
                 decoder_codec: VideoCodecType::Vp9,
                 input_format: FrameFormat::P010,
-                decode_format: DecodeFormat::P010,
+                decode_format: FrameFormat::P010,
+                qp: DEFAULT_QP,
                 chroma_check: ChromaCheck::Psnr,
             },
         ]);
@@ -5225,7 +5625,7 @@ mod identity {
 
         // 入力の BGRA は RGB、デコード結果は YUV の Y であり、値のスケールが異なるため
         // 直接 PSNR で比較できない
-        let config = identity_config(h264_high(), FrameFormat::Bgra);
+        let config = identity_config(h264_high(), FrameFormat::Bgra, DEFAULT_QP);
 
         let (input_frames, expected_values): (Vec<Vec<u8>>, Vec<Vec<f64>>) =
             (0..NUM_FRAMES).map(bgra_gray_frame).unzip();
@@ -5238,11 +5638,16 @@ mod identity {
                 frame.user_data, index,
                 "BGRA: フレーム {index} の user_data が入力の順序と一致しない"
             );
+            assert_eq!(
+                frame.frame_format,
+                FrameFormat::Nv12,
+                "BGRA: フレーム {index} のデコード出力が NV12 でない"
+            );
             let expected = &expected_values[index];
             let mut decoded = Vec::new();
             for row in 0..HEIGHT {
                 for col in 0..WIDTH {
-                    decoded.push(luma_sample(frame, DecodeFormat::Nv12, row, col));
+                    decoded.push(luma_sample(frame, row, col));
                 }
             }
 
@@ -5262,21 +5667,20 @@ mod identity {
                 "BGRA: フレーム {index} のルマ平均 {decoded_mean:.2} が期待値 {expected_mean:.2} から許容差 {BGRA_LUMA_MEAN_TOLERANCE} 以上離れている"
             );
 
-            let range = luma_range(frame, DecodeFormat::Nv12);
+            let range = luma_range(frame);
             assert!(
                 range >= BGRA_LUMA_RANGE_MIN,
                 "BGRA: フレーム {index} のルマレンジ {range:.1} が下限 {BGRA_LUMA_RANGE_MIN} 未満"
             );
 
-            let variance = luma_variance(frame, DecodeFormat::Nv12);
+            let variance = luma_variance(frame);
             assert!(
                 variance >= BGRA_LUMA_VARIANCE_MIN,
                 "BGRA: フレーム {index} のルマ分散 {variance:.1} が下限 {BGRA_LUMA_VARIANCE_MIN} 未満"
             );
 
             if index > 0 {
-                let diff =
-                    mean_abs_luma_diff(&decoded_frames[index - 1], frame, DecodeFormat::Nv12);
+                let diff = mean_abs_luma_diff(&decoded_frames[index - 1], frame);
                 assert!(
                     diff >= BGRA_FRAME_DIFF_MIN,
                     "BGRA: フレーム {index} と前フレームの平均絶対差分 {diff:.2} が下限 {BGRA_FRAME_DIFF_MIN} 未満"

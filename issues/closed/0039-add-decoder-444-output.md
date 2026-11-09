@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-11-07
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-09
 - Model: DeepSeek V4 Flash
 - Branch: feature/add-decoder-444-output
 - Polished: {YYYY-MM-DD}
@@ -55,3 +55,37 @@ Meteor Lake (mfx-gen) で確認した現在の挙動:
 - エンコーダー側の 4:4:4 入力対応: `FrameFormat::Ayuv` / `FrameFormat::Y410`
 - デコーダーの色形式ケーパビリティ: `supported_codecs` の `DecodingInfo` / `MemoryTypeCapabilities::color_formats`
 - 汎用の恒等性テスト: issue 0038
+
+## 解決方法
+
+`DecodedFrame` の API を出力形式に依存しない形に変更し、4:4:4 のデコードと恒等性検証に対応した。
+
+### 変更内容
+
+- `DecodedFrame` に `frame_format` と `data` を追加し、`y` / `uv` / `pitch` を削除した
+  - `data` は `FrameData::SemiPlanar` / `FrameData::Packed` を返す
+  - `FrameData` はエンコード入力とデコード出力の共通型として `codec_info` に移動した
+- `read_decoded_surface` を形式別に読み取るようにした
+  - NV12 / P010 は `Data.Y` / `Data.UV`
+  - AYUV は `Data.V`
+  - Y410 は `Data.Y410`
+  - P010 は `Info.Shift` を検証する
+  - ピッチは `PitchHigh` / `PitchLow` の合成値を使い、`bytes_per_row` 以上であることを検証する
+- 4:4:4 の恒等性テストを追加した
+  - HEVC Rext / Scc + AYUV / Y410 の 320x240
+  - HEVC Rext + AYUV / Y410 の 318x238（ピッチが行のバイト数より大きくなる経路）
+  - Scc + Y410 は実機で QPI / QPP 20 以下だとエンコードが完了しないため、22 を使う
+- テストの形式対応表を `FormatInfo` / `format_info` に集約した
+- `README.md` / `skills/shiguredo-vpl/SKILL.md` / `CHANGES.md` を更新した
+
+### 確認
+
+Intel GPU (Meteor Lake, mfx-gen) を搭載した実機で確認した。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test -- --test-threads=1` | pass (lib 55 件、adapter 5 件、roundtrip 67 件、doctest 2 件) |
+| HEVC Rext / Scc + AYUV / Y410 の恒等性 | pass |
+| 318x238 の 4:4:4 ピッチ検証 | pass |

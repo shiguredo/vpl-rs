@@ -87,7 +87,7 @@
 //! # デコードの例
 //!
 //! ```no_run
-//! use shiguredo_vpl::{AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler, VideoCodecType, list_adapters};
+//! use shiguredo_vpl::{AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler, FrameData, VideoCodecType, list_adapters};
 //! use std::sync::mpsc;
 //!
 //! let adapter = list_adapters().unwrap().into_iter().next().unwrap();
@@ -95,7 +95,13 @@
 //! let (tx, rx) = mpsc::channel();
 //! let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result: Result<DecodedFrame<'_, ()>, Error>| {
 //!     // DecodedFrame は借用データを含むため、コールバック内でコピーする
-//!     let info = result.map(|frame| (frame.y().to_vec(), frame.pitch(), frame.width(), frame.height()));
+//!     let info = result.map(|frame| {
+//!         let data_len = match frame.data() {
+//!             FrameData::SemiPlanar { y, uv, .. } => y.len() + uv.len(),
+//!             FrameData::Packed { data, .. } => data.len(),
+//!         };
+//!         (frame.frame_format(), frame.width(), frame.height(), data_len)
+//!     });
 //!     tx.send(info).unwrap();
 //! })).unwrap();
 //!
@@ -103,7 +109,7 @@
 //! let bitstream = vec![0u8; 1024];
 //! decoder.decode(&bitstream, ()).unwrap();
 //! decoder.finish().unwrap();
-//! let (y, _pitch, _width, _height) = rx.recv().unwrap().unwrap();
+//! let (_format, _width, _height, _data_len) = rx.recv().unwrap().unwrap();
 //! ```
 
 // Linux x86_64 以外では libvpl をビルド・リンクできないため、対応外のターゲットではコンパイル時点で拒否する。
@@ -134,9 +140,8 @@ pub use decode::{
 };
 pub use encode::{
     Av1EncoderConfig, CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder,
-    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, FrameData, H264EncoderConfig,
-    HevcEncoderConfig, PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam,
-    Vp9EncoderConfig,
+    EncoderConfig, EncoderStats, ExtParams, FnEncodeHandler, H264EncoderConfig, HevcEncoderConfig,
+    PictureType, RateControlMode, ReconfigureParams, SequenceParams, VideoParam, Vp9EncoderConfig,
 };
 pub use error::Error;
 pub use stats::{Counter, Gauge};
