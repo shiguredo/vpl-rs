@@ -11,6 +11,9 @@
 
 ## develop
 
+- [CHANGE] MSRV (rust-version) を 1.93 から 1.95 に上げる
+  - `rust-toolchain.toml` の channel、CI と devcontainer のツールチェーンも 1.95 に合わせる
+  - @melpon
 - [CHANGE] デコーダーの 4:4:4 出力 (AYUV / Y410) に対応する
   - `DecodedFrame::frame_format` でデコード出力の色形式を取得できる
   - `DecodedFrame::data` が返す `FrameData` で画素データを取得する。NV12 / P010 は `SemiPlanar`、AYUV / Y410 は `Packed` になる

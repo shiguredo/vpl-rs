@@ -1,4 +1,4 @@
 # ライブラリの MSRV に合わせて固定する (Cargo.toml の rust-version と同じ値)
 [toolchain]
-channel = "1.93"
+channel = "1.95"
 components = ["rustfmt", "clippy"]
