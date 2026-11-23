@@ -14,9 +14,10 @@
 - [CHANGE] MSRV (rust-version) を 1.93 から 1.95 に上げる
   - `rust-toolchain.toml` の channel、CI と devcontainer のツールチェーンも 1.95 に合わせる
   - @melpon
-- [CHANGE] デコーダーの 4:4:4 出力 (AYUV / Y410) に対応する
-  - `DecodedFrame::frame_format` でデコード出力の色形式を取得できる
+- [CHANGE] デコーダーの 10bit 4:2:0 (P010) と 4:4:4 (AYUV / Y410) の出力に対応する
+  - `DecodedFrame::frame_format` でデコード出力の色形式を取得できる。10bit 4:2:0 は P010、8bit 4:4:4 は AYUV、10bit 4:4:4 は Y410 になる
   - `DecodedFrame::data` が返す `FrameData` で画素データを取得する。NV12 / P010 は `SemiPlanar`、AYUV / Y410 は `Packed` になる
+  - 対応外の出力形式 (P016 など) はデコード時にエラーになる
   - `DecodedFrame::y` / `DecodedFrame::uv` / `DecodedFrame::pitch` を削除する。`data` と `frame_format` で置き換える
   - `FrameData` をエンコード入力とデコード出力の共通の画素データ表現にする
   - @melpon
@@ -33,7 +34,7 @@
   - @melpon
 - [CHANGE] `supported_codecs` が返すコーデック情報を VPL の実装記述に合わせて拡充する
   - `CodecInfo::decoding` / `CodecInfo::encoding` を `Option` に変更し、非対応コーデックでは `None` を返す
-  - `DecodingInfo` / `EncodingInfo` から `supported` / `hardware_accelerated` / `supports_multi_pass` を削除する
+  - `DecodingInfo` / `EncodingInfo` から `supported` / `hardware_accelerated` を、 `EncodingInfo` から `supports_multi_pass` を削除する
   - `DecodingInfo` / `EncodingInfo` に `max_codec_level: Option<u16>` を追加し、レベルが不明な場合は `None` にする
   - プロファイルごとの `ProfileCapabilities` と、メモリタイプごとの `MemoryTypeCapabilities` を追加する
   - `MemoryTypeCapabilities` は幅・高さの範囲 (`ValueRange`) と色形式をメモリタイプ別に返し、プロファイルやメモリタイプをまたいだ集約はしない
@@ -54,7 +55,7 @@
   - `Encoder::coded_size` はサーフェスのサイズを返す API として残す
   - @melpon
 - [ADD] エンコーダーとデコーダーの統計 API を追加する
-  - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・出力ビット数・in-flight フレーム数を取得できる
+  - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・in-flight フレーム数を取得でき、 `EncoderStats` は出力ビット数も持つ
   - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する
   - 統計の型として `Counter` / `Gauge` を公開する
   - @melpon
@@ -88,24 +89,30 @@
   - ルマの分散・フレーム間差分・色バー間のクロマ平均の広がりと、BGRA 入力のルマ相関・平均・レンジ・分散を検証する
   - `identity` と内容が重複する AYUV / 10bit のルマ PSNR と、BGRA / AYUV のフレーム数のみのテストを整理する
   - @melpon
+- [ADD] コーデックケーパビリティ照会の実機テストを追加する
+  - `tests/test_codec_info.rs` でプロファイル・メモリタイプ別の解像度範囲と色形式を検証する
+  - `tests/helpers.rs` にテスト用アダプタを取得する共通ヘルパーを追加する
+  - @melpon
 - [ADD] silent pass していたテストを修正する
   - `frame_surface_gpu_required` でテスト用エンコーダーを初期化し、早期 return を assert に置き換える
   - `test_list_adapters_sorted_and_deduped` に空 Vec の自動パスを防ぐ assert を追加する
   - @melpon
 - [UPDATE] VPL が返す値の検証方針をユーザー入力と Rust の安全境界に限定する
   - VPL が仕様どおりの値を返す前提で、メタデータの健全性検証を削除する
+  - `Encoder::new` の実効 FrameInfo / VP9 `WriteIVFHeaders` の一致検証と、Decoder 出力の crop / pitch / Shift / 奇数サイズの検証を削除する
   - @melpon
 - [UPDATE] VPL ローダーの初期化処理を `VplLoader` に集約する
   - セッション生成・アダプタ列挙・コーデック照会で重複していたローダーの生成とフィルタ設定を共通化する
   - ローダーの解放を `VplLoader` の Drop に統一する
   - @melpon
-- [UPDATE] Rust ツールチェーンを rust-version と同じ 1.93 に固定する
-  - CI と devcontainer のツールチェーンも 1.93 に合わせる
-  - @voluntas
 - [UPDATE] 公開型から `#[non_exhaustive]` を削除する
   - `DecoderConfig` / `EncoderConfig` / `AdapterSelector` / `MediaAdapterType` / `PciAddress` / `AdapterInfo` が対象
   - 利用側で `match` の網羅性チェックと構造体リテラルによる構築が可能になる
   - 今後フィールドや variant を追加する場合は後方互換のない変更として扱う
+  - @melpon
+- [UPDATE] CI の clippy でテストコードも lint し、docs.rs ビルドでは警告をエラーにする
+  - GPU 実機テストのジョブの clippy に `--all-targets` を指定する
+  - docs.rs ビルドのジョブに `RUSTDOCFLAGS=-D warnings` を設定する
   - @melpon
 - [FIX] docs.rs のビルドでネットワークに接続できないためドキュメント生成に失敗する問題を修正する
   - `DOCS_RS` 設定時は libvpl の取得と bindgen をスキップし、ドキュメント生成に必要な最小限のダミー定義を出力する

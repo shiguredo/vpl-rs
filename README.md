@@ -37,6 +37,7 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - エンコーダーからの SPS / PPS / VPS 取得 (MP4 / RTP 用のパラメータセット)
 - デコーダーのキーフレームのヘッダから解像度とフレームレートを取得 (`Decoder::decode_header`)
 - コーデックケーパビリティ照会 (プロファイル別・メモリタイプ別の解像度範囲 / 最大コーデックレベル / 対応色形式)
+- エンコーダー / デコーダーの統計取得 (`Encoder::stats` / `Decoder::stats`)
 
 ## 動作要件
 
@@ -162,9 +163,12 @@ let mut config = EncoderConfig::new(
 config.target_kbps = Some(5_000);
 
 let (tx, rx) = mpsc::channel();
-let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |result| {
-    tx.send(result).expect("failed to send callback result");
-}))?;
+let mut encoder = Encoder::new(
+    config,
+    FnEncodeHandler::new(move |result: Result<EncodedFrame<&'static str>, Error>| {
+        tx.send(result).expect("failed to send callback result");
+    }),
+)?;
 
 // width x height の FrameData を構築する
 let pitch = FrameFormat::Nv12
@@ -228,8 +232,8 @@ if let Some(params) = params {
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, Decoder, DecoderConfig, FnDecodeHandler, FrameData, VideoCodecType,
-    list_adapters,
+    AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler, FrameData,
+    VideoCodecType, list_adapters,
 };
 use std::sync::mpsc;
 
@@ -237,19 +241,24 @@ let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node
 let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 
 let (tx, rx) = mpsc::channel();
-let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
-    // DecodedFrame は借用データを含むため、コールバック内でコピーする
-    let info = result.map(|frame| {
-        let data_len = match frame.data() {
-            FrameData::SemiPlanar { y, uv, .. } => y.len() + uv.len(),
-            FrameData::Packed { data, .. } => data.len(),
-        };
-        (frame.frame_format(), frame.width(), frame.height(), data_len)
-    });
-    tx.send(info).expect("failed to send callback result");
-}))?;
+let mut decoder = Decoder::new(
+    config,
+    FnDecodeHandler::new(
+        move |result: Result<DecodedFrame<'_, &'static str>, Error>| {
+            // DecodedFrame は借用データを含むため、コールバック内でコピーする
+            let info = result.map(|frame| {
+                let data_len = match frame.data() {
+                    FrameData::SemiPlanar { y, uv, .. } => y.len() + uv.len(),
+                    FrameData::Packed { data, .. } => data.len(),
+                };
+                (frame.frame_format(), frame.width(), frame.height(), data_len)
+            });
+            tx.send(info).expect("failed to send callback result");
+        },
+    ),
+)?;
 
-// ビットストリームデータをデコード (value で任意のユーザーデータを紐付け可能)
+// ビットストリームデータをデコード (user_data で任意のユーザーデータを紐付け可能)
 let bitstream_data = vec![0u8; 1024];
 decoder.decode(&bitstream_data, "frame-0")?;
 decoder.decode(&bitstream_data, "frame-1")?;
@@ -295,6 +304,36 @@ decoder.decode(&keyframe, "frame-0")?;
 - `framerate` はフレームレートで、`Framerate` の `num` / `den` の比で表されます。約分されているとは限りません。ビットストリームに情報が無い場合は `None` になります
 - `data` には SPS / PPS / sequence header が必要です。これらは通常キーフレームに含まれます
 - `Decoder::decode` と同じスレッドで、`Decoder::decode` と直列になるように呼んでください
+
+### 統計の取得
+
+`Encoder::stats()` / `Decoder::stats()` で処理状況の統計を取得できます。
+統計値は処理の進行に伴って更新され、各カウンタは `Counter`、in-flight フレーム数は `Gauge` で表されます。
+
+```rust
+let stats = encoder.stats();
+println!(
+    "encode={} output={} error={} in_flight={}",
+    stats.total_encode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get(),
+    stats.in_flight_frames.get(),
+);
+
+let stats = decoder.stats();
+println!(
+    "decode={} output={} error={} in_flight={}",
+    stats.total_decode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get(),
+    stats.in_flight_frames.get(),
+);
+```
+
+- `EncoderStats` は `total_encode_count` / `total_output_frame_count` / `total_error_count` / `total_reconfigure_count` / `total_output_bit_count` / `in_flight_frames` を持ちます
+- `DecoderStats` は `total_decode_count` / `total_output_frame_count` / `total_error_count` / `in_flight_frames` を持ちます
+- `Counter` / `Gauge` は `get()` で現在値を取得できます。`clone()` は現在値のスナップショットを返します
+- `in_flight_frames` は処理中のフレーム数です。`finish()` や `reconfigure()` の完了時点で 0 になります。処理の途中でエラーになった場合は残留することがあります
 
 ## サポートコーデック
 
