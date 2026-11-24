@@ -11,6 +11,10 @@
 
 ## develop
 
+## 2026.5.0
+
+**リリース日**: 2026-11-24
+
 - [CHANGE] MSRV (rust-version) を 1.93 から 1.95 に上げる
   - `rust-toolchain.toml` の channel、CI と devcontainer のツールチェーンも 1.95 に合わせる
   - @melpon

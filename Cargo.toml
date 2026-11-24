@@ -1,6 +1,6 @@
 [package]
 name = "shiguredo_vpl"
-version = "2026.4.0"
+version = "2026.5.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Rust bindings for Intel oneVPL (Video Processing Library)"

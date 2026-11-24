@@ -5,7 +5,7 @@ description: shiguredo_vpl (vpl-rs) クレートの徹底リファレンス。In
 
 # shiguredo_vpl クレート
 
-- **バージョン**: 2026.4.0 (依存する libvpl は 2.17.0)
+- **バージョン**: 2026.5.0 (依存する libvpl は 2.17.0)
 - **リポジトリ**: https://github.com/shiguredo/vpl-rs
 - **Rust エディション**: 2024 (rust-version: 1.95、`rust-toolchain.toml` の channel も 1.95 に固定)
 - **ライセンス**: Apache-2.0
