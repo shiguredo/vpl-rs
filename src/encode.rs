@@ -1,63 +1,13 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
-use crate::vpl::{FrameSurface, Session, VplLibrary};
+use crate::codec_info::{
+    Av1Profile, FrameData, FrameFormat, H264Profile, HevcProfile, VideoCodecType, Vp9Profile,
+};
+use crate::stats::{Counter, Gauge};
+use crate::vpl::{FrameSurface, Session, VplLibrary, frame_data_pitch};
 use crate::{AdapterSelector, Error, sys};
-
-/// H.264 プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H264Profile {
-    /// ベースラインプロファイル
-    Baseline,
-    /// Constrained ベースラインプロファイル
-    ConstrainedBaseline,
-    /// メインプロファイル
-    Main,
-    /// ハイプロファイル
-    High,
-    /// Constrained ハイプロファイル
-    ConstrainedHigh,
-    /// High 10 プロファイル（10bit）
-    High10,
-    /// High 4:2:2 プロファイル
-    High422,
-}
-
-/// HEVC プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HevcProfile {
-    /// メインプロファイル
-    Main,
-    /// Main 10 プロファイル（10bit）
-    Main10,
-    /// Main Still Picture プロファイル
-    MainSp,
-    /// Range Extension プロファイル
-    Rext,
-    /// Screen Content Coding プロファイル
-    Scc,
-}
-
-/// VP9 プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Vp9Profile {
-    /// Profile 0（8bit YUV 4:2:0）
-    Profile0,
-    /// Profile 1（8bit YUV 4:2:2 または 4:4:4）
-    Profile1,
-    /// Profile 2（10/12bit YUV 4:2:0）
-    Profile2,
-    /// Profile 3（10/12bit YUV 4:2:2 または 4:4:4）
-    Profile3,
-}
-
-/// AV1 プロファイル
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Av1Profile {
-    /// メインプロファイル
-    Main,
-}
 
 /// H.264 エンコーダ固有の設定
 #[derive(Debug, Clone)]
@@ -80,7 +30,7 @@ pub struct Vp9EncoderConfig {
     pub profile: Option<Vp9Profile>,
     /// IVF ヘッダーを出力するかどうか
     ///
-    /// true の場合は IVF ヘッダー付き、false の場合は raw VP9 を出力する。
+    /// `true` の場合は IVF ヘッダー付き、`false` の場合は raw VP9 を出力する。
     pub write_ivf_headers: bool,
 }
 
@@ -104,115 +54,152 @@ pub enum CodecConfig {
     Av1(Av1EncoderConfig),
 }
 
-/// 入力フレームフォーマット
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameFormat {
-    /// Semi-Planar YUV 4:2:0 8bit [Y plane + interleaved UV plane]
-    Nv12,
-    /// Packed YUV 4:2:2 8bit [YUYV interleaved]
-    Yuy2,
-    /// Packed BGRA 8bit
-    Bgra,
-}
-
 impl FrameFormat {
-    fn fourcc(self) -> u32 {
-        match self {
-            FrameFormat::Nv12 => sys::MFX_FOURCC_NV12,
-            FrameFormat::Yuy2 => sys::MFX_FOURCC_YUY2,
-            FrameFormat::Bgra => sys::MFX_FOURCC_RGB4,
-        }
-    }
-
-    fn chroma_format(self) -> u16 {
-        match self {
-            FrameFormat::Nv12 => sys::MFX_CHROMAFORMAT_YUV420 as u16,
-            FrameFormat::Yuy2 => sys::MFX_CHROMAFORMAT_YUV422 as u16,
-            FrameFormat::Bgra => sys::MFX_CHROMAFORMAT_YUV444 as u16,
-        }
-    }
-
-    fn bit_depth(self) -> u16 {
-        8
-    }
-
-    /// フレームデータのバイトサイズを返す
+    /// フレームデータをコピーする
     ///
-    /// オーバーフロー時は `None` を返す。
-    pub fn frame_size(self, width: usize, height: usize) -> Option<usize> {
-        let pixels = width.checked_mul(height)?;
-        match self {
-            // YUV 4:2:0 8bit: Y + UV/2 = pixels * 3 / 2
-            FrameFormat::Nv12 => pixels.checked_mul(3).map(|v| v / 2),
-            // YUY2: 2 bytes/pixel (packed YUYV)
-            FrameFormat::Yuy2 => pixels.checked_mul(2),
-            // BGRA: 4 bytes/pixel
-            FrameFormat::Bgra => pixels.checked_mul(4),
-        }
-    }
-
-    /// フレームデータを内部サーフェスの mfxFrameData にコピーする
+    /// `frame` の形式と各プレーンの `pitch` / データ長、コピー先サーフェスの
+    /// サイズとピッチが不正な場合はエラーを返す。
     ///
     /// # Safety
     ///
-    /// `data` の各プレーンポインタは有効なメモリを指し、Pitch 幅分の書き込みが可能である必要がある。
-    /// `src` は `frame_size(coded_width, coded_height)` バイト以上である必要がある。
+    /// `data` の各プレーンポインタは有効なメモリを指し、`surface_width` /
+    /// `surface_height` の範囲に `Pitch` 幅で書き込める必要がある。
     unsafe fn copy_to_surface_planes(
         self,
-        src: &[u8],
+        frame: FrameData<'_>,
         data: &sys::mfxFrameData,
-        coded_width: usize,
-        coded_height: usize,
-    ) {
+        surface_width: usize,
+        surface_height: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<(), Error> {
+        let row_bytes = self.bytes_per_row(width).ok_or_else(|| {
+            Error::new_custom("Encoder::encode", "row bytes calculation overflowed")
+        })?;
         unsafe {
-            let pitch = data.__bindgen_anon_2.Pitch as usize;
-            match self {
-                FrameFormat::Nv12 => {
+            let dst_pitch = frame_data_pitch(data);
+            ensure_destination_surface_fits(
+                surface_width,
+                surface_height,
+                dst_pitch,
+                row_bytes,
+                width,
+                height,
+            )?;
+            match (self, frame) {
+                (
+                    FrameFormat::Nv12 | FrameFormat::P010,
+                    FrameData::SemiPlanar {
+                        y,
+                        y_pitch,
+                        uv,
+                        uv_pitch,
+                    },
+                ) => {
+                    validate_plane(y, y_pitch, height, row_bytes, "Y")?;
+                    validate_plane(uv, uv_pitch, height / 2, row_bytes, "UV")?;
                     let y_ptr = data.__bindgen_anon_3.Y;
                     let uv_ptr = data.__bindgen_anon_4.UV;
-                    let luma_size = coded_width * coded_height;
                     // Y プレーンをコピーする
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * coded_width),
-                            y_ptr.add(row * pitch),
-                            coded_width,
-                        );
-                    }
+                    copy_rows(y.as_ptr(), y_ptr, row_bytes, height, y_pitch, dst_pitch);
                     // UV プレーンをコピーする
-                    let uv_src = src.as_ptr().add(luma_size);
-                    let uv_height = coded_height / 2;
-                    for row in 0..uv_height {
-                        std::ptr::copy_nonoverlapping(
-                            uv_src.add(row * coded_width),
-                            uv_ptr.add(row * pitch),
-                            coded_width,
-                        );
-                    }
+                    copy_rows(
+                        uv.as_ptr(),
+                        uv_ptr,
+                        row_bytes,
+                        height / 2,
+                        uv_pitch,
+                        dst_pitch,
+                    );
                 }
-                FrameFormat::Yuy2 => {
+                (FrameFormat::Yuy2, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
                     let y_ptr = data.__bindgen_anon_3.Y;
-                    let row_bytes = coded_width * 2;
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * row_bytes),
-                            y_ptr.add(row * pitch),
-                            row_bytes,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), y_ptr, row_bytes, height, pitch, dst_pitch);
                 }
-                FrameFormat::Bgra => {
+                (FrameFormat::Bgra, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
                     let b_ptr = data.__bindgen_anon_5.B;
-                    let row_bytes = coded_width * 4;
-                    for row in 0..coded_height {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(row * row_bytes),
-                            b_ptr.add(row * pitch),
-                            row_bytes,
-                        );
-                    }
+                    copy_rows(src.as_ptr(), b_ptr, row_bytes, height, pitch, dst_pitch);
+                }
+                (FrameFormat::Ayuv, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
+                    // AYUV の各チャネルポインタは、パックされた 1 画素の各バイトを指す。
+                    // メモリ上のバイト順は V, U, Y, A なので、行の先頭は V になる。
+                    let v_ptr = data.__bindgen_anon_5.V;
+                    copy_rows(src.as_ptr(), v_ptr, row_bytes, height, pitch, dst_pitch);
+                }
+                (FrameFormat::Y410, FrameData::Packed { data: src, pitch }) => {
+                    validate_plane(src, pitch, height, row_bytes, "packed frame")?;
+                    let y410_ptr = data.__bindgen_anon_4.Y410 as *mut u8;
+                    copy_rows(src.as_ptr(), y410_ptr, row_bytes, height, pitch, dst_pitch);
+                }
+                (format, _) => {
+                    return Err(Error::new_custom_owned(
+                        "Encoder::encode",
+                        format!("frame data variant does not match frame format {format:?}"),
+                    ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// 指定幅のフレームの 1 行あたりの最小バイト数を返す
+    ///
+    /// オーバーフロー時は `None` を返す。
+    pub fn bytes_per_row(self, width: usize) -> Option<usize> {
+        match self {
+            // 8bit は 1 サンプル 1 バイト (Y プレーン、UV プレーンとも行あたりのバイト数は幅と同じ)
+            FrameFormat::Nv12 => Some(width),
+            // 1 画素あたり 2 バイト (P010 は 10bit サンプルを 16bit ワード、Yuy2 は 8bit サンプルをパック)
+            FrameFormat::P010 | FrameFormat::Yuy2 => width.checked_mul(2),
+            // 1 画素 4 バイト
+            FrameFormat::Bgra | FrameFormat::Ayuv | FrameFormat::Y410 => width.checked_mul(4),
+        }
+    }
+
+    /// `mfxFrameInfo.Shift` に設定する値を返す
+    ///
+    /// VPL の仕様では、10bit サンプルを 16bit ワードに格納する形式について、Shift が 0 の場合は
+    /// 有効データが下位 10bit に、0 以外の場合は上位 10bit にあることを表す。
+    /// 10bit サンプルを 16bit ワードの上位ビットに格納する P010 だけ 1 を返す。
+    /// 10bit サンプルが 10bit 幅のフィールドにそのまま入る Y410 と、8bit の各形式は 0 を返す。
+    ///
+    /// ref: libvpl api/vpl/mfxstructures.h (mfxFrameInfo::Shift)
+    pub(crate) fn frame_info_shift(self) -> u16 {
+        match self {
+            FrameFormat::P010 => 1,
+            FrameFormat::Nv12
+            | FrameFormat::Yuy2
+            | FrameFormat::Bgra
+            | FrameFormat::Ayuv
+            | FrameFormat::Y410 => 0,
+        }
+    }
+}
+
+/// コピー元の行を 1 行ずつコピー先のピッチに従ってコピーする
+///
+/// # Safety
+///
+/// `src` は `rows` 行分（最終行は `row_bytes` バイト）読み出せ、`dst` も同様に
+/// 書き込める必要がある。`rows` が 0 の場合はアクセスしない。
+unsafe fn copy_rows(
+    src: *const u8,
+    dst: *mut u8,
+    row_bytes: usize,
+    rows: usize,
+    src_pitch: usize,
+    dst_pitch: usize,
+) {
+    for row in 0..rows {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add(row * src_pitch),
+                dst.add(row * dst_pitch),
+                row_bytes,
+            );
         }
     }
 }
@@ -261,10 +248,12 @@ impl RateControlMode {
 
 /// エンコーダ設定
 ///
-/// VPL の mfxVideoParam / mfxInfoMFX / mfxFrameInfo に対応する。
+/// ほとんどのフィールドは VPL の mfxVideoParam / mfxInfoMFX / mfxFrameInfo に対応する。
 /// フィールド名は VPL API の構造体メンバ名に準拠する。
+///
+/// ただし `width` / `height` は coded サイズではなく表示サイズ（crop サイズ）を表す。
+/// coded サイズは [`Encoder::coded_size`] で取得する。
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct EncoderConfig {
     // --- アダプタ選択 ---
     /// 使用する Intel HW アダプタの指定（DRM render node 番号など）
@@ -275,11 +264,15 @@ pub struct EncoderConfig {
     pub codec: CodecConfig,
 
     // --- フレーム情報 (mfxFrameInfo) ---
-    /// フレーム幅（ピクセル、16 の倍数にアライメントされる）
+    /// 表示フレーム幅（ピクセル）
+    ///
+    /// この値は入力フレームフォーマットが NV12 / P010 / YUY2 の場合は偶数であること。
     pub width: u32,
-    /// フレーム高さ（ピクセル、16 の倍数にアライメントされる）
+    /// 表示フレーム高さ（ピクセル）
+    ///
+    /// この値は入力フレームフォーマットが NV12 / P010 の場合は偶数であること。
     pub height: u32,
-    /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth を決定する）
+    /// 入力フレームフォーマット（mfxFrameInfo.FourCC / ChromaFormat / BitDepth / Shift を決定する）
     pub frame_format: FrameFormat,
     /// フレームレートの分子（mfxFrameInfo.FrameRateExtN）
     pub framerate_num: u32,
@@ -347,7 +340,7 @@ pub struct EncoderConfig {
     pub initial_delay_in_kb: Option<u16>,
     /// ビットストリームバッファサイズ（KB 単位、mfxInfoMFX.BufferSizeInKB）
     ///
-    /// None の場合は width * height * 4 / 1024 に切り上げて自動計算する。
+    /// None の場合はエンコーダーが自動計算する。
     pub buffer_size_in_kb: Option<u16>,
     /// ターゲットビットレート（kbps、mfxInfoMFX.TargetKbps）
     ///
@@ -457,6 +450,279 @@ impl EncoderConfig {
     }
 }
 
+/// ExtParam として VPL に渡す拡張バッファの本体を所有する
+///
+/// [`ExtBuffers::ext_param`] が返すポインタは、この構造体が所有する `Box` の
+/// ヒープ領域を指す。`Box` のヒープアドレスはこの構造体の move では変わらないため、
+/// ポインタはこの構造体の生存期間中ずっと有効である。
+struct ExtBuffers {
+    /// mfxExtCodingOption2（LookAheadDepth 用）
+    ext_co2: Option<Box<sys::mfxExtCodingOption2>>,
+    /// mfxExtCodingOption3（QVBRQuality 用）
+    ext_co3: Option<Box<sys::mfxExtCodingOption3>>,
+    /// mfxExtVP9Param（WriteIVFHeaders 用）
+    ext_vp9: Option<Box<sys::mfxExtVP9Param>>,
+}
+
+/// mfxExtCodingOption2 を構築する
+///
+/// `Header` を設定し、`LookAheadDepth` に `look_ahead_depth` を設定する。
+///
+/// LA / LA_ICQ / LA_HRD モードでは LookAheadDepth で先読みフレーム数を指定する。
+/// ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption2::LookAheadDepth)
+fn coding_option2(look_ahead_depth: u16) -> Box<sys::mfxExtCodingOption2> {
+    let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+    co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
+    co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
+    co2.LookAheadDepth = look_ahead_depth;
+    Box::new(co2)
+}
+
+/// mfxExtCodingOption3 を構築する
+///
+/// `Header` を設定し、`QVBRQuality` に `qvbr_quality` を設定する。
+///
+/// QVBR モードでは QVBRQuality で品質値を指定する。
+/// ref: libvpl api/vpl/mfxstructures.h (mfxExtCodingOption3::QVBRQuality)
+fn coding_option3(qvbr_quality: u16) -> Box<sys::mfxExtCodingOption3> {
+    let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+    co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
+    co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
+    co3.QVBRQuality = qvbr_quality;
+    Box::new(co3)
+}
+
+/// mfxExtVP9Param を構築する
+///
+/// `Header` を設定し、`WriteIVFHeaders` に `write_ivf_headers` を設定する。
+///
+/// WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
+/// ref:
+/// - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
+/// - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
+fn vp9_param(write_ivf_headers: u16) -> Box<sys::mfxExtVP9Param> {
+    let mut param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
+    param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
+    param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
+    param.WriteIVFHeaders = write_ivf_headers;
+    Box::new(param)
+}
+
+impl ExtBuffers {
+    /// ExtParam として VPL に渡す拡張バッファ一式を構築する
+    ///
+    /// `look_ahead_depth` は mfxExtCodingOption2、`qvbr_quality` は mfxExtCodingOption3、
+    /// `write_ivf_headers` は mfxExtVP9Param として構築する。None の項目は構築しない。
+    fn new(
+        look_ahead_depth: Option<u16>,
+        qvbr_quality: Option<u16>,
+        write_ivf_headers: Option<bool>,
+    ) -> Self {
+        Self {
+            ext_co2: look_ahead_depth.map(coding_option2),
+            ext_co3: qvbr_quality.map(coding_option3),
+            ext_vp9: write_ivf_headers.map(|enabled| vp9_param(coding_option_value(enabled))),
+        }
+    }
+
+    /// 読み戻し用に、要求したものと同じ種類のバッファをゼロ初期化して構築する
+    ///
+    /// `Header` だけを設定し、値は 0 のままにする。要求値が入ったバッファを読み戻しに
+    /// 使うと、VPL が値を書き戻さなかった場合に要求値がそのまま残り、
+    /// 読み戻せたように見えてしまう。
+    fn zeroed_copy(&self) -> Self {
+        Self {
+            ext_co2: self.ext_co2.as_ref().map(|_| coding_option2(0)),
+            ext_co3: self.ext_co3.as_ref().map(|_| coding_option3(0)),
+            ext_vp9: self.ext_vp9.as_ref().map(|_| vp9_param(0)),
+        }
+    }
+
+    /// 読み戻した拡張バッファを VPL の構造体のまま取り出す
+    fn into_params(self) -> ExtParams {
+        ExtParams {
+            coding_option2: self.ext_co2.map(|buffer| *buffer),
+            coding_option3: self.ext_co3.map(|buffer| *buffer),
+            vp9_param: self.ext_vp9.map(|buffer| *buffer),
+        }
+    }
+
+    /// VPL に渡す ExtParam のポインタ配列を組み立てる
+    ///
+    /// 戻り値の `Vec` は VPL の呼び出しが終わるまで保持すること。
+    /// 空の場合は ExtParam を渡さない（拡張バッファを要求しない）ことを意味する。
+    fn ext_param(&mut self) -> Vec<*mut sys::mfxExtBuffer> {
+        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = Vec::new();
+        if let Some(co2) = self.ext_co2.as_deref_mut() {
+            ext_bufs.push(co2 as *mut sys::mfxExtCodingOption2 as *mut sys::mfxExtBuffer);
+        }
+        if let Some(co3) = self.ext_co3.as_deref_mut() {
+            ext_bufs.push(co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer);
+        }
+        if let Some(vp9) = self.ext_vp9.as_deref_mut() {
+            ext_bufs.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
+        }
+        ext_bufs
+    }
+}
+
+/// シーケンスパラメータの読み戻し用バッファの容量
+///
+/// VPL は `mfxExtCodingOptionSPSPPS` / `mfxExtCodingOptionVPS` のサイズフィールドを
+/// 書き込み先バッファの容量として扱う。パラメータセットが収まる十分な容量を確保する。
+const SEQUENCE_PARAM_BUFFER_SIZE: usize = 1024;
+
+/// シーケンスパラメータの読み戻し用バッファを所有する
+///
+/// `MFXVideoENCODE_GetVideoParam` に attach した `mfxExtCodingOptionSPSPPS` /
+/// `mfxExtCodingOptionVPS` のバッファポインタは、この構造体の生存期間中だけ有効である。
+// `Vec` のヒープアドレスは構造体の move では変わらないため、フィールドに保持した
+// ポインタは move 後も有効なままである。
+struct SequenceParamBuffers {
+    /// mfxExtCodingOptionSPSPPS（SPS / PPS の書き込み先を保持する）
+    spspps: Box<sys::mfxExtCodingOptionSPSPPS>,
+    /// mfxExtCodingOptionVPS（要求した場合のみ）
+    vps_ext: Option<Box<sys::mfxExtCodingOptionVPS>>,
+    /// SPS の書き込み先
+    sps: Vec<u8>,
+    /// PPS の書き込み先（要求しない場合は空）
+    pps: Vec<u8>,
+    /// VPS の書き込み先（要求しない場合は空）
+    vps: Vec<u8>,
+}
+
+impl SequenceParamBuffers {
+    /// 読み戻し用バッファ一式を構築する
+    ///
+    /// `with_vps` が true の場合は VPS 用バッファを、`with_pps` が true の場合は
+    /// PPS 用バッファを構築する。
+    fn new(with_vps: bool, with_pps: bool) -> Self {
+        let mut sps = vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE];
+        // PPS を要求しない場合は読み戻し用の領域を確保しない
+        let mut pps = if with_pps {
+            vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE]
+        } else {
+            Vec::new()
+        };
+        // VPS を要求しない場合は読み戻し用の領域を確保しない
+        let mut vps = if with_vps {
+            vec![0u8; SEQUENCE_PARAM_BUFFER_SIZE]
+        } else {
+            Vec::new()
+        };
+
+        let mut spspps: sys::mfxExtCodingOptionSPSPPS = unsafe { std::mem::zeroed() };
+        spspps.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION_SPSPPS;
+        spspps.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOptionSPSPPS>() as u32;
+        spspps.SPSBuffer = sps.as_mut_ptr();
+        spspps.SPSBufSize = SEQUENCE_PARAM_BUFFER_SIZE as u16;
+        if with_pps {
+            spspps.PPSBuffer = pps.as_mut_ptr();
+            spspps.PPSBufSize = SEQUENCE_PARAM_BUFFER_SIZE as u16;
+        }
+
+        let vps_ext = if with_vps {
+            let mut vps_ext: sys::mfxExtCodingOptionVPS = unsafe { std::mem::zeroed() };
+            vps_ext.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION_VPS;
+            vps_ext.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOptionVPS>() as u32;
+            vps_ext.__bindgen_anon_1.VPSBuffer = vps.as_mut_ptr();
+            vps_ext.VPSBufSize = SEQUENCE_PARAM_BUFFER_SIZE as u16;
+            Some(Box::new(vps_ext))
+        } else {
+            None
+        };
+
+        Self {
+            spspps: Box::new(spspps),
+            vps_ext,
+            sps,
+            pps,
+            vps,
+        }
+    }
+
+    /// VPL に渡す ExtParam のポインタ配列を組み立てる
+    ///
+    /// 戻り値の `Vec` は VPL の呼び出しが終わるまで保持すること。
+    fn ext_param(&mut self) -> Vec<*mut sys::mfxExtBuffer> {
+        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = vec![self.spspps.as_mut()
+            as *mut sys::mfxExtCodingOptionSPSPPS
+            as *mut sys::mfxExtBuffer];
+        if let Some(vps_ext) = self.vps_ext.as_deref_mut() {
+            ext_bufs.push(vps_ext as *mut sys::mfxExtCodingOptionVPS as *mut sys::mfxExtBuffer);
+        }
+        ext_bufs
+    }
+}
+
+/// `video_param` に ExtParam を設定する
+///
+/// 空の場合は設定しない（空 `Vec` の `as_mut_ptr()` は dangling ポインタを返すため）。
+fn attach_ext_param(video_param: &mut sys::mfxVideoParam, ext_bufs: &mut [*mut sys::mfxExtBuffer]) {
+    if ext_bufs.is_empty() {
+        return;
+    }
+    video_param.ExtParam = ext_bufs.as_mut_ptr();
+    video_param.NumExtParam = ext_bufs.len() as u16;
+}
+
+/// `video_param` の ExtParam をクリアする
+///
+/// `video_param.ExtParam` は VPL API 呼び出しの直前だけ設定し、呼び出し直後に
+/// 必ずこの関数でクリアする。
+fn clear_ext_param(video_param: &mut sys::mfxVideoParam) {
+    video_param.ExtParam = std::ptr::null_mut();
+    video_param.NumExtParam = 0;
+}
+
+/// 読み戻したバッファからパラメータセットを 1 つ取り出す
+///
+/// 先頭のスタートコード (`00 00 00 01` / `00 00 01`) を除去したバイト列を返す。
+/// VPL が報告したサイズが 0 の場合、確保したバッファの容量を超える場合、
+/// スタートコードを除いた結果が空になる場合は `Err` を返す。`function` は
+/// エラーに付ける呼び出し元の関数名である。
+fn read_sequence_param(
+    buffer: &[u8],
+    size: u16,
+    name: &str,
+    function: &'static str,
+) -> Result<Vec<u8>, Error> {
+    let size = usize::from(size);
+    if size == 0 {
+        return Err(Error::new_custom_owned(
+            function,
+            format!("{name} is not available"),
+        ));
+    }
+    let data = buffer.get(..size).ok_or_else(|| {
+        Error::new_custom_owned(
+            function,
+            format!(
+                "{name} size {size} exceeds the readback buffer size {}",
+                buffer.len()
+            ),
+        )
+    })?;
+    let data = strip_start_code(data);
+    if data.is_empty() {
+        return Err(Error::new_custom_owned(
+            function,
+            format!("{name} is empty after removing the start code"),
+        ));
+    }
+    Ok(data.to_vec())
+}
+
+/// NAL ユニット先頭のスタートコードを除去する
+///
+/// 先頭に 4 バイト (`00 00 00 01`) または 3 バイト (`00 00 01`) のスタートコードが
+/// 付いている場合は除去し、付いていない場合はそのまま返す。
+fn strip_start_code(data: &[u8]) -> &[u8] {
+    data.strip_prefix(&[0x00, 0x00, 0x00, 0x01])
+        .or_else(|| data.strip_prefix(&[0x00, 0x00, 0x01]))
+        .unwrap_or(data)
+}
+
 /// エンコーダ再構成パラメータ
 ///
 /// `Encoder::reconfigure` で動的に変更可能なパラメータ。
@@ -483,6 +749,76 @@ pub struct EncodeOptions {
     pub frame_type: u16,
 }
 
+/// コピー先サーフェスが、指定した表示サイズのフレームを書き込めることを確認する
+///
+/// `surface_width` / `surface_height` はコピー先サーフェスの実際のサイズ、
+/// `pitch` は実際の行ピッチ、`row_bytes` は 1 行あたりの必要バイト数、
+/// `width` / `height` は書き込む表示サイズである。
+///
+/// 幅・高さ・ピッチのいずれかが不足する場合は `Err` を返す。
+fn ensure_destination_surface_fits(
+    surface_width: usize,
+    surface_height: usize,
+    pitch: usize,
+    row_bytes: usize,
+    width: usize,
+    height: usize,
+) -> Result<(), Error> {
+    if surface_width < width || surface_height < height || pitch < row_bytes {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!(
+                "destination surface is too small: surface={surface_width}x{surface_height} pitch={pitch}, required={width}x{height} row_bytes={row_bytes}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// プレーンのデータ長が指定行数分あることを検証する
+fn validate_plane(
+    data: &[u8],
+    pitch: usize,
+    rows: usize,
+    row_bytes: usize,
+    name: &str,
+) -> Result<(), Error> {
+    if pitch < row_bytes {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!("{name} plane pitch ({pitch}) is less than bytes per row ({row_bytes})"),
+        ));
+    }
+    let required = plane_span(rows, pitch, row_bytes).ok_or_else(|| {
+        Error::new_custom_owned(
+            "Encoder::encode",
+            format!("{name} plane size calculation overflowed"),
+        )
+    })?;
+    if data.len() < required {
+        return Err(Error::new_custom_owned(
+            "Encoder::encode",
+            format!(
+                "{name} plane data is too small (got {}, need at least {required})",
+                data.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// プレーンが必要とするバイト数を返す
+///
+/// 最終行の後ろのパディングは含まない。
+fn plane_span(rows: usize, pitch: usize, row_bytes: usize) -> Option<usize> {
+    if rows == 0 {
+        return Some(0);
+    }
+    rows.checked_sub(1)?
+        .checked_mul(pitch)?
+        .checked_add(row_bytes)
+}
+
 /// ピクチャータイプ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PictureType {
@@ -498,15 +834,43 @@ pub enum PictureType {
     Unknown,
 }
 
-/// エンコード統計情報
-#[derive(Debug, Clone)]
+/// エンコーダーの統計値
+///
+/// [`Encoder::stats`] が返す統計値である。値はエンコード処理の進行に伴って
+/// 更新される。
+///
+/// `Clone` は各フィールドの現在値を個別にコピーするスナップショットを返すため、
+/// フィールド間の一貫性は保証されない。
+#[derive(Debug, Clone, Default)]
 pub struct EncoderStats {
-    /// エンコード済みフレーム数
-    pub num_frame: u32,
-    /// エンコード済みビット数
-    pub num_bit: u64,
-    /// キャッシュ済みフレーム数
-    pub num_cached_frame: u32,
+    /// [`Encoder::encode`] が VPL に受理させたフレームの通算回数
+    ///
+    /// フレームサイズの検証など、エンコード API に渡す前に拒否した呼び出しは計上しない。
+    pub total_encode_count: Counter,
+
+    /// [`EncodeHandler::on_encoded`] に `Ok` を渡した通算回数
+    pub total_output_frame_count: Counter,
+
+    /// [`EncodeHandler::on_encoded`] に `Err` を渡した通算回数
+    ///
+    /// [`Encoder::finish`] と [`Encoder::reconfigure`] が残留フレームを
+    /// エラー通知した場合も含む。
+    pub total_error_count: Counter,
+
+    /// [`Encoder::reconfigure`] が成功した通算回数
+    pub total_reconfigure_count: Counter,
+
+    /// [`EncodeHandler::on_encoded`] に渡した出力ビットストリームの総ビット数
+    pub total_output_bit_count: Counter,
+
+    /// 受理したが、まだ結果を通知していないフレーム数の現在値
+    ///
+    /// [`Encoder::encode`] がフレームを受理した時点で増え、対応する結果を
+    /// [`EncodeHandler::on_encoded`] に通知する直前に減る。[`Encoder::finish`] と
+    /// [`Encoder::reconfigure`] の処理が完了した時点で 0 になる。処理の途中で
+    /// エラーになった場合は残留することがある。`Drop` 時に中断したフレームを
+    /// 通知した場合も減る。
+    pub in_flight_frames: Gauge,
 }
 
 /// エンコード済みフレーム
@@ -547,6 +911,25 @@ impl<T> EncodedFrame<T> {
     pub fn into_user_data(self) -> T {
         self.user_data
     }
+}
+
+/// エンコーダが現在使用しているシーケンスパラメータ
+///
+/// スタートコードを含まない NAL / OBU の生バイト列を保持する。
+///
+/// コーデックごとの各フィールドの内容は次のとおり。
+///
+/// - H.264: SPS / PPS をそれぞれ `sps` / `pps` に設定する。`vps` は `None`
+/// - HEVC: VPS / SPS / PPS をそれぞれ `vps` / `sps` / `pps` に設定する。
+/// - AV1: Sequence Header OBU を `sps` に設定する。`vps` と `pps` は `None`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceParams {
+    /// VPS (HEVC のみ)
+    pub vps: Option<Vec<u8>>,
+    /// SPS (AV1 の場合は Sequence Header OBU)
+    pub sps: Vec<u8>,
+    /// PPS (AV1 では `None`)
+    pub pps: Option<Vec<u8>>,
 }
 
 /// デバイスビジー時の最大リトライ回数
@@ -618,7 +1001,11 @@ enum WorkerCommand<T> {
         pending_frame: PendingFrame<T>,
     },
     Sync(SyncData),
-    WaitIdle(mpsc::Sender<Result<(), Error>>),
+    WaitIdle {
+        reply_tx: mpsc::Sender<Result<(), Error>>,
+        /// pending が残留したときのエラーに付けるコンテキスト
+        function: &'static str,
+    },
     Stop,
 }
 
@@ -664,34 +1051,133 @@ where
     }
 }
 
+/// エンコーダが現在使用しているパラメータ
+///
+/// 基本パラメータは VPL の生の構造体、拡張バッファは VPL が書き戻した実効値を保持する。
+/// いずれも要求値ではなく、VPL が報告した値である。
+#[derive(Clone, Copy)]
+pub struct VideoParam {
+    /// 基本パラメータ
+    ///
+    /// `ExtParam` は常に null、`NumExtParam` は常に 0 である。
+    /// VPL の共用体メンバを読む場合は `unsafe` を伴う。
+    pub param: sys::mfxVideoParam,
+    /// 拡張バッファの実効値
+    pub ext: ExtParams,
+}
+
+/// エンコーダが現在使用している拡張バッファ
+///
+/// バッファを要求していない場合は `None` になる。要求した場合でも、VPL が値を
+/// 書き戻さなかった場合はゼロ初期化された値のままになる。
+#[derive(Clone, Copy)]
+pub struct ExtParams {
+    /// mfxExtCodingOption2（`LookAheadDepth`）
+    pub coding_option2: Option<sys::mfxExtCodingOption2>,
+    /// mfxExtCodingOption3（`QVBRQuality`）
+    pub coding_option3: Option<sys::mfxExtCodingOption3>,
+    /// mfxExtVP9Param（`WriteIVFHeaders`）
+    pub vp9_param: Option<sys::mfxExtVP9Param>,
+}
+
 /// エンコーダ
 pub struct Encoder<H: EncodeHandler> {
     session: Session,
     video_param: sys::mfxVideoParam,
     frame_info: sys::mfxFrameInfo,
+    /// エンコードするコーデック種別
+    codec: VideoCodecType,
     frame_format: FrameFormat,
+    /// 入力バッファの表示幅 (`EncoderConfig::width`)
+    width: usize,
+    /// 入力バッファの表示高さ (`EncoderConfig::height`)
+    height: usize,
     write_ivf_headers: bool,
     bitstream_buffer_size: usize,
+    /// Init / Reset で VPL へ渡す拡張バッファの本体
+    ext_buffers: ExtBuffers,
     worker_tx: mpsc::Sender<WorkerCommand<H::UserData>>,
     worker_handle: Option<thread::JoinHandle<()>>,
     frame_count: u64,
     framerate_den: u64,
+    /// ワーカースレッドと共有する統計値
+    stats: Arc<EncoderStats>,
 }
 
 // Safety: エンコード完了通知は専用スレッドで行い、メインスレッドは EncodeFrameAsync のみ実行する。
 // VPL 仕様上、セッション操作の同一スレッド制約は明記されておらず、公式サンプルでも
 // セッションハンドルにスレッドアフィニティの制約は課されていない。
+// また ext_buffers が保持する mfxExtCodingOption2 / mfxExtCodingOption3 / mfxExtVP9Param は
+// 生ポインタを含まない全整数フィールドの POD であり、Box<...> は自動で Send になる。
+// video_param.ExtParam は VPL API 呼び出しの直前だけ設定し、呼び出し直後に必ず null に
+// 戻すため、Encoder をスレッド間で move しても無効なポインタが残ることはない。
 // Sync は実装しない（生ポインタにより自動的に !Sync）。
 unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 impl<H: EncodeHandler> Encoder<H> {
+    /// テスト用に VPL セッションを返す
+    ///
+    /// `MFXMemory_GetSurfaceForEncode` はエンコーダー初期化後のセッションでのみ
+    /// サーフェスを返すため、`FrameSurface` のテストはこのセッションを使う。
+    #[cfg(test)]
+    pub(crate) fn session_for_test(&self) -> &Session {
+        &self.session
+    }
+
     /// エンコーダを作成する
+    ///
+    /// # 入力フォーマットとプロファイル
+    ///
+    /// 入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存する。
+    /// 初期化に失敗した場合、[`Error::function`] は `MFXVideoENCODE_Init` になる。
+    /// また、初期化に成功しても、エンコードに失敗する組み合わせがある。
+    ///
+    /// 事前に対応を判定する場合は [`crate::supported_codecs`] が返す
+    /// [`crate::EncodingInfo::profiles`] の
+    /// [`crate::MemoryTypeCapabilities::color_formats`] を参照する。
+    /// ただし、ケーパビリティ照会の結果は初期化やエンコードの成功を保証しない。
+    ///
+    /// # エラー
+    ///
+    /// 以下の場合はエラーを返す。
+    ///
+    /// - `width` / `height` が 0
+    /// - `framerate_den` が 0
+    /// - 16 の倍数に切り上げた幅または高さが `u16::MAX` を超える
+    /// - 入力フォーマットが NV12 / P010 であり、`width` または `height` が奇数
+    /// - 入力フォーマットが YUY2 であり、`width` が奇数
+    /// - VPL の関数がエラーを返す
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         // 寸法を u16 へ変換する前に範囲を検証する
         if config.width == 0 || config.height == 0 {
             return Err(Error::new_custom(
                 "Encoder::new",
                 "width and height must be non-zero",
+            ));
+        }
+        // 4:2:0 は幅と高さ、4:2:2 は幅が偶数でなければならない
+        if matches!(
+            config.frame_format,
+            FrameFormat::Nv12 | FrameFormat::P010 | FrameFormat::Yuy2
+        ) && !config.width.is_multiple_of(2)
+        {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "{:?} requires an even width (got {})",
+                    config.frame_format, config.width
+                ),
+            ));
+        }
+        if matches!(config.frame_format, FrameFormat::Nv12 | FrameFormat::P010)
+            && !config.height.is_multiple_of(2)
+        {
+            return Err(Error::new_custom_owned(
+                "Encoder::new",
+                format!(
+                    "{:?} requires an even height (got {})",
+                    config.frame_format, config.height
+                ),
             ));
         }
         if config.framerate_den == 0 {
@@ -711,22 +1197,6 @@ impl<H: EncodeHandler> Encoder<H> {
                 ),
             ));
         }
-        // pitch（行あたりのバイト数）が u16 に収まるか検証する
-        // NV12: width, YUY2: width * 2, BGRA: width * 4
-        let pitch_bytes: u64 = match config.frame_format {
-            FrameFormat::Nv12 => aligned_width as u64,
-            FrameFormat::Yuy2 => aligned_width as u64 * 2,
-            FrameFormat::Bgra => aligned_width as u64 * 4,
-        };
-        if pitch_bytes > u16::MAX as u64 {
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "pitch ({pitch_bytes} bytes) for {:?} with width {} exceeds u16::MAX",
-                    config.frame_format, aligned_width
-                ),
-            ));
-        }
 
         let lib = VplLibrary::load()?;
 
@@ -741,11 +1211,13 @@ impl<H: EncodeHandler> Encoder<H> {
         frame_info.ChromaFormat = config.frame_format.chroma_format();
         frame_info.BitDepthLuma = config.frame_format.bit_depth();
         frame_info.BitDepthChroma = config.frame_format.bit_depth();
+        frame_info.Shift = config.frame_format.frame_info_shift();
         frame_info.PicStruct = sys::MFX_PICSTRUCT_PROGRESSIVE as u16;
         frame_info.FrameRateExtN = config.framerate_num;
         frame_info.FrameRateExtD = config.framerate_den;
         frame_info.AspectRatioW = config.aspect_ratio_w.unwrap_or(0);
         frame_info.AspectRatioH = config.aspect_ratio_h.unwrap_or(0);
+        // 内部サーフェスの Width/Height は 16 の倍数に切り上げ、CropW/CropH は表示サイズにする
         {
             let fi = unsafe { &mut frame_info.__bindgen_anon_1.__bindgen_anon_1 };
             fi.Width = aligned_width as u16;
@@ -756,8 +1228,10 @@ impl<H: EncodeHandler> Encoder<H> {
 
         let gop_ref_dist = config.gop_ref_dist.unwrap_or(1);
         let gop_pic_size = config.gop_pic_size.unwrap_or(0);
+        let codec = codec_type(&config.codec);
 
-        // ビットストリームバッファサイズ（指定がなければ 4 バイト/ピクセルで自動計算する）
+        // 未指定時は 16 の倍数に切り上げた幅 x 高さの画素数に 4 バイトを掛け、
+        // 1024 バイト単位に切り上げて KB 単位で設定する
         let pixel_count = aligned_width as u64 * aligned_height as u64;
         let auto_buffer_bytes = pixel_count.saturating_mul(4);
         let auto_buffer_kb = align_up(auto_buffer_bytes.min(u32::MAX as u64) as u32, 1024) / 1024;
@@ -777,7 +1251,7 @@ impl<H: EncodeHandler> Encoder<H> {
         unsafe {
             let mfx = &mut video_param.__bindgen_anon_1.mfx;
             mfx.FrameInfo = frame_info;
-            mfx.CodecId = codec_id(&config.codec);
+            mfx.CodecId = codec.to_codec_id();
             mfx.CodecProfile = codec_profile(&config.codec);
 
             // LowPower (VDENC) モード
@@ -878,147 +1352,49 @@ impl<H: EncodeHandler> Encoder<H> {
         }
 
         // 拡張バッファの設定
-        let mut ext_co2: Option<sys::mfxExtCodingOption2> = None;
-        let mut ext_co3: Option<sys::mfxExtCodingOption3> = None;
-        let mut ext_vp9: Option<sys::mfxExtVP9Param> = None;
-
-        // VP9 の場合、IVF ヘッダー出力の要求値 (write_ivf_headers) を MFX_CODINGOPTION_* の値へ変換して
-        // mfxExtVP9Param を構築する。非 VP9 コーデックでは write_ivf_headers は false 固定とし、
-        // ext_vp9 は構築しない。
         //
-        // WriteIVFHeaders は CodingOptionValue (MFX_CODINGOPTION_ON/OFF) で指定する。
-        // ref:
-        // - libvpl api/vpl/mfxstructures.h (mfxExtVP9Param::WriteIVFHeaders)
-        // - libvpl api/vpl/mfxstructures.h (CodingOptionValue)
-        let write_ivf_headers_value: Option<u16> = match &config.codec {
-            CodecConfig::Vp9(vp9) => {
-                let value = if vp9.write_ivf_headers {
-                    sys::MFX_CODINGOPTION_ON as u16
-                } else {
-                    sys::MFX_CODINGOPTION_OFF as u16
-                };
-                let mut vp9_param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
-                vp9_param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
-                vp9_param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
-                vp9_param.WriteIVFHeaders = value;
-                ext_vp9 = Some(vp9_param);
-                Some(value)
-            }
-            _ => None,
-        };
+        // reconfigure (MFXVideoENCODE_Reset) でも Init 時と同じ拡張バッファを渡すため、
+        // Box に包んだバッファを構築して Encoder に保持する。
+        let write_ivf_headers_setting = vp9_write_ivf_headers(&config.codec);
+        let mut ext_buffers = ExtBuffers::new(
+            config.look_ahead_depth,
+            config.qvbr_quality,
+            write_ivf_headers_setting,
+        );
+
         // getter が返す bool は要求値が ON かどうかで決まる
-        let write_ivf_headers = write_ivf_headers_value == Some(sys::MFX_CODINGOPTION_ON as u16);
+        let write_ivf_headers = write_ivf_headers_setting.unwrap_or(false);
 
-        // Look Ahead depth の設定 (mfxExtCodingOption2)
-        let needs_co2 = config.look_ahead_depth.is_some();
-        if needs_co2 {
-            let mut co2: sys::mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
-            co2.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION2;
-            co2.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption2>() as u32;
-            if let Some(depth) = config.look_ahead_depth {
-                co2.LookAheadDepth = depth;
-            }
-            ext_co2 = Some(co2);
-        }
-
-        // QVBR Quality の設定 (mfxExtCodingOption3)
-        let needs_co3 = config.qvbr_quality.is_some();
-        if needs_co3 {
-            let mut co3: sys::mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
-            co3.Header.BufferId = sys::MFX_EXTBUFF_CODING_OPTION3;
-            co3.Header.BufferSz = std::mem::size_of::<sys::mfxExtCodingOption3>() as u32;
-            if let Some(quality) = config.qvbr_quality {
-                co3.QVBRQuality = quality;
-            }
-            ext_co3 = Some(co3);
-        }
-
-        // 拡張バッファポインタ配列を構築する
-        let mut ext_bufs: Vec<*mut sys::mfxExtBuffer> = Vec::new();
-        if let Some(ref mut co2) = ext_co2 {
-            ext_bufs.push(co2 as *mut sys::mfxExtCodingOption2 as *mut sys::mfxExtBuffer);
-        }
-        if let Some(ref mut co3) = ext_co3 {
-            ext_bufs.push(co3 as *mut sys::mfxExtCodingOption3 as *mut sys::mfxExtBuffer);
-        }
-        if let Some(ref mut vp9) = ext_vp9 {
-            ext_bufs.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
-        }
-        if !ext_bufs.is_empty() {
-            video_param.ExtParam = ext_bufs.as_mut_ptr();
-            video_param.NumExtParam = ext_bufs.len() as u16;
-        }
+        // Init 用の拡張バッファポインタ配列を構築する
+        let mut init_ext_bufs = ext_buffers.ext_param();
+        attach_ext_param(&mut video_param, &mut init_ext_bufs);
 
         lib.mfx_video_encode_init(session.as_ptr(), &mut video_param)?;
 
         let lib = session.lib();
         let session_ptr = session.as_ptr();
 
-        // Init 後に ExtParam ポインタをクリアする（ローカルの ext_bufs が drop されるため）
-        video_param.ExtParam = std::ptr::null_mut();
-        video_param.NumExtParam = 0;
+        // Init の呼び出しが終わったので ExtParam をクリアする
+        clear_ext_param(&mut video_param);
 
-        // 初期化後に実効パラメータを読み戻す。
-        // VP9 の場合、write_ivf_headers の要求値が oneVPL に尊重されるかを検証するため、
-        // 読み戻し専用の mfxExtVP9Param を attach して GetVideoParam を呼ぶ。
-        //
-        // GetVideoParam は mfxVideoParam に attach した拡張バッファへ実効値を書き戻す。
-        // 読み戻し用バッファの WriteIVFHeaders は zeroed 初期化により UNKNOWN (0) のままにしておき、
-        // 書き戻されなかった場合に下の一致検証で必ず検出できるようにする。
-        // ref:
-        // - libvpl api/vpl/mfxvideo.h (MFXVideoENCODE_GetVideoParam の拡張バッファ説明)
-        let mut ext_vp9_readback: Option<sys::mfxExtVP9Param> = None;
-        if matches!(&config.codec, CodecConfig::Vp9(_)) {
-            let mut vp9_param: sys::mfxExtVP9Param = unsafe { std::mem::zeroed() };
-            vp9_param.Header.BufferId = sys::MFX_EXTBUFF_VP9_PARAM;
-            vp9_param.Header.BufferSz = std::mem::size_of::<sys::mfxExtVP9Param>() as u32;
-            ext_vp9_readback = Some(vp9_param);
-        }
-
-        // 読み戻し用の拡張バッファポインタ配列を構築する
-        let mut ext_bufs_readback: Vec<*mut sys::mfxExtBuffer> = Vec::new();
-        if let Some(ref mut vp9) = ext_vp9_readback {
-            ext_bufs_readback.push(vp9 as *mut sys::mfxExtVP9Param as *mut sys::mfxExtBuffer);
-        }
-        if !ext_bufs_readback.is_empty() {
-            video_param.ExtParam = ext_bufs_readback.as_mut_ptr();
-            video_param.NumExtParam = ext_bufs_readback.len() as u16;
-        }
-
+        // 初期化後の実効 FrameInfo を読み戻す。
+        // 内部サーフェスのサイズは VPL が決めるため、その値を coded_size として保持する。
         lib.mfx_video_encode_get_video_param(session_ptr, &mut video_param)
             .inspect_err(|_| {
                 // GetVideoParam 失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
                 let _ = lib.mfx_video_encode_close(session_ptr);
             })?;
-        video_param.ExtParam = std::ptr::null_mut();
-        video_param.NumExtParam = 0;
         frame_info = unsafe { video_param.__bindgen_anon_1.mfx.FrameInfo };
-
-        // VP9 の場合、WriteIVFHeaders の実効値が要求値と完全一致することを検証する。
-        // 一致しない場合（UNKNOWN を含む）は oneVPL が要求を尊重しなかったことを意味するため、
-        // エンコーダをクローズしてエラーを返す。
-        if let Some(expected) = write_ivf_headers_value
-            && let Some(vp9) = ext_vp9_readback
-            && vp9.WriteIVFHeaders != expected
-        {
-            let _ = lib.mfx_video_encode_close(session_ptr);
-            return Err(Error::new_custom_owned(
-                "Encoder::new",
-                format!(
-                    "VP9 WriteIVFHeaders mismatch: requested {} but got {}",
-                    coding_option_name(expected),
-                    coding_option_name(vp9.WriteIVFHeaders),
-                ),
-            ));
-        }
 
         let bitstream_buffer_size = (buffer_size_in_kb as usize) * 1024;
         let (worker_tx, worker_rx) = mpsc::channel();
         let session_handle = session_ptr as usize;
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker_handle = thread::Builder::new()
             .name("vpl-encoder-sync".to_owned())
             .spawn(move || {
-                run_sync_worker(lib, session_handle, worker_rx, handler);
+                run_sync_worker(lib, session_handle, worker_rx, handler, worker_stats);
             })
             .map_err(|error| {
                 // スレッド生成失敗時は MFXVideoENCODE_Close を呼んでから session を Drop させる
@@ -1034,13 +1410,18 @@ impl<H: EncodeHandler> Encoder<H> {
             session,
             video_param,
             frame_info,
+            codec,
             frame_format: config.frame_format,
+            width: config.width as usize,
+            height: config.height as usize,
             write_ivf_headers,
             bitstream_buffer_size,
+            ext_buffers,
             worker_tx,
             worker_handle: Some(worker_handle),
             frame_count: 0,
             framerate_den: config.framerate_den as u64,
+            stats,
         })
     }
 
@@ -1069,7 +1450,19 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// エンコーダパラメータを動的に変更する
     ///
-    /// MFXVideoENCODE_Reset を呼び出す。ビットレートやフレームレートの変更に使用する。
+    /// ビットレートやフレームレートの変更に使用する。
+    ///
+    /// この関数が `Ok` を返した場合、呼び出し時点で未出力だったフレームは、その時点で
+    /// すべて `Ok` として [`EncodeHandler::on_encoded`] に通知されている。`Err` を
+    /// 返した場合は、未出力フレームの一部が `Err` として通知されるか、通知されないまま
+    /// 残ることがある。
+    ///
+    /// - frame_seq は reconfigure 後も継続し、リセットされない
+    /// - この関数は、呼び出し時点までに送信したフレームのエンコード完了と、
+    ///   すべてのコールバックの完了までブロックする
+    /// - パラメータの検証に失敗した場合を除き、`Err` を返したときはエンコーダが
+    ///   使用できない状態のまま残ることがあるため、呼び出し側は [`Encoder`] を
+    ///   作り直すこと
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         if let Some(0) = params.framerate_den {
             return Err(Error::new_custom(
@@ -1078,7 +1471,19 @@ impl<H: EncodeHandler> Encoder<H> {
             ));
         }
 
-        // 現在の video_param をベースに変更を適用する
+        // Reset は VPL 内部の未出力フレームを破棄する場合がある。
+        // ref:
+        // - doc/spec/source/programming_guide/VPL_prg_encoding.rst (Configuration Change)
+        // pending に対応する出力を失わないよう、Reset より前に NULL 入力で
+        // cached frame をすべて回収する。
+        //
+        // worker はコマンドを FIFO で処理するため、この待機は先行する QueueFrame と
+        // Sync の処理完了も意味する。
+        self.drain_cached_frames("Encoder::reconfigure")?;
+
+        // 現在の video_param をベースに変更を適用する。drain より後に適用するのは、
+        // drain が Err を返したときに Rust 側のパラメータだけが更新された状態を
+        // 残さないため。
         unsafe {
             let enc = &mut self
                 .video_param
@@ -1103,29 +1508,140 @@ impl<H: EncodeHandler> Encoder<H> {
             }
         }
 
-        self.session
+        // Init 時に設定した拡張バッファを Reset にも渡す。
+        //
+        // Reset で attach されなかった拡張バッファの扱いはバッファ種別と実装に依存するため、
+        // Init 時の設定を確実に再要求するには Init と同じ ExtParam を渡す必要がある。
+        //
+        // ExtParam の設定は drain の完了後に行う。drain のエラーで早期リターンしたときに、
+        // ExtParam が設定されたまま残らないようにするため。
+        let mut ext_bufs = self.ext_buffers.ext_param();
+        attach_ext_param(&mut self.video_param, &mut ext_bufs);
+
+        let result = self
+            .session
             .lib()
-            .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param)
+            .mfx_video_encode_reset(self.session.as_ptr(), &mut self.video_param);
+
+        // Reset の成否にかかわらず ExtParam をクリアする
+        clear_ext_param(&mut self.video_param);
+
+        // 成功した Reset だけを reconfigure の回数として計上する
+        if result.is_ok() {
+            self.stats.total_reconfigure_count.inc();
+        }
+        result
     }
 
-    /// Init 後の実効パラメータを取得する
+    /// 現在の作業パラメータを読み戻す
     ///
-    /// MFXVideoENCODE_GetVideoParam を呼び出す。
-    /// エンコーダが実際に使用しているパラメータを確認するために使用する。
-    ///
-    /// 戻り値の [`ffi::mfxVideoParam`](crate::ffi::mfxVideoParam) は bindgen 生成の型で、
-    /// VPL API の構造体に直接対応する。
-    pub fn get_video_param(&self) -> Result<sys::mfxVideoParam, Error> {
+    /// `ext_bufs` は VPL に attach する拡張バッファのポインタ配列である。
+    /// VPL の呼び出し後に `mfxVideoParam` の ExtParam をクリアして返す。
+    fn read_video_param(
+        &self,
+        ext_bufs: &mut [*mut sys::mfxExtBuffer],
+    ) -> Result<sys::mfxVideoParam, Error> {
         let mut param: sys::mfxVideoParam = unsafe { std::mem::zeroed() };
-        // 現在のパラメータをコピーしてから GetVideoParam で上書きする
         param.IOPattern = self.video_param.IOPattern;
-        self.session
+
+        attach_ext_param(&mut param, ext_bufs);
+        let result = self
+            .session
             .lib()
-            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param)?;
+            .mfx_video_encode_get_video_param(self.session.as_ptr(), &mut param);
+
+        // 成功・失敗にかかわらず、拡張バッファのポインタを残さない
+        clear_ext_param(&mut param);
+        result?;
+
         Ok(param)
     }
 
-    /// エンコーダが要求する coded フレームサイズ（`FrameInfo::Width/Height`）を取得する
+    /// エンコーダが現在使用しているパラメータを取得する
+    ///
+    /// 基本パラメータと、要求した拡張バッファの実効値を返す。拡張バッファの値は
+    /// VPL が報告した値であり、要求値と一致するとは限らない。
+    ///
+    /// 拡張バッファを要求していない場合、対応する [`ExtParams`] のフィールドは
+    /// `None` になる。
+    pub fn get_video_param(&self) -> Result<VideoParam, Error> {
+        // 読み戻し用のバッファは毎回新しく構築する。
+        // 保持している要求値のバッファを読み戻し先に使うと、要求値が実効値で
+        // 上書きされ、以降の Reset が要求値ではなくなる。
+        let mut readback = self.ext_buffers.zeroed_copy();
+        let mut ext_bufs = readback.ext_param();
+        let param = self.read_video_param(&mut ext_bufs)?;
+
+        Ok(VideoParam {
+            param,
+            ext: readback.into_params(),
+        })
+    }
+
+    /// 現在の作業パラメータセット (SPS / PPS / VPS) を取得する
+    ///
+    /// H.264 / HEVC / AV1 以外のコーデックはパラメータセットを持たないため `Ok(None)` を返す。
+    ///
+    /// 返るのは現在の作業パラメータセットであり、次にエンコードするフレームに
+    /// 適用される。エンコード済みで出力待ちのフレームに適用されたものではない。
+    /// パラメータセットの内容が変わるのは [`Encoder::new`] と
+    /// [`Encoder::reconfigure`] だけで、[`Encoder::encode`] では変わらない。
+    /// [`EncodeOptions::frame_type`] で IDR を強制しても、その時点の
+    /// パラメータセットが挿入されるだけで内容は変わらない。
+    ///
+    /// # 呼び出しスレッド
+    ///
+    /// [`Encoder::encode`] と同じスレッドで、[`Encoder::encode`] と直列になるように
+    /// 呼ぶこと。コールバック ([`EncodeHandler::on_encoded`]) から呼び出してはならない。
+    ///
+    /// # エラー
+    ///
+    /// パラメータセットを取得できなかった場合に `Err` を返す。VPL からの読み戻しに
+    /// 失敗した場合のほか、SPS、H.264 / HEVC の PPS、HEVC の VPS のサイズが 0 の
+    /// 場合も `Err` になる。
+    pub fn get_sequence_params(&self) -> Result<Option<SequenceParams>, Error> {
+        // コーデックごとに取得するパラメータセットを明示する
+        // タプルは左から (VPS を取得するか, PPS を取得するか) を表す
+        // H.264 / AV1 に mfxExtCodingOptionVPS を attach すると
+        // MFXVideoENCODE_GetVideoParam が MFX_ERR_UNSUPPORTED を返すため、
+        // VPS は HEVC の場合だけ要求する
+        let (with_vps, with_pps) = match self.codec {
+            VideoCodecType::H264 => (false, true),
+            VideoCodecType::Hevc => (true, true),
+            // VP9 は SPS / PPS / VPS に相当するパラメータセットを持たない
+            VideoCodecType::Vp9 => return Ok(None),
+            // AV1 の Sequence Header OBU は PPS を持たない
+            VideoCodecType::Av1 => (false, false),
+        };
+
+        let mut buffers = SequenceParamBuffers::new(with_vps, with_pps);
+        let mut ext_bufs = buffers.ext_param();
+        self.read_video_param(&mut ext_bufs)?;
+
+        let function = "Encoder::get_sequence_params";
+        let sps = read_sequence_param(&buffers.sps, buffers.spspps.SPSBufSize, "SPS", function)?;
+
+        let pps = if with_pps {
+            Some(read_sequence_param(
+                &buffers.pps,
+                buffers.spspps.PPSBufSize,
+                "PPS",
+                function,
+            )?)
+        } else {
+            None
+        };
+
+        let vps = buffers
+            .vps_ext
+            .as_ref()
+            .map(|vps_ext| read_sequence_param(&buffers.vps, vps_ext.VPSBufSize, "VPS", function))
+            .transpose()?;
+
+        Ok(Some(SequenceParams { vps, sps, pps }))
+    }
+
+    /// 内部サーフェスのサイズを返す
     pub fn coded_size(&self) -> (usize, usize) {
         let fi = unsafe { self.frame_info.__bindgen_anon_1.__bindgen_anon_1 };
         (usize::from(fi.Width), usize::from(fi.Height))
@@ -1133,58 +1649,33 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// IVF ヘッダーを出力する設定かどうかを返す
     ///
-    /// `Vp9EncoderConfig::write_ivf_headers` で指定した値（oneVPL へ要求し、初期化時に実効値との一致を検証済みの値）を返す。
+    /// `Vp9EncoderConfig::write_ivf_headers` で指定した値を返す。
     /// 非 VP9 コーデックでは常に `false` を返す。
-    ///
-    /// 実効値の一致検証は GetVideoParam が拡張バッファへ実効値を書き戻す挙動に依存している。
-    /// この挙動は libvpl の実装由来で、将来のバージョンで変更される可能性がある。
     pub fn write_ivf_headers(&self) -> bool {
         self.write_ivf_headers
     }
 
-    /// エンコード統計情報を取得する
-    pub fn get_encode_stat(&self) -> Result<EncoderStats, Error> {
-        let mut stat: sys::mfxEncodeStat = unsafe { std::mem::zeroed() };
-        self.session
-            .lib()
-            .mfx_video_encode_get_encode_stat(self.session.as_ptr(), &mut stat)?;
-        Ok(EncoderStats {
-            num_frame: stat.NumFrame,
-            num_bit: stat.NumBit,
-            num_cached_frame: stat.NumCachedFrame,
-        })
+    /// エンコーダーの統計値を取得する
+    pub fn stats(&self) -> &EncoderStats {
+        &self.stats
     }
 
     /// フレームをエンコードする
+    ///
+    /// `frame` は [`EncoderConfig::frame_format`] に対応する [`FrameData`] であること。
+    /// 各プレーンの `pitch` とデータ長は [`FrameData`] の契約を満たすこと。
+    ///
+    /// # エラー
+    ///
+    /// 入力フォーマットと frame の variant の不一致、`pitch` 不足、データ長不足の場合はエラーになる。
     pub fn encode(
         &mut self,
-        frame_data: &[u8],
+        frame: FrameData<'_>,
         user_data: H::UserData,
         options: &EncodeOptions,
     ) -> Result<(), Error> {
-        // フレームサイズを検証する
-        let (coded_width, coded_height) = self.coded_size();
-        let expected = self
-            .frame_format
-            .frame_size(coded_width, coded_height)
-            .ok_or_else(|| {
-                Error::new_custom("Encoder::encode", "frame size calculation overflowed")
-            })?;
-        if frame_data.len() < expected {
-            return Err(Error::new_custom_owned(
-                "Encoder::encode",
-                format!(
-                    "frame data is too small for coded size {}x{} (got {}, need at least {})",
-                    coded_width,
-                    coded_height,
-                    frame_data.len(),
-                    expected
-                ),
-            ));
-        }
-
         let frame_seq = self.frame_count;
-        // 公開 API 向けのタイムスタンプは従来どおり frame_rate 由来で計算する。
+        // 公開 API 向けのタイムスタンプは frame_rate 由来で計算する。
         let presentation_timestamp = frame_seq
             .checked_mul(self.framerate_den)
             .ok_or_else(|| Error::new_custom("Encoder::encode", "timestamp overflowed"))?;
@@ -1203,15 +1694,22 @@ impl<H: EncodeHandler> Encoder<H> {
         // Map して CPU から書き込めるようにする
         frame_surface.map_write()?;
 
-        // フレームデータを内部サーフェスにコピーする
+        // フレームデータを検証して内部サーフェスにコピーする
         unsafe {
-            (*frame_surface.as_ptr()).Data.TimeStamp = frame_seq;
+            let surface_ptr = frame_surface.as_ptr();
+            (*surface_ptr).Data.TimeStamp = frame_seq;
+            let (surface_width, surface_height) = {
+                let fi = &(*surface_ptr).Info.__bindgen_anon_1.__bindgen_anon_1;
+                (usize::from(fi.Width), usize::from(fi.Height))
+            };
             self.frame_format.copy_to_surface_planes(
-                &frame_data[..expected],
-                &(*frame_surface.as_ptr()).Data,
-                coded_width,
-                coded_height,
-            );
+                frame,
+                &(*surface_ptr).Data,
+                surface_width,
+                surface_height,
+                self.width,
+                self.height,
+            )?;
         }
 
         // Unmap して書き込み完了を通知する
@@ -1229,8 +1727,14 @@ impl<H: EncodeHandler> Encoder<H> {
         let (mut bitstream, bitstream_buffer) = self.create_bitstream();
         let syncp = self.encode_frame_async(ctrl_ptr, Some(&frame_surface), bitstream.as_mut())?;
 
+        // VPL が受理した時点で通算回数を計上する
+        self.stats.total_encode_count.inc();
+
         // syncp が None の入力でも、後続出力との対応付けのため pending は必ず登録する。
-        self.send_worker_command(
+        // pending の登録と in-flight の加算を同じタイミングで行い、
+        // ワーカーが対応する結果を通知する直前に減算する。
+        self.stats.in_flight_frames.inc();
+        if let Err(error) = self.send_worker_command(
             "Encoder::encode",
             WorkerCommand::QueueFrame {
                 frame_seq,
@@ -1239,7 +1743,11 @@ impl<H: EncodeHandler> Encoder<H> {
                     user_data,
                 },
             },
-        )?;
+        ) {
+            // pending を登録できなかったため、加算した in-flight を戻す
+            self.stats.in_flight_frames.dec();
+            return Err(error);
+        }
 
         if let Some(syncp) = syncp {
             self.send_worker_command(
@@ -1296,24 +1804,32 @@ impl<H: EncodeHandler> Encoder<H> {
         ))
     }
 
-    /// エンコーダをフラッシュして残りのフレームを取得する
+    /// 保留しているフレームをすべて回収する
     ///
-    /// この関数は全てのエンコードの完了を待ち、内部で保持している
-    /// フレームをすべて排出してコールバックを呼び出し終わるまでブロックする。
-    pub fn finish(&mut self) -> Result<(), Error> {
+    /// 送信済みのフレームの出力がすべて揃い、それらのコールバックの処理が終わるまで待つ。
+    fn drain_cached_frames(&mut self, function: &'static str) -> Result<(), Error> {
         loop {
             // null surface でエンコードを呼び出して、残りのフレームをすべて排出する
             let (mut bitstream, bitstream_buffer) = self.create_bitstream();
 
-            let Some(syncp) =
-                self.encode_frame_async(std::ptr::null_mut(), None, bitstream.as_mut())?
+            let Some(syncp) = self
+                .encode_frame_async(std::ptr::null_mut(), None, bitstream.as_mut())
+                .map_err(|error| {
+                    // drain の失敗を呼び出し元の操作のコンテキスト付きで返す。
+                    // 元のメッセージは保持したまま前置きする。
+                    let message = match error.status_message() {
+                        Some(message) => format!("{function}: {message}"),
+                        None => format!("{function}: failed to retrieve a cached frame"),
+                    };
+                    error.with_message(message)
+                })?
             else {
                 // すべて排出済み
                 break;
             };
 
             self.send_worker_command(
-                "Encoder::finish",
+                function,
                 WorkerCommand::Sync(SyncData {
                     syncp,
                     bitstream,
@@ -1324,10 +1840,23 @@ impl<H: EncodeHandler> Encoder<H> {
 
         // ここまでに送った Sync が worker 側で全て処理されるまで待つ。
         let (tx, rx) = mpsc::channel();
-        self.send_worker_command("Encoder::finish", WorkerCommand::WaitIdle(tx))?;
-        rx.recv().map_err(|_| {
-            Error::new_custom("Encoder::finish", "sync worker thread stopped unexpectedly")
-        })?
+        self.send_worker_command(
+            function,
+            WorkerCommand::WaitIdle {
+                reply_tx: tx,
+                function,
+            },
+        )?;
+        rx.recv()
+            .map_err(|_| Error::new_custom(function, "sync worker thread stopped unexpectedly"))?
+    }
+
+    /// エンコーダをフラッシュして残りのフレームを取得する
+    ///
+    /// この関数は全てのエンコードの完了を待ち、内部で保持している
+    /// フレームをすべて排出してコールバックを呼び出し終わるまでブロックする。
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.drain_cached_frames("Encoder::finish")
     }
 
     fn create_bitstream(&self) -> (Box<sys::mfxBitstream>, Vec<u8>) {
@@ -1374,6 +1903,7 @@ fn run_sync_worker<H: EncodeHandler>(
     session_handle: usize,
     worker_rx: mpsc::Receiver<WorkerCommand<H::UserData>>,
     mut handler: H,
+    stats: Arc<EncoderStats>,
 ) {
     let mut pending_store = PendingFrameStore::new();
     while let Ok(command) = worker_rx.recv() {
@@ -1385,46 +1915,84 @@ fn run_sync_worker<H: EncodeHandler>(
                 // encode 呼び出し単位の pending frame を frame_seq で登録する。
                 // syncp == None の入力も必ずここで保持し、後続出力との一致で回収する。
                 if pending_store.insert(frame_seq, pending_frame).is_some() {
-                    handler.on_encoded(Err(Error::new_custom_owned(
-                        "Encoder::sync_worker",
-                        format!("duplicate frame sequence in pending frames: {frame_seq}"),
-                    )
-                    .into()));
+                    // 同じ frame_seq で置き換えた pending は結果を通知できないため、
+                    // in-flight から取り除く
+                    stats.in_flight_frames.dec();
+                    notify_encoded(
+                        &mut handler,
+                        &stats,
+                        Err(Error::new_custom_owned(
+                            "Encoder::sync_worker",
+                            format!("duplicate frame sequence in pending frames: {frame_seq}"),
+                        )),
+                    );
                 }
             }
             WorkerCommand::Sync(sync) => {
                 // 通常入力の sync 完了を待ち、bitstream.TimeStamp と frame_seq を完全一致で対応付ける。
-                handler.on_encoded(
-                    sync_and_build_frame(lib, session_handle, sync, &mut pending_store)
-                        .map_err(Into::into),
-                );
+                let result = sync_and_build_frame(lib, session_handle, sync, &mut pending_store);
+                if result.is_ok() {
+                    // pending を消費して結果を通知できる状態になった
+                    stats.in_flight_frames.dec();
+                }
+                notify_encoded(&mut handler, &stats, result);
             }
-            WorkerCommand::WaitIdle(reply_tx) => {
-                // finish 側のバリア。ここに到達した時点で、それ以前に送信された
-                // QueueFrame / Sync はすべて処理済みである。
+            WorkerCommand::WaitIdle { reply_tx, function } => {
+                // finish / reconfigure 側のバリア。ここに到達した時点で、それ以前に
+                // 送信された QueueFrame / Sync はすべて処理済みである。
                 if pending_store.is_empty() {
                     let _ = reply_tx.send(Ok(()));
                     continue;
                 }
 
+                // バリア時点で回収できなかったフレームは、対応する出力が得られなかった
+                // ものとしてエラー通知する。
                 let pending = pending_store.drain_all();
                 let remaining_count = pending.len();
                 for (frame_seq, _meta) in pending {
-                    handler
-                        .on_encoded(Err(finish_pending_error(frame_seq, remaining_count).into()));
+                    stats.in_flight_frames.dec();
+                    notify_encoded(
+                        &mut handler,
+                        &stats,
+                        Err(pending_frame_error(frame_seq, remaining_count, function)),
+                    );
                 }
                 let _ = reply_tx.send(Err(Error::new_custom_owned(
-                    "Encoder::finish",
-                    format!("finish completed but {remaining_count} pending frames remained"),
+                    function,
+                    format!("{function} completed but {remaining_count} pending frames remained"),
                 )));
             }
             WorkerCommand::Stop => {
                 // drop 時の中断。未完了 frame はすべて MFX_ERR_ABORTED として通知する。
                 for (_frame_seq, _pending) in pending_store.drain_all() {
-                    handler.on_encoded(Err(canceled_error().into()));
+                    stats.in_flight_frames.dec();
+                    notify_encoded(&mut handler, &stats, Err(canceled_error()));
                 }
                 break;
             }
+        }
+    }
+}
+
+/// エンコード結果をハンドラーへ通知し、通知内容に応じて統計を更新する
+///
+/// `Ok` は出力フレーム数と出力ビット数に、`Err` はエラー数に計上する。
+fn notify_encoded<H: EncodeHandler>(
+    handler: &mut H,
+    stats: &EncoderStats,
+    result: Result<EncodedFrame<H::UserData>, Error>,
+) {
+    match result {
+        Ok(frame) => {
+            stats.total_output_frame_count.inc();
+            stats
+                .total_output_bit_count
+                .add(frame.data().len() as u64 * 8);
+            handler.on_encoded(Ok(frame));
+        }
+        Err(error) => {
+            stats.total_error_count.inc();
+            handler.on_encoded(Err(error.into()));
         }
     }
 }
@@ -1457,8 +2025,7 @@ fn sync_and_build_frame<T>(
 /// `SyncOperation` を実行し、VPL が返した `mfxBitstream` から
 /// callback に必要な情報を取り出して `SyncedBitstream` に整形する。
 ///
-/// 取り出し時は `DataOffset` / `DataLength` の範囲検証を行い、
-/// 不正なオフセットでメモリアクセスしないように防御する。
+/// `DataOffset` / `DataLength` がバッファ範囲外の場合は `Err` を返す。
 fn sync_and_collect(
     lib: VplLibrary,
     session_handle: usize,
@@ -1486,17 +2053,9 @@ fn sync_and_collect(
     let offset = bitstream.DataOffset as usize;
     let length = bitstream.DataLength as usize;
 
-    // VPL のドレイン処理では syncp は返るが DataLength == 0 となるケースがあるため、
-    // 空ビットストリームをエラーではなく空データとして正常に処理する。
-    if length == 0 {
-        return Ok(SyncedBitstream {
-            data: vec![],
-            frame_seq: bitstream.TimeStamp,
-            picture_type: picture_type_from_frame_type(bitstream.FrameType),
-        });
-    }
-
-    // VPL が返したオフセットと長さがバッファ範囲内か検証する
+    // VPL が返したオフセットと長さをバッファ範囲内のスライスに変換する。
+    // これは VPL の値の正しさを検証するためではなく、範囲外のメモリに
+    // アクセスしないための Rust の安全境界としての確認である。
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::new_custom_owned(
             "Encoder::sync_worker",
@@ -1533,11 +2092,12 @@ fn mismatched_timestamp_error(frame_seq: u64, pending_len: usize) -> Error {
     )
 }
 
-fn finish_pending_error(frame_seq: u64, pending_count: usize) -> Error {
+/// バリア時点で回収できなかった pending frame のエラー
+fn pending_frame_error(frame_seq: u64, pending_count: usize, function: &'static str) -> Error {
     Error::new_custom_owned(
-        "Encoder::finish",
+        function,
         format!(
-            "pending frames remained after flush for frame sequence {frame_seq} (pending count: {pending_count})"
+            "pending frame remained for frame sequence {frame_seq} (pending count: {pending_count})"
         ),
     )
 }
@@ -1560,51 +2120,37 @@ fn picture_type_from_frame_type(frame_type: u16) -> PictureType {
     }
 }
 
-/// コーデック ID を返す
-fn codec_id(codec: &CodecConfig) -> u32 {
+/// VP9 の IVF ヘッダー出力設定を返す
+///
+/// 非 VP9 コーデックは IVF ヘッダー出力の設定を持たないため None を返す。
+fn vp9_write_ivf_headers(codec: &CodecConfig) -> Option<bool> {
     match codec {
-        CodecConfig::H264(_) => sys::MFX_CODEC_AVC,
-        CodecConfig::Hevc(_) => sys::MFX_CODEC_HEVC,
-        CodecConfig::Vp9(_) => sys::MFX_CODEC_VP9,
-        CodecConfig::Av1(_) => sys::MFX_CODEC_AV1,
+        CodecConfig::Vp9(vp9) => Some(vp9.write_ivf_headers),
+        _ => None,
+    }
+}
+
+/// コーデック種別を返す
+fn codec_type(codec: &CodecConfig) -> VideoCodecType {
+    match codec {
+        CodecConfig::H264(_) => VideoCodecType::H264,
+        CodecConfig::Hevc(_) => VideoCodecType::Hevc,
+        CodecConfig::Vp9(_) => VideoCodecType::Vp9,
+        CodecConfig::Av1(_) => VideoCodecType::Av1,
     }
 }
 
 /// コーデックプロファイルを返す
+///
+/// プロファイル未指定の場合は MFX_PROFILE_UNKNOWN を返す。
 fn codec_profile(codec: &CodecConfig) -> u16 {
-    match codec {
-        CodecConfig::H264(c) => match c.profile {
-            Some(H264Profile::Baseline) => sys::MFX_PROFILE_AVC_BASELINE as u16,
-            Some(H264Profile::ConstrainedBaseline) => {
-                sys::MFX_PROFILE_AVC_CONSTRAINED_BASELINE as u16
-            }
-            Some(H264Profile::Main) => sys::MFX_PROFILE_AVC_MAIN as u16,
-            Some(H264Profile::High) => sys::MFX_PROFILE_AVC_HIGH as u16,
-            Some(H264Profile::ConstrainedHigh) => sys::MFX_PROFILE_AVC_CONSTRAINED_HIGH as u16,
-            Some(H264Profile::High10) => sys::MFX_PROFILE_AVC_HIGH10 as u16,
-            Some(H264Profile::High422) => sys::MFX_PROFILE_AVC_HIGH_422 as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-        CodecConfig::Hevc(c) => match c.profile {
-            Some(HevcProfile::Main) => sys::MFX_PROFILE_HEVC_MAIN as u16,
-            Some(HevcProfile::Main10) => sys::MFX_PROFILE_HEVC_MAIN10 as u16,
-            Some(HevcProfile::MainSp) => sys::MFX_PROFILE_HEVC_MAINSP as u16,
-            Some(HevcProfile::Rext) => sys::MFX_PROFILE_HEVC_REXT as u16,
-            Some(HevcProfile::Scc) => sys::MFX_PROFILE_HEVC_SCC as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-        CodecConfig::Vp9(c) => match c.profile {
-            Some(Vp9Profile::Profile0) => sys::MFX_PROFILE_VP9_0 as u16,
-            Some(Vp9Profile::Profile1) => sys::MFX_PROFILE_VP9_1 as u16,
-            Some(Vp9Profile::Profile2) => sys::MFX_PROFILE_VP9_2 as u16,
-            Some(Vp9Profile::Profile3) => sys::MFX_PROFILE_VP9_3 as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-        CodecConfig::Av1(c) => match c.profile {
-            Some(Av1Profile::Main) => sys::MFX_PROFILE_AV1_MAIN as u16,
-            None => sys::MFX_PROFILE_UNKNOWN as u16,
-        },
-    }
+    let profile = match codec {
+        CodecConfig::H264(config) => config.profile.map(H264Profile::to_mfx_profile),
+        CodecConfig::Hevc(config) => config.profile.map(HevcProfile::to_mfx_profile),
+        CodecConfig::Vp9(config) => config.profile.map(Vp9Profile::to_mfx_profile),
+        CodecConfig::Av1(config) => config.profile.map(Av1Profile::to_mfx_profile),
+    };
+    profile.map_or(sys::MFX_PROFILE_UNKNOWN as u16, |profile| profile as u16)
 }
 
 /// alignment の倍数に切り上げる
@@ -1617,17 +2163,14 @@ fn align_up(value: u32, alignment: u32) -> u32 {
     }
 }
 
-/// MFX_CODINGOPTION_* の数値を記号名へ変換する
+/// bool を MFX_CODINGOPTION_* の値へ変換する
 ///
-/// CodingOptionValue (mfxstructures.h) の値をエラーメッセージで判読可能にするための表示用関数。
-/// 想定外の値は unknown (0xNN) で表示する。
-fn coding_option_name(value: u16) -> String {
-    match value {
-        v if v == sys::MFX_CODINGOPTION_UNKNOWN as u16 => "MFX_CODINGOPTION_UNKNOWN".to_owned(),
-        v if v == sys::MFX_CODINGOPTION_ON as u16 => "MFX_CODINGOPTION_ON".to_owned(),
-        v if v == sys::MFX_CODINGOPTION_OFF as u16 => "MFX_CODINGOPTION_OFF".to_owned(),
-        v if v == sys::MFX_CODINGOPTION_ADAPTIVE as u16 => "MFX_CODINGOPTION_ADAPTIVE".to_owned(),
-        v => format!("unknown ({v:#x})"),
+/// CodingOptionValue (mfxstructures.h) の ON / OFF に対応する値だけを扱う。
+fn coding_option_value(enabled: bool) -> u16 {
+    if enabled {
+        sys::MFX_CODINGOPTION_ON as u16
+    } else {
+        sys::MFX_CODINGOPTION_OFF as u16
     }
 }
 
@@ -1637,6 +2180,281 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    /// すべての FrameFormat が FourCC との相互変換で往復すること
+    #[test]
+    fn frame_format_fourcc_roundtrip() {
+        for format in FrameFormat::all() {
+            assert_eq!(
+                FrameFormat::from_fourcc(format.fourcc()),
+                Some(*format),
+                "{format:?} の FourCC 変換が往復しない"
+            );
+        }
+    }
+
+    /// 未知の FourCC が `None` になること
+    #[test]
+    fn frame_format_from_unknown_fourcc_returns_none() {
+        assert_eq!(FrameFormat::from_fourcc(0xDEAD_BEEF), None);
+    }
+
+    /// 1 行あたりのバイト数が形式ごとの 1 画素あたりのバイト数と一致すること
+    #[test]
+    fn frame_format_bytes_per_row_matches_bytes_per_pixel() {
+        let cases = [
+            (FrameFormat::Nv12, 320),
+            (FrameFormat::P010, 640),
+            (FrameFormat::Yuy2, 640),
+            (FrameFormat::Bgra, 1280),
+            (FrameFormat::Ayuv, 1280),
+            (FrameFormat::Y410, 1280),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(
+                format.bytes_per_row(320),
+                Some(expected),
+                "{format:?} の行あたりのバイト数が不一致"
+            );
+        }
+        // 1 画素 1 バイトの Nv12 は乗算がないためオーバーフローしない
+        assert_eq!(
+            FrameFormat::Nv12.bytes_per_row(usize::MAX),
+            Some(usize::MAX)
+        );
+        for format in [
+            FrameFormat::P010,
+            FrameFormat::Yuy2,
+            FrameFormat::Bgra,
+            FrameFormat::Ayuv,
+            FrameFormat::Y410,
+        ] {
+            assert_eq!(
+                format.bytes_per_row(usize::MAX),
+                None,
+                "{format:?} の行あたりのバイト数がオーバーフロー時に None にならない"
+            );
+        }
+    }
+
+    /// ビット深度と `mfxFrameInfo.Shift` が形式ごとに正しいこと
+    #[test]
+    fn frame_format_bit_depth_and_shift() {
+        let cases = [
+            // 8bit の形式は Shift を 0 にする
+            (FrameFormat::Nv12, 8, 0),
+            (FrameFormat::Yuy2, 8, 0),
+            (FrameFormat::Bgra, 8, 0),
+            (FrameFormat::Ayuv, 8, 0),
+            // P010 は 10bit の値を 16bit ワードの上位ビットに格納するため Shift を 1 にする
+            (FrameFormat::P010, 10, 1),
+            // Y410 は 10bit の値が 10bit 幅のフィールドにそのまま入るため Shift を 0 にする
+            (FrameFormat::Y410, 10, 0),
+        ];
+        for (format, bit_depth, shift) in cases {
+            assert_eq!(
+                format.bit_depth(),
+                bit_depth,
+                "{format:?} のビット深度が不一致"
+            );
+            assert_eq!(
+                format.frame_info_shift(),
+                shift,
+                "{format:?} の mfxFrameInfo.Shift が不一致"
+            );
+        }
+    }
+
+    /// コピーが UV の行数と UV ピッチを使い、表示範囲外を変更しないこと
+    #[test]
+    fn copy_to_surface_planes_uses_uv_pitch_and_rows() {
+        let width = 4;
+        let height = 4;
+        let row_bytes = width;
+        let y_pitch = 6;
+        let uv_pitch = 8;
+        let dst_pitch = 5;
+
+        let mut y_src = vec![0u8; y_pitch * height];
+        for row in 0..height {
+            for col in 0..row_bytes {
+                y_src[row * y_pitch + col] = (row * 10 + col) as u8;
+            }
+        }
+        let mut uv_src = vec![0u8; uv_pitch * (height / 2)];
+        for row in 0..height / 2 {
+            for col in 0..row_bytes {
+                uv_src[row * uv_pitch + col] = (0x40 + row * 10 + col) as u8;
+            }
+        }
+
+        let mut y_dst = vec![0xAAu8; dst_pitch * height];
+        let mut uv_dst = vec![0xBBu8; dst_pitch * (height / 2)];
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 0;
+        data.__bindgen_anon_2.PitchLow = dst_pitch as u16;
+        data.__bindgen_anon_3.Y = y_dst.as_mut_ptr();
+        data.__bindgen_anon_4.UV = uv_dst.as_mut_ptr();
+
+        let frame = FrameData::SemiPlanar {
+            y: &y_src,
+            y_pitch,
+            uv: &uv_src,
+            uv_pitch,
+        };
+        unsafe {
+            FrameFormat::Nv12
+                .copy_to_surface_planes(frame, &data, width, height, width, height)
+                .expect("コピーに失敗した");
+        }
+
+        for row in 0..height {
+            assert_eq!(
+                &y_dst[row * dst_pitch..row * dst_pitch + row_bytes],
+                &y_src[row * y_pitch..row * y_pitch + row_bytes],
+                "Y の {row} 行目が一致しない"
+            );
+            assert!(
+                y_dst[row * dst_pitch + row_bytes..(row + 1) * dst_pitch]
+                    .iter()
+                    .all(|&byte| byte == 0xAA),
+                "Y の {row} 行目のパディングが変更されている"
+            );
+        }
+        for row in 0..height / 2 {
+            assert_eq!(
+                &uv_dst[row * dst_pitch..row * dst_pitch + row_bytes],
+                &uv_src[row * uv_pitch..row * uv_pitch + row_bytes],
+                "UV の {row} 行目が一致しない"
+            );
+            assert!(
+                uv_dst[row * dst_pitch + row_bytes..(row + 1) * dst_pitch]
+                    .iter()
+                    .all(|&byte| byte == 0xBB),
+                "UV の {row} 行目のパディングが変更されている"
+            );
+        }
+    }
+
+    /// コピー先のピッチが 1 行のバイト数未満ならエラーになること
+    #[test]
+    fn copy_to_surface_planes_rejects_short_destination_pitch() {
+        let width = 4;
+        let height = 4;
+        let row_bytes = width;
+        let dst_pitch = row_bytes - 1;
+        let y_src = vec![0u8; row_bytes * height];
+        let uv_src = vec![0u8; row_bytes * (height / 2)];
+        let mut y_dst = vec![0u8; dst_pitch * height];
+        let mut uv_dst = vec![0u8; dst_pitch * (height / 2)];
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 0;
+        data.__bindgen_anon_2.PitchLow = dst_pitch as u16;
+        data.__bindgen_anon_3.Y = y_dst.as_mut_ptr();
+        data.__bindgen_anon_4.UV = uv_dst.as_mut_ptr();
+        let frame = FrameData::SemiPlanar {
+            y: &y_src,
+            y_pitch: row_bytes,
+            uv: &uv_src,
+            uv_pitch: row_bytes,
+        };
+        let error = unsafe {
+            FrameFormat::Nv12
+                .copy_to_surface_planes(frame, &data, width, height, width, height)
+                .expect_err("コピー先のピッチ不足は拒否されること")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("destination surface is too small"),
+            "エラーメッセージに容量不足が含まれること: {error}"
+        );
+    }
+
+    /// コピー先サーフェスの幅・高さ・ピッチがちょうどの容量なら受け付けること
+    #[test]
+    fn ensure_destination_surface_fits_accepts_exact_capacity() {
+        ensure_destination_surface_fits(4, 4, 4, 4, 4, 4)
+            .expect("ちょうどの容量は受け付けられること");
+    }
+
+    /// コピー先サーフェスの幅・高さ・ピッチのいずれかが不足する場合はエラーになること
+    #[test]
+    fn ensure_destination_surface_fits_rejects_short_capacity() {
+        for (surface_width, surface_height, pitch) in [(3, 4, 4), (4, 3, 4), (4, 4, 3)] {
+            let error =
+                ensure_destination_surface_fits(surface_width, surface_height, pitch, 4, 4, 4)
+                    .expect_err("容量不足は拒否されること");
+            assert!(
+                error
+                    .to_string()
+                    .contains("destination surface is too small"),
+                "エラーメッセージに容量不足が含まれること: {error}"
+            );
+        }
+    }
+
+    /// パック形式のコピーが形式ごとのポインタとピッチを使うこと
+    #[test]
+    fn copy_to_surface_planes_uses_packed_plane_pointer() {
+        let width = 4;
+        let height = 2;
+        for format in [FrameFormat::Yuy2, FrameFormat::Bgra, FrameFormat::Ayuv] {
+            let row_bytes = format
+                .bytes_per_row(width)
+                .expect("行バイト数が取得できない");
+            let src_pitch = row_bytes + 2;
+            let dst_pitch = row_bytes + 1;
+            let mut src = vec![0u8; src_pitch * height];
+            for row in 0..height {
+                for col in 0..row_bytes {
+                    src[row * src_pitch + col] = (row * 10 + col) as u8;
+                }
+            }
+            let mut dst = vec![0xAAu8; dst_pitch * height];
+            let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+            data.PitchHigh = 0;
+            data.__bindgen_anon_2.PitchLow = dst_pitch as u16;
+            match format {
+                FrameFormat::Yuy2 => data.__bindgen_anon_3.Y = dst.as_mut_ptr(),
+                FrameFormat::Bgra => data.__bindgen_anon_5.B = dst.as_mut_ptr(),
+                FrameFormat::Ayuv => data.__bindgen_anon_5.V = dst.as_mut_ptr(),
+                _ => unreachable!(),
+            }
+            let frame = FrameData::Packed {
+                data: &src,
+                pitch: src_pitch,
+            };
+            unsafe {
+                format
+                    .copy_to_surface_planes(frame, &data, width, height, width, height)
+                    .expect("コピーに失敗した");
+            }
+            for row in 0..height {
+                assert_eq!(
+                    &dst[row * dst_pitch..row * dst_pitch + row_bytes],
+                    &src[row * src_pitch..row * src_pitch + row_bytes],
+                    "{format:?} の {row} 行目が一致しない"
+                );
+                assert!(
+                    dst[row * dst_pitch + row_bytes..(row + 1) * dst_pitch]
+                        .iter()
+                        .all(|&byte| byte == 0xAA),
+                    "{format:?} の {row} 行目のパディングが変更されている"
+                );
+            }
+        }
+    }
+
+    /// ピッチが PitchHigh と PitchLow を合わせた 32bit の値になること
+    #[test]
+    fn frame_data_pitch_combines_pitch_high_and_pitch_low() {
+        let mut data: sys::mfxFrameData = unsafe { std::mem::zeroed() };
+        data.PitchHigh = 1;
+        data.__bindgen_anon_2.PitchLow = 2;
+        // finalPitch = (1 << 16) + 2
+        assert_eq!(unsafe { frame_data_pitch(&data) }, 65538);
+    }
 
     fn make_pending(presentation_timestamp: u64, user_data: u32) -> PendingFrame<u32> {
         PendingFrame {
@@ -1666,8 +2484,12 @@ mod tests {
 
     #[test]
     fn worker_wait_idle_returns_error_when_pending_remains() {
+        // WaitIdle は残留 pending をエラー通知し、呼び出し元に渡した
+        // コンテキストをエラーに付けることを確認する。
         let (command_tx, command_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker = thread::spawn(move || {
             run_sync_worker(
                 VplLibrary,
@@ -1676,47 +2498,82 @@ mod tests {
                 FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
                     callback_tx
                         .send(result.map(|_| ()))
-                        .expect("failed to forward callback result");
+                        .expect("コールバック結果の送信に失敗した");
                 }),
+                worker_stats,
             );
         });
 
+        // encode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 77,
                 pending_frame: make_pending(7700, 7),
             })
-            .expect("failed to send QueueFrame");
+            .expect("QueueFrame の送信に失敗した");
         let (reply_tx, reply_rx) = mpsc::channel();
         command_tx
-            .send(WorkerCommand::WaitIdle(reply_tx))
-            .expect("failed to send WaitIdle");
-        let wait_result = reply_rx
+            .send(WorkerCommand::WaitIdle {
+                reply_tx,
+                function: "Encoder::reconfigure",
+            })
+            .expect("WaitIdle の送信に失敗した");
+        let wait_error = reply_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("failed to receive WaitIdle response");
-        assert!(
-            wait_result.is_err(),
-            "WaitIdle should fail when pending frames remain"
+            .expect("WaitIdle の応答の受信に失敗した")
+            .expect_err("残留 pending があるのに WaitIdle が成功した");
+        assert_eq!(
+            wait_error.function(),
+            "Encoder::reconfigure",
+            "WaitIdle のエラーは渡したコンテキストを持つこと"
+        );
+        assert_eq!(
+            wait_error.status_message(),
+            Some("Encoder::reconfigure completed but 1 pending frames remained"),
+            "WaitIdle のエラーメッセージはコンテキストで始まること"
         );
 
-        let callback_result = callback_rx
+        let callback_error = callback_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("failed to receive callback result");
-        assert!(
-            callback_result.is_err(),
-            "pending frames on WaitIdle must be reported as callback error"
+            .expect("コールバック結果の受信に失敗した")
+            .expect_err("残留 pending はコールバックのエラーとして通知されること");
+        assert_eq!(
+            callback_error.function(),
+            "Encoder::reconfigure",
+            "残留 pending のエラーは渡したコンテキストを持つこと"
+        );
+
+        // 残留 pending はエラー通知のたびにエラー数へ計上し、
+        // 通知を終えた時点で in-flight から取り除かれること
+        assert_eq!(
+            stats.total_error_count.get(),
+            1,
+            "残留 pending のエラー通知がエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.total_output_frame_count.get(),
+            0,
+            "エラー通知は出力フレーム数に計上されないこと"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "残留 pending の通知後に in-flight が 0 であること"
         );
 
         command_tx
             .send(WorkerCommand::Stop)
-            .expect("failed to send Stop");
-        worker.join().expect("worker thread panicked");
+            .expect("Stop の送信に失敗した");
+        worker.join().expect("worker スレッドがパニックした");
     }
 
     #[test]
     fn worker_stop_returns_aborted_for_all_pending() {
         let (command_tx, command_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel::<Result<(), Error>>();
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
         let worker = thread::spawn(move || {
             run_sync_worker(
                 VplLibrary,
@@ -1727,15 +2584,19 @@ mod tests {
                         .send(result.map(|_| ()))
                         .expect("failed to forward callback result");
                 }),
+                worker_stats,
             );
         });
 
+        // encode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 1,
                 pending_frame: make_pending(100, 10),
             })
             .expect("failed to send QueueFrame");
+        stats.in_flight_frames.inc();
         command_tx
             .send(WorkerCommand::QueueFrame {
                 frame_seq: 2,
@@ -1760,6 +2621,409 @@ mod tests {
         assert_eq!(
             callback_count, 2,
             "expected callbacks for all pending frames"
+        );
+
+        // 中断通知でもエラー数を増やし、in-flight を 0 に戻すこと
+        assert_eq!(
+            stats.total_error_count.get(),
+            2,
+            "中断した全フレームがエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "中断通知の後に in-flight が 0 であること"
+        );
+    }
+
+    #[test]
+    fn worker_reports_duplicate_frame_sequence() {
+        // decode 側と対称に、同一 frame_seq の QueueFrame を 2 回送信する。
+        // 置き換えられた pending と残留 pending の両方が in-flight から
+        // 取り除かれ、2 件のエラー通知がエラー数に計上されることを確認する。
+        let (command_tx, command_rx) = mpsc::channel();
+        let (callback_tx, callback_rx) = mpsc::channel::<Result<u32, Error>>();
+        let stats = Arc::new(EncoderStats::default());
+        let worker_stats = Arc::clone(&stats);
+        let worker = thread::spawn(move || {
+            run_sync_worker(
+                VplLibrary,
+                0,
+                command_rx,
+                FnEncodeHandler::new(move |result: Result<EncodedFrame<u32>, Error>| {
+                    callback_tx
+                        .send(result.map(|frame| *frame.user_data()))
+                        .expect("コールバック結果の送信に失敗した");
+                }),
+                worker_stats,
+            );
+        });
+
+        // encode() と同じく、pending を登録する時点で in-flight を加算する
+        stats.in_flight_frames.inc();
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 42,
+                pending_frame: make_pending(100, 1),
+            })
+            .expect("QueueFrame の送信に失敗した");
+        stats.in_flight_frames.inc();
+        command_tx
+            .send(WorkerCommand::QueueFrame {
+                frame_seq: 42,
+                pending_frame: make_pending(200, 2),
+            })
+            .expect("QueueFrame の送信に失敗した");
+        command_tx
+            .send(WorkerCommand::Stop)
+            .expect("Stop の送信に失敗した");
+        worker.join().expect("worker スレッドがパニックした");
+
+        // 1 つ目のコールバックが重複 frame_seq のエラー通知であること
+        let callback_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("重複通知コールバックの受信に失敗した");
+        let error = callback_result.expect_err("重複 frame_seq はエラー通知されること");
+        assert_eq!(error.function(), "Encoder::sync_worker");
+        assert_eq!(
+            error.status_message(),
+            Some("duplicate frame sequence in pending frames: 42"),
+            "重複した frame_seq を含むエラーメッセージであること"
+        );
+
+        // 置き換えられた pending は通知済みで、Stop では新しく登録された
+        // pending が残留分として ABORTED 通知されること
+        let stop_result = callback_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("残留 pending の ABORTED 通知の受信に失敗した");
+        let stop_error = stop_result.expect_err("Stop 時のコールバックはエラーであること");
+        assert_eq!(
+            stop_error.status_code(),
+            Some(sys::mfxStatus_MFX_ERR_ABORTED),
+            "残留 pending は MFX_ERR_ABORTED で通知されること"
+        );
+
+        // 通知は重複エラーと残留 ABORTED の 2 回だけであること
+        assert!(
+            callback_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "通知は 2 回だけであること"
+        );
+
+        assert_eq!(
+            stats.total_error_count.get(),
+            2,
+            "重複エラーと中断エラーがエラー数に計上されること"
+        );
+        assert_eq!(
+            stats.total_output_frame_count.get(),
+            0,
+            "出力フレーム数は増えないこと"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "重複と中断の通知後に in-flight が 0 であること"
+        );
+    }
+
+    #[test]
+    fn ext_buffers_zeroed_copy_keeps_header_and_clears_values() {
+        // 読み戻し用のバッファは Header を維持したまま値だけを 0 にする。
+        // 値が残っていると、VPL が書き戻さなかった場合に要求値がそのまま見えてしまう。
+        let requested = ExtBuffers::new(Some(16), Some(25), Some(true));
+        let readback = requested.zeroed_copy();
+
+        let co2 = readback
+            .ext_co2
+            .as_ref()
+            .expect("mfxExtCodingOption2 が構築されていない");
+        assert_eq!(co2.Header.BufferId, sys::MFX_EXTBUFF_CODING_OPTION2);
+        assert_eq!(
+            co2.Header.BufferSz,
+            std::mem::size_of::<sys::mfxExtCodingOption2>() as u32
+        );
+        assert_eq!(
+            co2.LookAheadDepth, 0,
+            "読み戻し用バッファの LookAheadDepth は 0 であること"
+        );
+
+        let co3 = readback
+            .ext_co3
+            .as_ref()
+            .expect("mfxExtCodingOption3 が構築されていない");
+        assert_eq!(co3.Header.BufferId, sys::MFX_EXTBUFF_CODING_OPTION3);
+        assert_eq!(
+            co3.QVBRQuality, 0,
+            "読み戻し用バッファの QVBRQuality は 0 であること"
+        );
+
+        let vp9 = readback
+            .ext_vp9
+            .as_ref()
+            .expect("mfxExtVP9Param が構築されていない");
+        assert_eq!(vp9.Header.BufferId, sys::MFX_EXTBUFF_VP9_PARAM);
+        assert_eq!(
+            vp9.WriteIVFHeaders, 0,
+            "読み戻し用バッファの WriteIVFHeaders は 0 であること"
+        );
+    }
+
+    #[test]
+    fn ext_buffers_zeroed_copy_skips_unrequested_buffers() {
+        let requested = ExtBuffers::new(None, None, None);
+        let readback = requested.zeroed_copy();
+
+        assert!(
+            readback.ext_co2.is_none(),
+            "要求していない mfxExtCodingOption2 は構築しないこと"
+        );
+        assert!(
+            readback.ext_co3.is_none(),
+            "要求していない mfxExtCodingOption3 は構築しないこと"
+        );
+        assert!(
+            readback.ext_vp9.is_none(),
+            "要求していない mfxExtVP9Param は構築しないこと"
+        );
+    }
+
+    #[test]
+    fn ext_buffers_into_params_keeps_requested_values() {
+        let buffers = ExtBuffers::new(Some(16), Some(25), Some(true));
+        let params = buffers.into_params();
+
+        assert_eq!(
+            params
+                .coding_option2
+                .expect("mfxExtCodingOption2 が取り出せない")
+                .LookAheadDepth,
+            16
+        );
+        assert_eq!(
+            params
+                .coding_option3
+                .expect("mfxExtCodingOption3 が取り出せない")
+                .QVBRQuality,
+            25
+        );
+        assert_eq!(
+            params
+                .vp9_param
+                .expect("mfxExtVP9Param が取り出せない")
+                .WriteIVFHeaders,
+            sys::MFX_CODINGOPTION_ON as u16
+        );
+    }
+
+    /// エンコーダが実際に使っている LookAheadDepth と QVBRQuality を読み戻す
+    ///
+    /// 実機 (Intel GPU) 上でのみ動作する。
+    #[cfg(intel_vpl)]
+    fn read_coding_option_ext_params<H: EncodeHandler>(encoder: &Encoder<H>) -> (u16, u16) {
+        let param = encoder.get_video_param().expect("GetVideoParam に失敗した");
+        let co2 = param
+            .ext
+            .coding_option2
+            .expect("mfxExtCodingOption2 が読み戻されていない");
+        let co3 = param
+            .ext
+            .coding_option3
+            .expect("mfxExtCodingOption3 が読み戻されていない");
+        (co2.LookAheadDepth, co3.QVBRQuality)
+    }
+
+    /// reconfigure 後も Init 時に設定した LookAheadDepth / QVBRQuality が維持されることを確認する
+    ///
+    /// 実機 (Intel GPU) 上でのみ動作するため `INTEL_VPL=1` ビルドでのみコンパイルする。
+    #[cfg(intel_vpl)]
+    #[test]
+    fn reconfigure_preserves_coding_option_ext_params() {
+        let adapters = crate::list_adapters().expect("list_adapters に失敗した");
+        let first = adapters.first().expect("Intel アダプタが見つからない");
+
+        // HEVC の QVBR は LookAheadDepth と QVBRQuality の両方を ExtParam として
+        // 受け付けるため、両方の維持を 1 つのエンコーダで確認できる。
+        let mut config = EncoderConfig::new(
+            AdapterSelector::DrmRenderNode(first.drm_render_node),
+            CodecConfig::Hevc(HevcEncoderConfig { profile: None }),
+            320,
+            240,
+            FrameFormat::Nv12,
+            30,
+            1,
+            RateControlMode::Qvbr,
+        );
+        config.target_kbps = Some(2000);
+        config.max_kbps = Some(4000);
+        config.look_ahead_depth = Some(16);
+        config.qvbr_quality = Some(25);
+
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<u32>, Error>| {}),
+        )
+        .expect("Encoder::new に失敗した");
+
+        // Init 直後の実効値を取得する。
+        // 拡張バッファが実効値として反映されない GPU ではこのテストの前提が
+        // 崩れるため、0 でないことも確認する。
+        let (look_ahead_before, qvbr_before) = read_coding_option_ext_params(&encoder);
+        assert!(
+            look_ahead_before > 0,
+            "Init 後の LookAheadDepth が 0: この GPU は HEVC QVBR の LookAheadDepth をサポートしていない"
+        );
+        assert!(
+            qvbr_before > 0,
+            "Init 後の QVBRQuality が 0: この GPU は HEVC QVBR の QVBRQuality をサポートしていない"
+        );
+
+        encoder
+            .reconfigure(ReconfigureParams {
+                target_kbps: Some(3000),
+                ..Default::default()
+            })
+            .expect("reconfigure に失敗した");
+
+        // reconfigure (MFXVideoENCODE_Reset) 後も Init 時の拡張バッファが
+        // 維持されていることを確認する。
+        let (look_ahead_after, qvbr_after) = read_coding_option_ext_params(&encoder);
+        assert_eq!(
+            look_ahead_after, look_ahead_before,
+            "reconfigure で LookAheadDepth が変わった (before: {look_ahead_before}, after: {look_ahead_after})"
+        );
+        assert_eq!(
+            qvbr_after, qvbr_before,
+            "reconfigure で QVBRQuality が変わった (before: {qvbr_before}, after: {qvbr_after})"
+        );
+    }
+
+    #[test]
+    fn strip_start_code_removes_four_byte_prefix() {
+        // 4 バイトのスタートコードが先頭から除去され、NAL ヘッダが先頭に来る
+        let data = [0x00, 0x00, 0x00, 0x01, 0x67, 0x42];
+        assert_eq!(strip_start_code(&data), &[0x67, 0x42]);
+    }
+
+    #[test]
+    fn strip_start_code_removes_three_byte_prefix() {
+        // 3 バイトのスタートコードが先頭から除去され、NAL ヘッダが先頭に来る
+        let data = [0x00, 0x00, 0x01, 0x68, 0xCE];
+        assert_eq!(strip_start_code(&data), &[0x68, 0xCE]);
+    }
+
+    #[test]
+    fn strip_start_code_keeps_data_without_prefix() {
+        // スタートコードを持たないデータはそのまま返る
+        let data = [0x0A, 0x0B, 0x0C];
+        assert_eq!(strip_start_code(&data), &data);
+    }
+
+    #[test]
+    fn read_sequence_param_rejects_zero_size() {
+        // サイズ 0 は「パラメータセットが存在しない」ではなく「取得できなかった」を表す
+        let error = read_sequence_param(&[0u8; 8], 0, "SPS", "Encoder::get_sequence_params")
+            .expect_err("サイズ 0 のパラメータセットはエラーになること");
+        assert_eq!(error.function(), "Encoder::get_sequence_params");
+        assert_eq!(
+            error.status_message(),
+            Some("SPS is not available"),
+            "サイズ 0 のエラーメッセージにパラメータ名が含まれること"
+        );
+    }
+
+    #[test]
+    fn read_sequence_param_rejects_size_larger_than_buffer() {
+        // VPL が確保した容量を超えるサイズを報告した場合は、範囲外アクセスせずエラーにする
+        let error = read_sequence_param(&[0u8; 8], 9, "SPS", "Encoder::get_sequence_params")
+            .expect_err("バッファ容量を超えるサイズはエラーになること");
+        assert_eq!(error.function(), "Encoder::get_sequence_params");
+        assert_eq!(
+            error.status_message(),
+            Some("SPS size 9 exceeds the readback buffer size 8"),
+            "容量超過のエラーメッセージにサイズが含まれること"
+        );
+    }
+
+    #[test]
+    fn read_sequence_param_returns_bytes_without_start_code() {
+        // サイズで切り詰めたうえでスタートコードを除去したバイト列を返す
+        let buffer = [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xFF, 0xFF];
+        let data = read_sequence_param(&buffer, 6, "SPS", "Encoder::get_sequence_params")
+            .expect("スタートコード付きのパラメータセットを取得できること");
+        assert_eq!(data, vec![0x67, 0x42]);
+    }
+
+    #[test]
+    fn sequence_param_buffers_attach_requested_params() {
+        // H.264 は SPS / PPS を要求し、VPS は要求しない
+        let mut h264 = SequenceParamBuffers::new(false, true);
+        assert_eq!(h264.ext_param().len(), 1);
+        assert!(
+            h264.vps_ext.is_none(),
+            "VPS を要求していない場合は mfxExtCodingOptionVPS を構築しないこと"
+        );
+        assert!(
+            h264.vps.is_empty(),
+            "VPS を要求していない場合は VPS の読み戻し領域を確保しないこと"
+        );
+        assert!(
+            !h264.pps.is_empty(),
+            "PPS を要求した場合は PPS の読み戻し領域を確保すること"
+        );
+        assert!(
+            !h264.spspps.PPSBuffer.is_null(),
+            "PPS を要求した場合は PPSBuffer を設定すること"
+        );
+        assert_eq!(
+            h264.spspps.PPSBufSize, SEQUENCE_PARAM_BUFFER_SIZE as u16,
+            "PPS の書き込み先容量が設定されること"
+        );
+
+        // HEVC は VPS / SPS / PPS を要求する
+        let mut hevc = SequenceParamBuffers::new(true, true);
+        assert_eq!(hevc.ext_param().len(), 2);
+        let vps_ext = hevc
+            .vps_ext
+            .as_ref()
+            .expect("VPS を要求した場合は mfxExtCodingOptionVPS を構築すること");
+        assert_eq!(
+            vps_ext.Header.BufferId,
+            sys::MFX_EXTBUFF_CODING_OPTION_VPS,
+            "mfxExtCodingOptionVPS の BufferId が設定されること"
+        );
+        assert_eq!(
+            vps_ext.VPSBufSize, SEQUENCE_PARAM_BUFFER_SIZE as u16,
+            "VPS の書き込み先容量が設定されること"
+        );
+        assert!(
+            !hevc.pps.is_empty(),
+            "PPS を要求した場合は PPS の読み戻し領域を確保すること"
+        );
+
+        // AV1 は Sequence Header OBU だけを要求し、VPS / PPS は要求しない
+        let mut av1 = SequenceParamBuffers::new(false, false);
+        assert_eq!(av1.ext_param().len(), 1);
+        assert!(
+            av1.vps_ext.is_none(),
+            "VPS を要求していない場合は mfxExtCodingOptionVPS を構築しないこと"
+        );
+        assert!(
+            av1.vps.is_empty(),
+            "VPS を要求していない場合は VPS の読み戻し領域を確保しないこと"
+        );
+        assert!(
+            av1.pps.is_empty(),
+            "PPS を要求していない場合は PPS の読み戻し領域を確保しないこと"
+        );
+        assert!(
+            av1.spspps.PPSBuffer.is_null(),
+            "PPS を要求していない場合は PPSBuffer を設定しないこと"
+        );
+        assert_eq!(
+            av1.spspps.PPSBufSize, 0,
+            "PPS を要求していない場合は PPSBufSize を 0 のままにすること"
         );
     }
 }

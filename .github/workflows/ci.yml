@@ -28,11 +28,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: rustup update stable
+      # Rust ツールチェイン (1.95) は rust-toolchain.toml に従って rustup が自動導入する
       - uses: shiguredo/github-actions/.github/actions/rust-cache@main
         with:
           os: ${{ matrix.os }}
-          toolchain: stable
+          toolchain: 1.95
       - run: cargo fmt --all --check
       - run: cargo build --workspace
       - run: cargo clippy --workspace -- -D warnings
@@ -45,17 +45,18 @@ jobs:
       labels: [self-hosted, linux, x64, Intel-VPL]
     timeout-minutes: 15
     env:
-      # 実機アダプタを使う統合テスト (tests/test_adapter.rs::test_real_adapter_session) を有効化する
+      # 実機アダプタを使う統合テストを有効化する
       INTEL_VPL: 1
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Rust ツールチェイン (1.95) は rust-toolchain.toml に従って rustup が自動導入する
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
       - name: Update PATH
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - run: cargo build --workspace
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --test-threads=1 --nocapture
 
   # docs.rs 向けビルド確認
@@ -65,9 +66,10 @@ jobs:
     timeout-minutes: 15
     env:
       DOCS_RS: 1
+      RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: rustup update stable
+      # Rust ツールチェイン (1.95) は rust-toolchain.toml に従って rustup が自動導入する
       - run: cargo doc --no-deps
 
   slack_notify:

@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/refactor-extract-vpl-loader-builder
 - Polished: 2026-08-02
@@ -171,3 +172,22 @@ impl Drop for LoaderBuilder {
 - 関連 issue: 0018（型統合。同じ `src/codec_info.rs` を編集するため、適用順序に注意）
 - 関連 issue: 0014（Drop 経路のエラー観測。同じ `src/vpl.rs` を編集する）
 - 関連 issue: 0023（silent pass テストの修正。完了条件 5 の検証力に関連）
+
+## 解決方法
+
+設計時の型名 `LoaderBuilder` は、実装レビューで `VplLoader` に変更した。あわせて `LoaderBuilder::build()` を `VplLoader::create_session()`、`LoaderBuilder::as_loader()` を `VplLoader::as_ptr()` に改名した。本セクションの記述が設計方針の該当箇所を置き換える。
+
+### 変更内容
+
+- `src/vpl.rs` に `VplLoader` を追加し、`MFXLoad` / `MFXCreateConfig` / `MFXSetConfigFilterProperty` を集約した
+- `src/vpl.rs` の `VplLibrary::create_session`、`src/adapter.rs` の `list_adapters`、`src/codec_info.rs` の `supported_codecs` を `VplLoader` を使う実装に変更した
+- `VplLoader` の Drop で `MFXUnload` を呼び、`supported_codecs` の失敗パスに散在していた `MFXUnload` を削除した
+- `src/adapter.rs` の `LoaderGuard` を削除し、`HdlGuard` が保持する loader は `VplLoader::as_ptr()` から取得するよう変更した
+- `adapter.validate()` の呼び出し位置と、`MFX_ERR_NOT_FOUND` 時の render node 番号入りエラーメッセージは維持した
+- `CHANGES.md` の `## develop` の `### misc` に `[UPDATE]` として追記した
+
+### 検証
+
+- Intel GPU 搭載の Linux x86_64 環境 (GMKtec K9 / iHD 1.22) で `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` が成功した
+- `cargo test --workspace` が単体テスト 14 件、`tests/test_adapter.rs` 5 件、`tests/test_roundtrip.rs` 21 件、doctest 2 件すべて pass した
+- `INTEL_VPL=1 cargo test --workspace` が単体テスト 15 件、`tests/test_adapter.rs` 6 件、`tests/test_roundtrip.rs` 21 件、doctest 2 件すべて pass した

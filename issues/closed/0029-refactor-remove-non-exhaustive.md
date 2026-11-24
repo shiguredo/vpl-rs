@@ -2,7 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-08-02
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-11-04
 - Model: DeepSeek V4 Flash
 - Branch: feature/refactor-remove-non-exhaustive
 - Polished: {YYYY-MM-DD}
@@ -39,8 +39,26 @@ issue 0018 は「`DecoderConfig` の `#[non_exhaustive]` 削除は本 issue の�
 
 ## 解決方法
 
-- `src/decode.rs` / `src/encode.rs` / `src/adapter.rs` の各公開型から `#[non_exhaustive]` 属性を削除する。
-- 削除後、`cargo test` / `cargo clippy` で問題がないことを確認する。
+公開型から `#[non_exhaustive]` をすべて削除し、shiguredo-rust 規約に準拠した。
+
+### 変更内容
+
+- `src/decode.rs` の `DecoderConfig` から `#[non_exhaustive]` を削除した
+- `src/encode.rs` の `EncoderConfig` から `#[non_exhaustive]` を削除した
+- `src/adapter.rs` の `AdapterSelector` / `MediaAdapterType` / `PciAddress` / `AdapterInfo` から `#[non_exhaustive]` を削除した
+- `CHANGES.md` の `## develop` の `### misc` に `[UPDATE]` として追記した
+
+### 確認
+
+Intel GPU を搭載した実機で確認した。外部クレートと同じ制約で公開型を利用できることも、`examples/` に一時的な確認用ファイルを置いて `cargo check --example verify_0029` で確認した（確認後に削除）。
+
+| 確認内容 | 結果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --workspace -- --test-threads=1` | pass（単体テスト 17 件、`tests/test_adapter.rs` 5 件、`tests/test_roundtrip.rs` 21 件、doc テスト 2 件） |
+| `INTEL_VPL=1 cargo test --workspace -- --test-threads=1` | pass（単体テスト 18 件、`tests/test_adapter.rs` 6 件、`tests/test_roundtrip.rs` 21 件、doc テスト 2 件） |
+| 外部クレート相当の構造体リテラル構築・構造体更新記法・網羅 match | pass |
 
 ## 参考
 

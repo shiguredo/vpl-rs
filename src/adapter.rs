@@ -14,18 +14,16 @@
 //! 参照バージョンは `Cargo.toml` の `package.metadata.external-dependencies.vpl.version`。
 //! 将来 libvpl の挙動が変わる可能性があるため、本実装は当該バージョンに依存する。
 
-#[cfg(target_os = "linux")]
 use std::ffi::CStr;
 
 use crate::Error;
-#[cfg(target_os = "linux")]
 use crate::sys;
+use crate::vpl::{VplLibrary, VplLoader};
 
 /// `Encoder` / `Decoder` のセッションを開くときの対象アダプタ
 ///
 /// 現状は DRM render node 番号による指定のみをサポートする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum AdapterSelector {
     /// `/dev/dri/renderD<N>` の `N`（通常 128 以上）
     DrmRenderNode(u32),
@@ -49,7 +47,6 @@ impl AdapterSelector {
 
 /// integrated GPU か discrete GPU か
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum MediaAdapterType {
     /// integrated GPU（iGPU）
     Integrated,
@@ -64,7 +61,6 @@ pub enum MediaAdapterType {
 /// 各フィールドは libvpl の `mfxExtendedDeviceId` (`PCIDomain` / `PCIBus` /
 /// `PCIDevice` / `PCIFunction` がすべて `mfxU32`) に合わせて `u32` にしている。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct PciAddress {
     /// PCI domain
     pub domain: u32,
@@ -78,7 +74,6 @@ pub struct PciAddress {
 
 /// VPL ローダーで列挙される Intel HW 実装の情報
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct AdapterInfo {
     /// `/dev/dri/renderD<N>` の `N`（通常 128 以上）。`AdapterSelector::DrmRenderNode` に渡す
     pub drm_render_node: u32,
@@ -99,29 +94,13 @@ pub struct AdapterInfo {
 /// 同一 DRM render node に対する重複エントリは除去し、`drm_render_node` 昇順で返す。
 /// HW 実装が見つからないことはエラーではなく、空の `Vec` を返す。
 ///
-/// 呼び出しごとに `MFXLoad` + 列挙 + `MFXUnload` を行う重い処理なので、
+/// 呼び出しごとに VPL の初期化と列挙を行う重い処理なので、
 /// 利用側はアプリ起動時に 1 回だけ呼んで結果を保持することを想定する。
-#[cfg(target_os = "linux")]
 pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
-    let loader = unsafe { sys::MFXLoad() };
-    if loader.is_null() {
-        return Err(Error::new_custom("MFXLoad", "returned null"));
-    }
-    let loader_guard = LoaderGuard { loader };
+    let loader = VplLoader::new(VplLibrary::load()?)?;
+    loader.require_hardware()?;
 
-    // ハードウェア実装のみに絞る
-    let cfg = unsafe { sys::MFXCreateConfig(loader) };
-    if cfg.is_null() {
-        return Err(Error::new_custom("MFXCreateConfig", "returned null"));
-    }
-    let name = b"mfxImplDescription.Impl\0";
-    let mut variant: sys::mfxVariant = unsafe { std::mem::zeroed() };
-    variant.Type = sys::mfxVariantType_MFX_VARIANT_TYPE_U32;
-    variant.Data.U32 = sys::mfxImplType_MFX_IMPL_TYPE_HARDWARE;
-    let status = unsafe { sys::MFXSetConfigFilterProperty(cfg, name.as_ptr(), variant) };
-    if status != sys::mfxStatus_MFX_ERR_NONE {
-        return Err(Error::from_mfx(status, "MFXSetConfigFilterProperty"));
-    }
+    let raw_loader = unsafe { loader.as_ptr() };
 
     let mut adapters: Vec<AdapterInfo> = Vec::new();
     let mut i: sys::mfxU32 = 0;
@@ -130,7 +109,7 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
         let mut hdl: sys::mfxHDL = std::ptr::null_mut();
         let status = unsafe {
             sys::MFXEnumImplementations(
-                loader,
+                raw_loader,
                 i,
                 sys::mfxImplCapsDeliveryFormat_MFX_IMPLCAPS_IMPLDESCSTRUCTURE,
                 &mut hdl,
@@ -148,13 +127,16 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
                 "returned null handle for IMPLDESCSTRUCTURE",
             ));
         }
-        let desc_guard = HdlGuard { loader, hdl };
+        let desc_guard = HdlGuard {
+            loader: raw_loader,
+            hdl,
+        };
 
         // mfxExtendedDeviceId（DRMRenderNodeNum / PCI 情報 等）を取る
         let mut hdl_ext: sys::mfxHDL = std::ptr::null_mut();
         let ext_status = unsafe {
             sys::MFXEnumImplementations(
-                loader,
+                raw_loader,
                 i,
                 sys::mfxImplCapsDeliveryFormat_MFX_IMPLCAPS_DEVICE_ID_EXTENDED,
                 &mut hdl_ext,
@@ -170,7 +152,7 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
             return Err(Error::from_mfx(ext_status, "MFXEnumImplementations"));
         }
         let ext_guard = HdlGuard {
-            loader,
+            loader: raw_loader,
             hdl: hdl_ext,
         };
 
@@ -208,20 +190,11 @@ pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
         i += 1;
     }
 
-    drop(loader_guard);
-
     adapters.sort_by_key(|a| a.drm_render_node);
     Ok(adapters)
 }
 
-/// Linux 以外では実機が存在しないため空 `Vec` を返す
-#[cfg(not(target_os = "linux"))]
-pub fn list_adapters() -> Result<Vec<AdapterInfo>, Error> {
-    Ok(Vec::new())
-}
-
 /// `mfxDeviceDescription.MediaAdapterType` (`mfxU16`) を Rust 側の enum にマップする
-#[cfg(target_os = "linux")]
 fn map_media_adapter_type(value: sys::mfxU16) -> MediaAdapterType {
     // MFX_MEDIA_* は本来 c_uint だが、mfxDeviceDescription.MediaAdapterType フィールドは mfxU16。
     // u16 にキャストして比較する。
@@ -239,7 +212,6 @@ fn map_media_adapter_type(value: sys::mfxU16) -> MediaAdapterType {
 ///
 /// NUL 終端があればそこまでを切り出し、なければ配列全体を UTF-8 として解釈する。
 /// 不正 UTF-8 のときは空文字列にフォールバックする。
-#[cfg(target_os = "linux")]
 fn c_array_to_string(arr: &[sys::mfxChar]) -> String {
     // mfxChar は c_char = i8 / u8 (環境依存) なので u8 にキャストする
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arr.as_ptr() as *const u8, arr.len()) };
@@ -249,27 +221,12 @@ fn c_array_to_string(arr: &[sys::mfxChar]) -> String {
     }
 }
 
-/// `MFXUnload` を Drop で呼ぶガード
-#[cfg(target_os = "linux")]
-struct LoaderGuard {
-    loader: sys::mfxLoader,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for LoaderGuard {
-    fn drop(&mut self) {
-        unsafe { sys::MFXUnload(self.loader) };
-    }
-}
-
 /// `MFXDispReleaseImplDescription` を Drop で呼ぶガード
-#[cfg(target_os = "linux")]
 struct HdlGuard {
     loader: sys::mfxLoader,
     hdl: sys::mfxHDL,
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for HdlGuard {
     fn drop(&mut self) {
         unsafe { sys::MFXDispReleaseImplDescription(self.loader, self.hdl) };

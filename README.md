@@ -28,12 +28,16 @@ libvpl を static link するため、実行時に Intel VPL 共有ライブラ�
 - Intel VPL によるハードウェアデコード (H.264 / H.265 / VP9 / AV1)
 - libvpl を static link してビルド (CMake で自動ビルド)
 - ビルド時に GitHub から libvpl ヘッダーを自動取得
-- エンコード入力フォーマット選択 (NV12 / YUY2 / BGRA)
-- デコード出力は NV12 フォーマット
+- エンコード入力フォーマット選択 (NV12 / P010 / YUY2 / BGRA / AYUV / Y410)
+- デコード出力はストリームのネイティブ形式 (4:2:0 は NV12 / P010、4:4:4 は AYUV / Y410)
 - フレーム単位のエンコードオプション (IDR フレーム強制)
 - CBR / VBR / CQP / ICQ / QVBR / LA / AVBR / VCM / LA_ICQ / LA_HRD レート制御モード
 - エンコーダーパラメータの動的変更 (MFXVideoENCODE_Reset)
 - パラメータのサポート可否検証 (MFXVideoENCODE_Query)
+- エンコーダーからの SPS / PPS / VPS 取得 (MP4 / RTP 用のパラメータセット)
+- デコーダーのキーフレームのヘッダから解像度とフレームレートを取得 (`Decoder::decode_header`)
+- コーデックケーパビリティ照会 (プロファイル別・メモリタイプ別の解像度範囲 / 最大コーデックレベル / 対応色形式)
+- エンコーダー / デコーダーの統計取得 (`Encoder::stats` / `Decoder::stats`)
 
 ## 動作要件
 
@@ -51,7 +55,7 @@ cargo build
 
 ### docs.rs 向けビルド
 
-libvpl がない環境では、docs.rs 向けのドキュメント生成のみ可能です。
+Linux (x86_64) 上では、libvpl がない環境でも docs.rs 向けのドキュメント生成のみ行えます。
 
 ```bash
 DOCS_RS=1 cargo doc --no-deps
@@ -81,24 +85,76 @@ for adapter in &adapters {
 let adapter = AdapterSelector::DrmRenderNode(adapters[0].drm_render_node);
 ```
 
+### コーデック情報の照会
+
+`supported_codecs()` は、H.264 / HEVC / VP9 / AV1 それぞれの対応状況とケーパビリティを返します。
+エンコード・デコードに対応していないコーデックは、`CodecInfo::encoding` / `CodecInfo::decoding` が `None` になります。
+
+ケーパビリティは VPL の実装記述 (`mfxDecoderDescription` / `mfxEncoderDescription`) の階層をそのまま反映します。プロファイルやメモリタイプをまたいだ集約は行いません。
+
+```rust
+use shiguredo_vpl::{AdapterSelector, list_adapters, supported_codecs};
+
+let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
+for codec in supported_codecs(adapter)? {
+    if let Some(encoding) = &codec.encoding {
+        for profile in &encoding.profiles {
+            for memory_type in &profile.memory_types {
+                println!(
+                    "{:?} {:?} {:?}: width={}..{} step={}, height={}..{} step={}, {:?}",
+                    codec.codec,
+                    profile.profile,
+                    memory_type.memory_type,
+                    memory_type.width.min,
+                    memory_type.width.max,
+                    memory_type.width.step,
+                    memory_type.height.min,
+                    memory_type.height.max,
+                    memory_type.height.step,
+                    memory_type.color_formats,
+                );
+            }
+        }
+    }
+}
+```
+
+| 型 | 説明 |
+|---|---|
+| `CodecInfo` | コーデック種別と、エンコード・デコードの情報 |
+| `DecodingInfo` / `EncodingInfo` | 最大コーデックレベルとプロファイル一覧。エンコードは B フレーム対応も持つ |
+| `ProfileCapabilities` | プロファイルと、メモリタイプごとのケーパビリティ |
+| `MemoryTypeCapabilities` | メモリタイプ、幅・高さの範囲 (`ValueRange`)、対応色形式 |
+| `ValueRange` | 最小値・最大値・増分 (VPL の `mfxRange32U`) |
+| `VideoProfile` | コーデックごとのプロファイル。既知の型で表現できない値は `Unknown(u32)` |
+| `MemoryType` | VPL の `mfxResourceType`。既知の型で表現できない値は `Unknown(u32)` |
+
+- 解像度範囲と色形式は、プロファイルとメモリタイプごとの値をそのまま返す
+- 色形式は `FrameFormat` で表現できる FourCC だけを、VPL の `ColorFormats` に並んでいる順序で返す
+- `max_codec_level` は最大コーデックレベルを返し、レベルが不明な場合は `None`
+- すべてのメモリタイプを返すが、このクレートの `Encoder` / `Decoder` が実際に使うのは `MemoryType::System` だけ
+- VPL がプロファイルを返さない場合は `profiles` が空、メモリタイプを返さない場合は `memory_types` が空、色形式を返さない場合や表現できる FourCC が無い場合は `color_formats` が空になる
+
 ### エンコード
 
 ```rust
 use shiguredo_vpl::{
     AdapterSelector, CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
-    Error, FnEncodeHandler, FrameFormat, H264EncoderConfig, H264Profile,
+    Error, FnEncodeHandler, FrameData, FrameFormat, H264EncoderConfig, H264Profile,
     RateControlMode, frame_type, list_adapters,
 };
 use std::sync::mpsc;
 
+let width = 1920usize;
+let height = 1080usize;
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
 let mut config = EncoderConfig::new(
     adapter,
     CodecConfig::H264(H264EncoderConfig {
         profile: Some(H264Profile::High),
     }),
-    1920,                    // width
-    1080,                    // height
+    width as u32,
+    height as u32,
     FrameFormat::Nv12,
     30,                      // framerate_num
     1,                       // framerate_den
@@ -107,21 +163,32 @@ let mut config = EncoderConfig::new(
 config.target_kbps = Some(5_000);
 
 let (tx, rx) = mpsc::channel();
-let mut encoder = Encoder::new(config, FnEncodeHandler::new(move |result| {
-    tx.send(result).expect("failed to send callback result");
-}))?;
+let mut encoder = Encoder::new(
+    config,
+    FnEncodeHandler::new(move |result: Result<EncodedFrame<&'static str>, Error>| {
+        tx.send(result).expect("failed to send callback result");
+    }),
+)?;
 
-// フレームデータをエンコード
-let (coded_width, coded_height) = encoder.coded_size();
-let frame_size = FrameFormat::Nv12
-    .frame_size(coded_width, coded_height)
-    .ok_or("frame size overflowed")?;
-let frame_data = vec![0u8; frame_size];
+// width x height の FrameData を構築する
+let pitch = FrameFormat::Nv12
+    .bytes_per_row(width)
+    .ok_or("row bytes overflowed")?;
+let y_size = pitch * height;
+let uv_size = pitch * (height / 2);
+let frame_data = vec![0u8; y_size + uv_size];
+let frame = FrameData::SemiPlanar {
+    y: &frame_data[..y_size],
+    y_pitch: pitch,
+    uv: &frame_data[y_size..],
+    uv_pitch: pitch,
+};
+// 構築したフレームデータをエンコードする
 let options = EncodeOptions { frame_type: frame_type::UNKNOWN };
-encoder.encode(&frame_data, "normal", &options)?;
+encoder.encode(frame, "normal", &options)?;
 
 // IDR フレームを強制してエンコード
-encoder.encode(&frame_data, "force-idr", &EncodeOptions {
+encoder.encode(frame, "force-idr", &EncodeOptions {
     frame_type: frame_type::IDR | frame_type::I | frame_type::REF,
 })?;
 
@@ -136,24 +203,62 @@ for _ in 0..2 {
 }
 ```
 
+`Encoder::encode` に渡すフレームは `FrameData` で表現します。`EncoderConfig::width` / `height` は表示サイズ（crop サイズ）で、16 の倍数に揃える必要はありませんが、NV12 / P010 は幅と高さ、YUY2 は幅を偶数にする必要があります。各行のバイト数が表示幅と異なる場合は、`y_pitch` / `uv_pitch` / `pitch` に実際の行間のバイト数を指定します。`Encoder::coded_size()` は内部サーフェスのサイズであり、入力バッファのサイズではありません。
+
+### シーケンスパラメータの取得
+
+エンコーダーが現在使用している SPS / PPS / VPS は `Encoder::get_sequence_params()` で取得できます。
+MP4 の SampleEntry (`avcC` / `hvcC` / `av1C`) や RTP の `fmtp` の組み立てに利用できます。
+
+```rust
+let params = encoder.get_sequence_params()?;
+if let Some(params) = params {
+    println!("SPS: {} bytes", params.sps.len());
+    println!("PPS: {:?}", params.pps.as_ref().map(|pps| pps.len()));
+    println!("VPS: {:?}", params.vps.as_ref().map(|vps| vps.len()));
+}
+```
+
+- 返るバイト列はスタートコード (`00 00 00 01` / `00 00 01`) を含まない
+- H.264 は `sps` に SPS、`pps` に PPS を返す
+- HEVC は `vps` に VPS、`sps` に SPS、`pps` に PPS を返す
+- AV1 は `sps` に Sequence Header OBU を返し、`vps` と `pps` は `None`
+- VP9 はパラメータセットを持たないため `Ok(None)` を返す
+- `Encoder::encode` と同じスレッドで、`Encoder::encode` と直列になるように呼ぶ
+- `Encoder::reconfigure` でフレームレートを変えるとパラメータセットの内容が変わるため、必要に応じて `get_sequence_params()` で取得し直す
+- MP4 の `avc1` / `hvc1` は SampleEntry を途中で差し替えられないため、SPS が変わる変更を行う場合は `avc3` / `hev1` を使う
+
 ### デコード
 
 ```rust
 use shiguredo_vpl::{
-    AdapterSelector, Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler,
-    list_adapters,
+    AdapterSelector, DecodedFrame, Decoder, DecoderConfig, Error, FnDecodeHandler, FrameData,
+    VideoCodecType, list_adapters,
 };
 use std::sync::mpsc;
 
 let adapter = AdapterSelector::DrmRenderNode(list_adapters()?[0].drm_render_node);
-let config = DecoderConfig::new(adapter, DecoderCodec::H264);
+let config = DecoderConfig::new(adapter, VideoCodecType::H264);
 
 let (tx, rx) = mpsc::channel();
-let mut decoder = Decoder::new(config, FnDecodeHandler::new(move |result| {
-    tx.send(result).expect("failed to send callback result");
-}))?;
+let mut decoder = Decoder::new(
+    config,
+    FnDecodeHandler::new(
+        move |result: Result<DecodedFrame<'_, &'static str>, Error>| {
+            // DecodedFrame は借用データを含むため、コールバック内でコピーする
+            let info = result.map(|frame| {
+                let data_len = match frame.data() {
+                    FrameData::SemiPlanar { y, uv, .. } => y.len() + uv.len(),
+                    FrameData::Packed { data, .. } => data.len(),
+                };
+                (frame.frame_format(), frame.width(), frame.height(), data_len)
+            });
+            tx.send(info).expect("failed to send callback result");
+        },
+    ),
+)?;
 
-// ビットストリームデータをデコード (value で任意のユーザーデータを紐付け可能)
+// ビットストリームデータをデコード (user_data で任意のユーザーデータを紐付け可能)
 let bitstream_data = vec![0u8; 1024];
 decoder.decode(&bitstream_data, "frame-0")?;
 decoder.decode(&bitstream_data, "frame-1")?;
@@ -163,11 +268,72 @@ decoder.finish()?;
 
 // コールバック経由でデコード結果を受け取る
 while let Ok(result) = rx.try_recv() {
-    let frame = result?;
-    println!("decoded: {}x{}, Y plane: {} bytes, UV plane: {} bytes, user_data: {:?}",
-        frame.width(), frame.height(), frame.y().len(), frame.uv().len(), frame.user_data());
+    let (format, width, height, data_len) = result?;
+    println!("decoded: {width}x{height}, format: {format:?}, data: {data_len} bytes");
 }
 ```
+
+### ヘッダからのストリーム情報の取得
+
+SPS / PPS / sequence header を含むビットストリーム (通常はキーフレーム) から、デコードを開始する前にストリームの解像度とフレームレートを取得できます。
+`Decoder::decode_header()` は SPS / PPS / sequence header を探して解析し、`StreamInfo` を返します。
+入力を消費しないため、解析したデータをそのまま `decode()` に渡せます。
+
+```rust
+// keyframe は SPS / PPS / sequence header を含むキーフレームのアクセスユニット
+let keyframe = vec![0u8; 1024];
+let info = decoder.decode_header(&keyframe)?;
+println!(
+    "coded: {}x{}, display: {}x{}",
+    info.coded_width,
+    info.coded_height,
+    info.width,
+    info.height,
+);
+if let Some(framerate) = info.framerate {
+    println!("framerate: {}/{}", framerate.num, framerate.den);
+}
+
+// 同じキーフレームをそのままデコードできる
+decoder.decode(&keyframe, "frame-0")?;
+```
+
+- `codec` はデコーダーに指定したコーデック種別です
+- `coded_width` / `coded_height` は VPL 実装が内部サーフェスを確保するサイズで、実装のアラインメントに切り上げられた値です
+- `width` / `height` は表示サイズです。デコード結果の `DecodedFrame::width()` / `DecodedFrame::height()` と一致します
+- `framerate` はフレームレートで、`Framerate` の `num` / `den` の比で表されます。約分されているとは限りません。ビットストリームに情報が無い場合は `None` になります
+- `data` には SPS / PPS / sequence header が必要です。これらは通常キーフレームに含まれます
+- `Decoder::decode` と同じスレッドで、`Decoder::decode` と直列になるように呼んでください
+
+### 統計の取得
+
+`Encoder::stats()` / `Decoder::stats()` で処理状況の統計を取得できます。
+統計値は処理の進行に伴って更新され、各カウンタは `Counter`、in-flight フレーム数は `Gauge` で表されます。
+
+```rust
+let stats = encoder.stats();
+println!(
+    "encode={} output={} error={} in_flight={}",
+    stats.total_encode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get(),
+    stats.in_flight_frames.get(),
+);
+
+let stats = decoder.stats();
+println!(
+    "decode={} output={} error={} in_flight={}",
+    stats.total_decode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get(),
+    stats.in_flight_frames.get(),
+);
+```
+
+- `EncoderStats` は `total_encode_count` / `total_output_frame_count` / `total_error_count` / `total_reconfigure_count` / `total_output_bit_count` / `in_flight_frames` を持ちます
+- `DecoderStats` は `total_decode_count` / `total_output_frame_count` / `total_error_count` / `in_flight_frames` を持ちます
+- `Counter` / `Gauge` は `get()` で現在値を取得できます。`clone()` は現在値のスナップショットを返します
+- `in_flight_frames` は処理中のフレーム数です。`finish()` や `reconfigure()` の完了時点で 0 になります。処理の途中でエラーになった場合は残留することがあります
 
 ## サポートコーデック
 
@@ -180,18 +346,19 @@ while let Ok(result) = rx.try_recv() {
 | VP9       | `CodecConfig::Vp9(Vp9EncoderConfig)` |
 | AV1       | `CodecConfig::Av1(Av1EncoderConfig)` |
 
-VP9 の場合、`Vp9EncoderConfig::write_ivf_headers` で出力形式を選択します。
-`true` で IVF ヘッダー付き、`false` で raw VP9 を出力します。
+VP9 の場合、`Vp9EncoderConfig::write_ivf_headers` に VPL への要求値を指定します。
+`true` で IVF ヘッダー付き、`false` で raw VP9 を要求します。実効値は `Encoder::get_video_param()` の
+`ExtParams::vp9_param` で確認できます。
 Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従来の IVF 付き出力を維持するには `true` を指定してください。
 
 ### デコード
 
-| コーデック | `DecoderCodec` |
-|-----------|---------------|
-| H.264     | `DecoderCodec::H264` |
-| H.265     | `DecoderCodec::Hevc` |
-| VP9       | `DecoderCodec::Vp9` |
-| AV1       | `DecoderCodec::Av1` |
+| コーデック | `VideoCodecType` |
+|-----------|-----------------|
+| H.264     | `VideoCodecType::H264` |
+| H.265     | `VideoCodecType::Hevc` |
+| VP9       | `VideoCodecType::Vp9` |
+| AV1       | `VideoCodecType::Av1` |
 
 ## サポートフォーマット
 
@@ -200,14 +367,32 @@ Intel GPU の oneVPL は IVF ヘッダー出力が既定で ON のため、従�
 | フォーマット | `FrameFormat` | 説明 |
 |---|---|---|
 | NV12 | `FrameFormat::Nv12` | Semi-Planar YUV 4:2:0 8bit |
+| P010 | `FrameFormat::P010` | Semi-Planar YUV 4:2:0 10bit (16bit ワードの上位 10bit) |
 | YUY2 | `FrameFormat::Yuy2` | Packed YUV 4:2:2 8bit |
 | BGRA | `FrameFormat::Bgra` | Packed BGRA 8bit |
+| AYUV | `FrameFormat::Ayuv` | Packed YUV 4:4:4 8bit (バイト順は V, U, Y, A) |
+| Y410 | `FrameFormat::Y410` | Packed YUV 4:4:4 10bit (下位から U 10bit / Y 10bit / V 10bit / A 2bit) |
+
+入力フォーマットとプロファイルの組み合わせの可否は GPU と VPL の実装に依存し、初期化およびエンコード時に判定されます。
+初期化に失敗した場合、`Encoder::new` はそのエラーを返します。初期化に成功しても、エンコードに失敗する組み合わせがあります。
+事前に対応を確認する場合は `supported_codecs()` が返す `EncodingInfo::profiles` の `MemoryTypeCapabilities::color_formats` を参照してください。ただし、ケーパビリティ照会の結果は初期化やエンコードの成功を保証しません。
+詳細は `Encoder::new` のドキュメントを参照してください。
 
 ### デコード出力フォーマット
 
-| フォーマット | 説明 |
-|---|---|
-| NV12 | Semi-Planar YUV 4:2:0 8bit |
+デコード出力の形式はストリームのネイティブ形式で決まります。出力形式を選択する API はありません。
+実際の出力形式は `DecodedFrame::frame_format()` で取得でき、画素データは `DecodedFrame::data()` が返す `FrameData` で取得します。
+
+| フォーマット | 説明 | `FrameData` の variant |
+|---|---|---|
+| NV12 | 8bit ストリームの出力 (Semi-Planar YUV 4:2:0 8bit) | `FrameData::SemiPlanar` |
+| P010 | 10bit ストリームの出力 (Semi-Planar YUV 4:2:0 10bit、16bit ワードの上位 10bit) | `FrameData::SemiPlanar` |
+| AYUV | 8bit 4:4:4 ストリームの出力 (Packed YUV 4:4:4 8bit、バイト順は V, U, Y, A) | `FrameData::Packed` |
+| Y410 | 10bit 4:4:4 ストリームの出力 (Packed YUV 4:4:4 10bit、下位から U 10bit / Y 10bit / V 10bit / A 2bit) | `FrameData::Packed` |
+
+`supported_codecs()` が返す `CodecInfo::decoding` → `DecodingInfo::profiles` → `ProfileCapabilities::memory_types` → `MemoryTypeCapabilities::color_formats` に、プロファイル・メモリタイプごとのデコード出力色形式が入ります。
+
+12bit (P016) など、上記以外の出力は未対応で、デコード時にエラーになります。
 
 ## サポートプロファイル
 

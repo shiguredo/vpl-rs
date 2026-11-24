@@ -11,6 +11,117 @@
 
 ## develop
 
+## 2026.5.0
+
+**リリース日**: 2026-11-24
+
+- [CHANGE] MSRV (rust-version) を 1.93 から 1.95 に上げる
+  - `rust-toolchain.toml` の channel、CI と devcontainer のツールチェーンも 1.95 に合わせる
+  - @melpon
+- [CHANGE] デコーダーの 10bit 4:2:0 (P010) と 4:4:4 (AYUV / Y410) の出力に対応する
+  - `DecodedFrame::frame_format` でデコード出力の色形式を取得できる。10bit 4:2:0 は P010、8bit 4:4:4 は AYUV、10bit 4:4:4 は Y410 になる
+  - `DecodedFrame::data` が返す `FrameData` で画素データを取得する。NV12 / P010 は `SemiPlanar`、AYUV / Y410 は `Packed` になる
+  - 対応外の出力形式 (P016 など) はデコード時にエラーになる
+  - `DecodedFrame::y` / `DecodedFrame::uv` / `DecodedFrame::pitch` を削除する。`data` と `frame_format` で置き換える
+  - `FrameData` をエンコード入力とデコード出力の共通の画素データ表現にする
+  - @melpon
+- [CHANGE] プロファイル型とコーデック識別型を統合する
+  - `H264EncodingProfile` / `HevcEncodingProfile` / `Vp9EncodingProfile` / `Av1EncodingProfile` を削除し、`H264Profile` / `HevcProfile` / `Vp9Profile` / `Av1Profile` に統合する
+  - `DecoderCodec` を削除し、`DecoderConfig` のコーデックを `VideoCodecType` で指定するよう変更する
+  - @melpon
+- [CHANGE] `Encoder::get_video_param` の戻り値を `VideoParam` に変更する
+  - 要求した拡張バッファの実効値を `ExtParams` として返す
+  - @melpon
+- [CHANGE] `Encoder::get_encode_stat` と旧 `EncoderStats` を削除する
+  - `EncoderStats` を共有統計型として定義し直し、`num_frame` / `num_bit` / `num_cached_frame` を廃止する
+  - VPL の生統計 (`mfxEncodeStat`) を返す API はなくなり、`Encoder::stats` で統計を取得する
+  - @melpon
+- [CHANGE] `supported_codecs` が返すコーデック情報を VPL の実装記述に合わせて拡充する
+  - `CodecInfo::decoding` / `CodecInfo::encoding` を `Option` に変更し、非対応コーデックでは `None` を返す
+  - `DecodingInfo` / `EncodingInfo` から `supported` / `hardware_accelerated` を、 `EncodingInfo` から `supports_multi_pass` を削除する
+  - `DecodingInfo` / `EncodingInfo` に `max_codec_level: Option<u16>` を追加し、レベルが不明な場合は `None` にする
+  - プロファイルごとの `ProfileCapabilities` と、メモリタイプごとの `MemoryTypeCapabilities` を追加する
+  - `MemoryTypeCapabilities` は幅・高さの範囲 (`ValueRange`) と色形式をメモリタイプ別に返し、プロファイルやメモリタイプをまたいだ集約はしない
+  - `VideoProfile` / `MemoryType` / `ValueRange` を公開し、未知のプロファイルとメモリタイプは `Unknown(u32)` で保持する
+  - `EncodingProfiles` を削除する
+  - @melpon
+- [CHANGE] エンコーダーの入力フォーマットに P010 / AYUV / Y410 を追加する
+  - `FrameFormat` に `P010` / `Ayuv` / `Y410` を追加する。variant の追加により、`FrameFormat` を網羅する `match` を持つ利用側はコンパイルできなくなる
+  - P010 の 10bit 値は 16bit ワードの上位ビットに格納し、`mfxFrameInfo.Shift` に 1 を設定する
+  - `mfxFrameData` のピッチは `PitchHigh` と `PitchLow` を合わせて計算する
+  - @melpon
+- [CHANGE] `Encoder::encode` の入力を `FrameData` に変更し、表示サイズと行ピッチに対応する
+  - `FrameData::SemiPlanar` で NV12 / P010 の Y/UV プレーンを、`FrameData::Packed` で YUY2 / BGRA / AYUV / Y410 のパック形式を指定する
+  - `y_pitch` / `uv_pitch` / `pitch` で行間のバイト数（パディングを含む）を指定でき、表示幅と異なるピッチのバッファをそのまま渡せる
+  - `FrameFormat::bytes_per_row` を公開する
+  - `FrameFormat::frame_size` を削除する。入力バッファの行長は `FrameFormat::bytes_per_row` から求める
+  - NV12 / P010 の奇数サイズと YUY2 の奇数幅は `Encoder::new` がエラーにする
+  - `Encoder::coded_size` はサーフェスのサイズを返す API として残す
+  - @melpon
+- [ADD] エンコーダーとデコーダーの統計 API を追加する
+  - `Encoder::stats` / `Decoder::stats` で受理回数・出力フレーム数・エラー数・in-flight フレーム数を取得でき、 `EncoderStats` は出力ビット数も持つ
+  - `EncoderStats` に reconfigure 成功回数を追加し、`DecoderStats` を追加する
+  - 統計の型として `Counter` / `Gauge` を公開する
+  - @melpon
+- [ADD] エンコーダーから SPS / PPS / VPS を取得する API を追加する
+  - `Encoder::get_sequence_params` でスタートコードを含まない NAL / OBU を取得できる
+  - `SequenceParams` を公開し、AV1 は Sequence Header OBU、VP9 は `None` を返す
+  - @melpon
+- [ADD] デコーダーでビットストリームのヘッダからストリーム情報を取得する API を追加する
+  - `Decoder::decode_header` で SPS / PPS / sequence header を含むデータから解像度とフレームレートを取得できる
+  - `StreamInfo` は `codec` / `coded_width` / `coded_height` / `width` / `height` / `framerate` (`Option<Framerate>`) を持つ
+  - `Decoder::decode_header` は入力を消費しないため、同じアクセスユニットをそのまま `decode` に渡せる
+  - @melpon
+- [FIX] Decoder の user_data 対応付けを TimeStamp 完全一致方式に変更する
+  - B フレームの表示順並び替えがあっても user_data が正しい入力フレームに紐付くようになる
+  - @melpon
+- [FIX] reconfigure 時に Init 時の拡張バッファを再送するよう修正する
+  - `EncoderConfig::look_ahead_depth` / `EncoderConfig::qvbr_quality` / `Vp9EncoderConfig::write_ivf_headers` が reconfigure 後も維持される
+  - @melpon
+- [FIX] reconfigure が pending frame を回収してから Reset するよう修正する
+  - reconfigure 時に未出力フレームが `Ok` で通知され、`finish()` の残留エラーにならない
+  - @melpon
+- [FIX] `#[cfg(target_os = "linux")]` を削除し、Linux x86_64 以外のターゲットでは `compile_error!` でビルドを拒否する
+  - 非対応ターゲットでリンカの未解決シンボルエラーではなく、意図が明確なコンパイルエラーを返す
+  - 非 Linux 向けに空 `Vec` を返していた `list_adapters()` を削除する
+  - @melpon
+
+### misc
+
+- [ADD] エンコード→デコードの恒等性を検証するテストを追加する
+  - 同一フォーマット経路は Y / U / V の PSNR、変換経路はルマの PSNR と色バー領域のクロマ平均で検証する
+  - ルマの分散・フレーム間差分・色バー間のクロマ平均の広がりと、BGRA 入力のルマ相関・平均・レンジ・分散を検証する
+  - `identity` と内容が重複する AYUV / 10bit のルマ PSNR と、BGRA / AYUV のフレーム数のみのテストを整理する
+  - @melpon
+- [ADD] コーデックケーパビリティ照会の実機テストを追加する
+  - `tests/test_codec_info.rs` でプロファイル・メモリタイプ別の解像度範囲と色形式を検証する
+  - `tests/helpers.rs` にテスト用アダプタを取得する共通ヘルパーを追加する
+  - @melpon
+- [ADD] silent pass していたテストを修正する
+  - `frame_surface_gpu_required` でテスト用エンコーダーを初期化し、早期 return を assert に置き換える
+  - `test_list_adapters_sorted_and_deduped` に空 Vec の自動パスを防ぐ assert を追加する
+  - @melpon
+- [UPDATE] VPL が返す値の検証方針をユーザー入力と Rust の安全境界に限定する
+  - VPL が仕様どおりの値を返す前提で、メタデータの健全性検証を削除する
+  - `Encoder::new` の実効 FrameInfo / VP9 `WriteIVFHeaders` の一致検証と、Decoder 出力の crop / pitch / Shift / 奇数サイズの検証を削除する
+  - @melpon
+- [UPDATE] VPL ローダーの初期化処理を `VplLoader` に集約する
+  - セッション生成・アダプタ列挙・コーデック照会で重複していたローダーの生成とフィルタ設定を共通化する
+  - ローダーの解放を `VplLoader` の Drop に統一する
+  - @melpon
+- [UPDATE] 公開型から `#[non_exhaustive]` を削除する
+  - `DecoderConfig` / `EncoderConfig` / `AdapterSelector` / `MediaAdapterType` / `PciAddress` / `AdapterInfo` が対象
+  - 利用側で `match` の網羅性チェックと構造体リテラルによる構築が可能になる
+  - 今後フィールドや variant を追加する場合は後方互換のない変更として扱う
+  - @melpon
+- [UPDATE] CI の clippy でテストコードも lint し、docs.rs ビルドでは警告をエラーにする
+  - GPU 実機テストのジョブの clippy に `--all-targets` を指定する
+  - docs.rs ビルドのジョブに `RUSTDOCFLAGS=-D warnings` を設定する
+  - @melpon
+- [FIX] docs.rs のビルドでネットワークに接続できないためドキュメント生成に失敗する問題を修正する
+  - `DOCS_RS` 設定時は libvpl の取得と bindgen をスキップし、ドキュメント生成に必要な最小限のダミー定義を出力する
+  - @melpon
+
 ## 2026.4.0
 
 **リリース日**: 2026-08-23

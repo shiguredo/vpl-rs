@@ -2,6 +2,7 @@
 
 - Priority: High
 - Created: 2026-07-01
+- Completed: 2026-11-03
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-does-not-drain-pending
 - Polished: 2026-08-21
@@ -211,3 +212,35 @@ VPL の `MFXVideoENCODE_Reset` の挙動はパラメータ差分に依存する�
 - 関連 issue: 0020（encode.rs のサブモジュール分割。`WorkerCommand` / `run_sync_worker` を移動するため、0020 は本 issue 適用後に調整する）
 - 関連 issue: 0027（`Encoder::get_video_param()` に `ExtParam` を渡す手段の追加。本 issue の reconfigure テストでの LookAheadDepth / QVBRQuality 保持検証に利用する。0027 は本 issue のテスト実装での利用方法に合わせて設計を確定するため、相互に参照して実装する）
 - `finish_pending_error` / `mismatched_timestamp_error` / `canceled_error` は `src/encode.rs` の worker 関連のエラー関数
+
+## 解決方法
+
+当初の設計方針だった「pending frame を破棄して `MFX_ERR_ABORTED` を通知する」方式は採用せず、Reset の前に未出力フレームを回収する方式に変更した。本セクションが、設計方針と完了条件のうち破棄方式に関する記述を置き換える。
+
+### 変更内容
+
+- `src/encode.rs` の `Encoder::finish` が持つドレインループを `Encoder::drain_cached_frames` として切り出し、`Encoder::reconfigure` が Reset の前に呼ぶようにした
+- `WorkerCommand::WaitIdle` にコンテキストを持たせ、reconfigure 経由の残留エラーが `"Encoder::reconfigure"` になるようにした
+- `Encoder::reconfigure` の doc に、未出力フレームが破棄されず `Ok` で通知されること、ブロッキング、エラー時の扱いを追記した
+- `tests/test_roundtrip.rs` に encode → reconfigure → encode → finish のテストを追加した
+- `skills/shiguredo-vpl/SKILL.md` と `CHANGES.md` を更新した
+
+### 設計方針を変更した理由
+
+- VPL プログラミングガイドの Configuration Change 節が定める手順（NULL 入力で cached frame を回収してから Reset）に一致する
+- 実機 (GMKtec K9 / iHD 1.22) で、pending 3 枚の reconfigure が 10 回計測で 1.84〜2.32 ms で完了した。破棄方式の根拠にしていた「数百 ms〜数秒のブロッキング」は実測で確認できなかった
+- 破棄方式では、Reset がシーケンスを継続する場合に、本来出力できたフレームを失う
+- nvcodec-rs は reconfigure の前に全 in-flight フレームを回収しており、回収方式が兄弟実装と揃う
+
+### 実機確認
+
+GMKtec K9 (iHD 1.22) で確認した。
+
+- 8 枚 encode → reconfigure → 8 枚 encode → finish で、全 16 枚が `Ok`、エラー 0 件、`finish()` が `Ok`
+- reconfigure の所要時間は 10 回計測で 1.84〜2.32 ms（pending 3 枚）
+- 回収を無効化すると `finish()` が "3 pending frames remained" で失敗し、テストが修正前の不具合を検出できることを確認した
+- テストスイートは lib 15、test_adapter 6、test_roundtrip 21、doctests 2 がすべて成功
+
+### 残課題
+
+LookAheadDepth / QVBRQuality の保持検証を統合テストに含める件は、公開 API の拡張（issue 0027）待ち。実機での保持確認は既存の `reconfigure_preserves_coding_option_ext_params` で完了している。

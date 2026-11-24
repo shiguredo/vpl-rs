@@ -1,9 +1,7 @@
-#![cfg(target_os = "linux")]
-
 use shiguredo_vpl::{
-    AdapterSelector, CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodedFrame, Encoder,
-    EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler, FrameFormat, H264EncoderConfig,
-    RateControlMode, list_adapters, supported_codecs,
+    AdapterSelector, CodecConfig, Decoder, DecoderConfig, EncodedFrame, Encoder, EncoderConfig,
+    Error, FnDecodeHandler, FnEncodeHandler, FrameFormat, H264EncoderConfig, RateControlMode,
+    VideoCodecType, list_adapters, supported_codecs,
 };
 
 /// `Encoder` / `Decoder` は `Debug` を実装しないため、`expect_err` の代わりにこのヘルパーで
@@ -16,7 +14,6 @@ fn into_err<T>(result: Result<T, Error>, message: &str) -> Error {
 }
 
 /// AdapterInfo の Debug 出力を 1 行ずつ整形した文字列で返す（assert メッセージ用）
-#[cfg(intel_vpl)]
 fn format_adapters(adapters: &[shiguredo_vpl::AdapterInfo]) -> String {
     let mut s = String::from("[");
     for (i, a) in adapters.iter().enumerate() {
@@ -36,6 +33,11 @@ fn format_adapters(adapters: &[shiguredo_vpl::AdapterInfo]) -> String {
 #[test]
 fn test_list_adapters_sorted_and_deduped() {
     let adapters = list_adapters().expect("list_adapters に失敗");
+    let listing = format_adapters(&adapters);
+    assert!(
+        !adapters.is_empty(),
+        "Intel HW アダプタが列挙されない: {listing}"
+    );
 
     let mut nodes: Vec<u32> = adapters.iter().map(|a| a.drm_render_node).collect();
     let original = nodes.clone();
@@ -73,7 +75,7 @@ fn test_encoder_rejects_render_node_zero() {
 /// `AdapterSelector::DrmRenderNode(0)` を Decoder::new に渡すと Err になる
 #[test]
 fn test_decoder_rejects_render_node_zero() {
-    let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(0), DecoderCodec::H264);
+    let config = DecoderConfig::new(AdapterSelector::DrmRenderNode(0), VideoCodecType::H264);
     let err = into_err(
         Decoder::new(
             config,
@@ -167,7 +169,7 @@ fn test_real_adapter_session() {
     };
 
     // Decoder を作って即破棄する
-    let decoder_config = DecoderConfig::new(adapter, DecoderCodec::H264);
+    let decoder_config = DecoderConfig::new(adapter, VideoCodecType::H264);
     let _decoder = match Decoder::new(
         decoder_config,
         FnDecodeHandler::new(|_: Result<shiguredo_vpl::DecodedFrame<()>, Error>| {}),
